@@ -5,8 +5,9 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
-from app.rag.contracts import DocumentList, DocumentResponse
+from app.rag.contracts import DocumentList, DocumentResponse, QueryRequest, QueryResponse
 from app.rag.documents import delete_document, get_document, list_documents, submit_document
+from app.rag.pipeline import answer_query
 from app.rag.runtime import RAGRuntime
 from app.rag.uploads import read_upload
 from app.security import get_current_user_id
@@ -102,3 +103,24 @@ async def remove_document(
     _runtime(request)
     await delete_document(session=session, owner_id=owner_id, document_id=document_id)
     return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+
+@router.post(
+    "/query",
+    response_model=QueryResponse,
+    responses={422: {}, 429: {}, 502: {}, 503: {}, 504: {}},
+)
+async def query_documents(
+    payload: QueryRequest, request: Request, response: Response, owner_id: Owner
+) -> QueryResponse:
+    # No Session dependency: no request-scoped session stays open across provider calls.
+    runtime = _runtime(request)
+    runtime.telemetry.increment("rag.requests", operation="query")
+    result = await answer_query(
+        session_factory=request.app.state.session_factory,
+        runtime=runtime,
+        owner_id=owner_id,
+        request=payload,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return result

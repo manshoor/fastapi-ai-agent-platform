@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from app.ai.provider import OpenAIAnswerer, OpenAIEmbedder
 from app.rag.config import RAGSettings
 from app.telemetry import Telemetry
 
@@ -39,6 +40,9 @@ class RAGRuntime:
         self._upload_slots = asyncio.Semaphore(settings.rag_upload_concurrency)
         self._query_slots = asyncio.Semaphore(settings.rag_query_concurrency)
         self._uploading: set[UUID] = set()
+        # One HTTP client per process: the embedder owns it, the answerer borrows it.
+        self.embedder = OpenAIEmbedder(settings, telemetry)
+        self.answerer = OpenAIAnswerer(settings, telemetry, client=self.embedder.client)
 
     @asynccontextmanager
     async def upload_slot(self, owner_id: UUID) -> AsyncIterator[None]:
@@ -50,4 +54,4 @@ class RAGRuntime:
         return _slot(self._query_slots, "Query capacity busy")
 
     async def aclose(self) -> None:
-        return None
+        await self.embedder.aclose()

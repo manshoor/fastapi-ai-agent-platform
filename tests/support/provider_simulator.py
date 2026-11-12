@@ -17,7 +17,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 MODES = frozenset(
-    {"success", "refusal", "invalid", "incomplete", "timeout", "rate_limit", "server_error"}
+    {
+        "success",
+        "refusal",
+        "invalid",
+        "incomplete",
+        "timeout",
+        "rate_limit",
+        "server_error",
+        # Grounded answer that cites no passage.
+        "uncited",
+    }
 )
 SUGGESTION = {"title": "Clear synthetic title", "description": "A clear synthetic description."}
 EMBEDDING_DIMENSIONS = 1536
@@ -219,6 +229,8 @@ def create_app() -> FastAPI:
         mode = admitted
         try:
             output = grounded_answer(value) if wants_grounded_answer(value) else SUGGESTION
+            if mode == "uncited":
+                output = {"answer": "Unsupported synthetic claim.", "citations": []}
             failure = await fail(mode)
             if failure is not None:
                 return failure
