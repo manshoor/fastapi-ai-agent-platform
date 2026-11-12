@@ -48,6 +48,15 @@ _SPANS = frozenset(
         "ai.dispatcher.publish",
         "ai.submit",
         "ai.poll",
+        "rag.upload",
+        "rag.consume",
+        "rag.dispatcher.publish",
+        "rag.ingest",
+        "rag.parse",
+        "rag.chunk",
+        "rag.store",
+        "rag.query",
+        "rag.retrieve",
     }
 )
 _COUNTERS = frozenset(
@@ -60,6 +69,9 @@ _COUNTERS = frozenset(
         "ai.publish",
         "ai.consume",
         "ai.export.drops",
+        "rag.requests",
+        "rag.documents",
+        "rag.queries",
     }
 )
 _HISTOGRAMS = frozenset(
@@ -69,6 +81,8 @@ _HISTOGRAMS = frozenset(
         "ai.queue.wait",
         "ai.queue.depth",
         "ai.publish.duration",
+        "rag.ingest.duration",
+        "rag.query.duration",
     }
 )
 _NUMBERS = frozenset(
@@ -83,9 +97,15 @@ _NUMBERS = frozenset(
         "duration_ms",
         "gen_ai.usage.input_tokens",
         "gen_ai.usage.output_tokens",
+        "chunk_count",
+        "page_count",
+        "retrieved_count",
+        "top_k",
     }
 )
-_IDS = frozenset({"job_id", "event_id", "item_id"})
+_IDS = frozenset({"job_id", "event_id", "item_id", "document_id", "query_id"})
+# Queue-depth gauges keep their metric labels; other gauges keep topic/partition only.
+_DEPTH_GAUGES = frozenset({"ai.queue.depth", "rag.queue.depth"})
 _TAGS = frozenset(
     {
         "model",
@@ -265,7 +285,7 @@ class Telemetry:
         }
         self.gauges = {
             name: meter.create_gauge(name, unit="1")
-            for name in ("ai.queue.depth", "ai.consumer.lag", "ai.worker.utilization")
+            for name in (*_DEPTH_GAUGES, "ai.consumer.lag", "ai.worker.utilization")
         }
         self._closed = False
         self._shutdown_lock = threading.Lock()
@@ -324,7 +344,7 @@ class Telemetry:
                 if name == "ai.worker.utilization" and value > 1:
                     return
                 labels = _attributes(attrs, metric=True)
-                if name != "ai.queue.depth":
+                if name not in _DEPTH_GAUGES:
                     labels = {
                         key: val for key, val in labels.items() if key in {"topic", "partition"}
                     }
