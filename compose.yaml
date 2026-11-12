@@ -15,7 +15,8 @@ x-runtime-build: &runtime-build
 
 services:
   db:
-    image: postgres:19rc1-bookworm
+    image: fastapi-crud-postgres:19rc1-pgvector-0.8.7
+    build: docker/postgres
     ports:
       - "127.0.0.1:5433:5432"
     command: ["postgres", "-c", "max_connections=100"]
