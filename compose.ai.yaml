@@ -1,0 +1,251 @@
+# Standalone only: never merge with compose.yaml, compose.bench.yaml, or compose.test.yaml.
+# docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d api worker dispatcher
+name: fastapi-ai-local
+
+x-build: &build
+  context: .
+  target: test
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+# Role health checks probe broker TCP reachability; Kafka's own health check performs metadata I/O.
+x-processing-healthcheck: &processing-healthcheck
+  test: ["CMD", "python", "-c", "import socket; connection=socket.create_connection(('kafka',9092),timeout=2); connection.close()"]
+  interval: 10s
+  timeout: 3s
+  retries: 3
+  start_period: 15s
+x-db-environment: &db-environment
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME: app_ai
+  DB_USER: app_ai
+  DB_PASSWORD: ${AI_DB_PASSWORD:?Run scripts/init_ai_env.py and pass --env-file .ai-local/.env}
+  DB_POOL_SIZE: "4"
+x-processing-environment: &processing-environment
+  <<: *db-environment
+  AI_ENABLED: "true"
+  AI_MODEL: gpt-5.6-terra
+  AI_POLL_SECONDS: "0.25"
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_REQUEST_TOPIC: ai.item-rewrite.requested.v1
+  KAFKA_DEAD_LETTER_TOPIC: ai.item-rewrite.dead-letter.v1
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
+  OTEL_EXPORTER_OTLP_TIMEOUT: "3"
+  OTEL_BSP_SCHEDULE_DELAY: "200"
+
+services:
+  db:
+    image: postgres:19rc1-bookworm
+    command: ["postgres", "-c", "max_connections=100"]
+    environment:
+      POSTGRES_DB: app_ai
+      POSTGRES_USER: app_ai
+      POSTGRES_PASSWORD: ${AI_DB_PASSWORD:?Missing private AI database credential}
+    volumes:
+      - ai_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_ai -d app_ai"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    logging: *logging
+
+  redis:
+    image: redis:7.4.2-bookworm
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    logging: *logging
+
+  kafka:
+    image: apache/kafka:4.1.2
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: "24"
+      KAFKA_LOG_RETENTION_BYTES: "268435456"
+      KAFKA_LOG_SEGMENT_BYTES: "67108864"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes:
+      - ai_kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+    logging: *logging
+
+  topic-init:
+    image: apache/kafka:4.1.2
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        for topic in ai.item-rewrite.requested.v1 ai.item-rewrite.dead-letter.v1; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$topic" --partitions 6 --replication-factor 1 --config retention.ms=86400000 --config retention.bytes=268435456 --config max.message.bytes=65536
+          description=$$(/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$topic")
+          [[ "$$description" == *"PartitionCount: 6"* ]] || { echo 'Topic requires exactly six partitions' >&2; exit 1; }
+        done
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    logging: *logging
+
+  migrate:
+    build: *build
+    environment: *db-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    logging: *logging
+
+  provider:
+    build: *build
+    command: ["python", "tests/support/provider_simulator.py", "--host", "0.0.0.0", "--port", "8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/live', timeout=1)"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    logging: *logging
+
+  otlp:
+    build: *build
+    command: ["python", "tests/support/otlp_receiver.py", "--host", "0.0.0.0", "--port", "4318"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4318/health/live', timeout=1)"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    logging: *logging
+
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./observability/collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      otlp:
+        condition: service_healthy
+    logging: *logging
+
+  collector-ready:
+    build: *build
+    command:
+      - python
+      - -c
+      - |
+        import time
+        import urllib.request
+        for attempt in range(60):
+            try:
+                urllib.request.urlopen("http://collector:13133/", timeout=1).close()
+                break
+            except OSError:
+                time.sleep(1)
+        else:
+            raise SystemExit("Collector readiness deadline exceeded")
+    depends_on:
+      collector:
+        condition: service_started
+    restart: "no"
+    logging: *logging
+
+  api:
+    build: *build
+    environment:
+      <<: *processing-environment
+      DB_POOL_SIZE: "10"
+      REDIS_URL: redis://redis:6379/2
+      JWT_SECRET: ${AI_JWT_SECRET:?Missing private AI signing credential}
+      AUTH_TOKEN_TTL_SECONDS: ${AI_AUTH_TOKEN_TTL_SECONDS:-900}
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
+    ports:
+      - "127.0.0.1:${AI_API_PORT:-8002}:8000"
+    networks: [default, api_ingress]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready',timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      collector-ready:
+        condition: service_completed_successfully
+    logging: *logging
+
+  dispatcher:
+    build: *build
+    environment:
+      <<: *processing-environment
+      DB_POOL_SIZE: "2"
+    command: ["python", "-m", "app.ai.dispatcher"]
+    healthcheck: *processing-healthcheck
+    stop_grace_period: 50s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topic-init:
+        condition: service_completed_successfully
+      collector-ready:
+        condition: service_completed_successfully
+    logging: *logging
+
+  worker:
+    build: *build
+    environment:
+      <<: *processing-environment
+      OPENAI_API_KEY: local-simulator-only-not-a-real-key
+      OPENAI_BASE_URL: http://provider:8080/v1
+    command: ["python", "-m", "app.ai.worker"]
+    healthcheck: *processing-healthcheck
+    stop_grace_period: 50s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topic-init:
+        condition: service_completed_successfully
+      provider:
+        condition: service_healthy
+      collector-ready:
+        condition: service_completed_successfully
+    logging: *logging
+
+volumes:
+  ai_postgres_data:
+  ai_kafka_data:
+
+networks:
+  default:
+    internal: true
+  # Docker requires a non-internal API attachment for loopback port publication.
+  api_ingress:
+    internal: false

@@ -1,0 +1,90 @@
+# Standalone benchmark topology. Never merge this file with compose.yaml.
+x-benchmark-environment: &benchmark-environment
+  DATABASE_URL: ""
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME: app
+  DB_USER: app
+  DB_PASSWORD: ${BENCH_POSTGRES_PASSWORD:?Use scripts/benchmark_smoke.py}
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET: ${BENCH_JWT_SECRET:?Use scripts/benchmark_smoke.py}
+  AUTH_TOKEN_TTL_SECONDS: "7200"
+
+x-runtime-build: &runtime-build
+  context: .
+  target: runtime
+
+services:
+  db:
+    image: postgres:19rc1-bookworm
+    command: ["postgres", "-c", "max_connections=100"]
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${BENCH_POSTGRES_PASSWORD:?Use scripts/benchmark_smoke.py}
+    volumes:
+      - benchmark_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  redis:
+    image: redis:7.4
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru",
+              "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  migrate:
+    build: *runtime-build
+    environment: *benchmark-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: *runtime-build
+    environment: *benchmark-environment
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).close()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    stop_grace_period: 20s
+
+  tools:
+    profiles: ["tools"]
+    build:
+      context: .
+      target: test
+    environment: *benchmark-environment
+    user: "${BENCH_UID:?Use scripts/benchmark_smoke.py}:${BENCH_GID:?Use scripts/benchmark_smoke.py}"
+    volumes:
+      - type: bind
+        source: ${BENCH_ARTIFACTS:?Use scripts/benchmark_smoke.py}
+        target: /artifacts
+        bind:
+          create_host_path: false
+
+volumes:
+  benchmark_postgres_data:

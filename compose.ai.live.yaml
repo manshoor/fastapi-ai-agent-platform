@@ -1,0 +1,15 @@
+# Optional override for compose.ai.yaml ONLY. Never use with normal, benchmark, or QA data.
+# Default compose.ai.yaml remains simulator-only on an internal network.
+# Supplying this file and AI_OPENAI_API_KEY explicitly enables potentially billable generations.
+services:
+  worker:
+    environment:
+      OPENAI_API_KEY: ${AI_OPENAI_API_KEY:?Explicitly authorise paid generation with AI_OPENAI_API_KEY}
+      OPENAI_BASE_URL: https://api.openai.com/v1
+    networks:
+      - default
+      - provider_egress
+
+networks:
+  provider_egress:
+    internal: false

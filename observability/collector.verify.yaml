@@ -1,0 +1,84 @@
+# Explicit verification runner only; scripts/verify_ingestion.py selects the active backends.
+# Secret values are injected into the Collector process, never written into this template.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 96
+    spike_limit_mib: 24
+  transform/langfuse:
+    error_mode: propagate
+    trace_statements:
+      - context: resource
+        statements:
+          - keep_keys(attributes, ["service.name", "service.namespace"])
+      - context: span
+        statements:
+          - keep_keys(attributes, ["model", "provider", "prompt_version", "schema_version", "gen_ai.system", "gen_ai.operation.name", "gen_ai.request.model", "gen_ai.response.model", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens"])
+          - set(attributes["langfuse.observation.type"], "span")
+          - set(attributes["langfuse.observation.type"], "generation") where attributes["gen_ai.system"] != nil
+          - set(attributes["langfuse.environment"], "verification")
+          - set(status.message, "")
+  transform/langsmith:
+    error_mode: propagate
+    trace_statements:
+      - context: resource
+        statements:
+          - keep_keys(attributes, ["service.name", "service.namespace"])
+      - context: span
+        statements:
+          - keep_keys(attributes, ["model", "provider", "prompt_version", "schema_version", "gen_ai.system", "gen_ai.operation.name", "gen_ai.request.model", "gen_ai.response.model", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "langsmith.trace.id", "langsmith.span.id", "langsmith.span.parent_id", "langsmith.span.dotted_order"])
+          - set(attributes["langsmith.span.kind"], "chain")
+          - set(attributes["langsmith.span.kind"], "llm") where attributes["gen_ai.system"] != nil
+          - set(attributes["langsmith.metadata.model"], attributes["model"]) where attributes["model"] != nil
+          - set(attributes["langsmith.metadata.prompt_version"], attributes["prompt_version"]) where attributes["prompt_version"] != nil
+          - set(status.message, "")
+  batch:
+    timeout: 200ms
+    send_batch_size: 64
+    send_batch_max_size: 128
+exporters:
+  otlphttp/langfuse:
+    endpoint: ${env:VERIFY_LANGFUSE_OTLP_BASE}
+    headers:
+      Authorization: ${env:VERIFY_LANGFUSE_AUTH}
+      x-langfuse-ingestion-version: "4"
+    timeout: 3s
+    retry_on_failure:
+      enabled: false
+    sending_queue:
+      enabled: true
+      queue_size: 32
+      num_consumers: 1
+  otlphttp/langsmith:
+    endpoint: ${env:VERIFY_LANGSMITH_OTLP_BASE}
+    headers:
+      x-api-key: ${env:LANGSMITH_API_KEY}
+    timeout: 3s
+    retry_on_failure:
+      enabled: false
+    sending_queue:
+      enabled: true
+      queue_size: 32
+      num_consumers: 1
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: error
+  pipelines:
+    traces/langfuse:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/langfuse, batch]
+      exporters: [otlphttp/langfuse]
+    traces/langsmith:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/langsmith, batch]
+      exporters: [otlphttp/langsmith]

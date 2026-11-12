@@ -1,0 +1,74 @@
+x-test-environment: &test-environment
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME: app_test
+  DB_USER: app_test
+  DB_PASSWORD: test-only-postgres-password
+  REDIS_URL: redis://redis:6379/1
+  JWT_SECRET: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  AUTH_TOKEN_TTL_SECONDS: "900"
+
+x-test-build: &test-build
+  context: .
+  target: test
+
+services:
+  db:
+    image: postgres:19rc1-bookworm
+    command: ["postgres", "-c", "max_connections=100"]
+    environment:
+      POSTGRES_DB: app_test
+      POSTGRES_USER: app_test
+      POSTGRES_PASSWORD: test-only-postgres-password
+    volumes:
+      - test_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app_test -d app_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  redis:
+    image: redis:7.4
+    command:
+      - redis-server
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  migrate:
+    build: *test-build
+    environment: *test-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  tests:
+    build: *test-build
+    environment:
+      <<: *test-environment
+      PYTHONPATH: /app
+    command: ["pytest", "--cov=app", "--cov-report=term-missing"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  test_postgres_data:

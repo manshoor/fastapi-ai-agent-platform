@@ -1,0 +1,160 @@
+# Standalone local verification only; launch through scripts/langfuse_local.py.
+# Recipe: https://github.com/langfuse/langfuse/blob/v4.72.0/docker-compose.yml
+# Headless init: https://langfuse.com/self-hosting/administration/headless-initialization
+# Only web is published. Blob/media uploads from browsers are intentionally unsupported.
+x-logging: &logging
+  driver: none
+x-dependencies: &dependencies
+  postgres:
+    condition: service_healthy
+  clickhouse:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
+  minio:
+    condition: service_healthy
+x-langfuse-environment: &langfuse-environment
+  HOSTNAME: "0.0.0.0"
+  NEXTAUTH_URL: http://127.0.0.1:8005
+  DATABASE_URL: postgresql://langfuse:${POSTGRES_PASSWORD:?Missing generated credential}@postgres:5432/langfuse
+  SALT: ${SALT:?Missing generated credential}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Missing generated credential}
+  TELEMETRY_ENABLED: "false"
+  LANGFUSE_IN_APP_AGENT_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: langfuse
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Missing generated credential}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${REDIS_AUTH:?Missing generated credential}
+  REDIS_TLS_ENABLED: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Missing generated credential}
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Missing generated credential}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?Missing generated credential}
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?Missing generated credential}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+  LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+services:
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4.72.0
+    depends_on: *dependencies
+    networks: [default, api_ingress]
+    ports:
+      - "127.0.0.1:8005:3000"
+    environment:
+      <<: *langfuse-environment
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?Missing generated credential}
+      AUTH_DISABLE_SIGNUP: "true"
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:?Missing generated organization}
+      LANGFUSE_INIT_ORG_NAME: Local verification
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:?Missing generated project}
+      LANGFUSE_INIT_PROJECT_NAME: Local ingestion verification
+      LANGFUSE_INIT_PROJECT_RETENTION: "3"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:?Missing generated credential}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:?Missing generated credential}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:?Missing generated user}
+      LANGFUSE_INIT_USER_NAME: Local operator
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?Missing generated credential}
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/public/health?failIfDatabaseUnavailable=true"]
+      interval: 5s
+      timeout: 5s
+      retries: 48
+      start_period: 30s
+    logging: *logging
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4.72.0
+    depends_on: *dependencies
+    environment: *langfuse-environment
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3030/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 48
+      start_period: 30s
+    logging: *logging
+  postgres:
+    # PostgreSQL 17 is the upstream recipe's supported major.
+    image: docker.io/postgres:17.11-bookworm
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_DB: langfuse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Missing generated credential}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "langfuse", "-d", "langfuse"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    logging: *logging
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:26.3.62.3
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?Missing generated credential}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+  redis:
+    image: docker.io/redis:7.4.12-bookworm
+    environment:
+      REDIS_AUTH: ${REDIS_AUTH:?Missing generated credential}
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ['exec redis-server --requirepass "$$REDIS_AUTH" --maxmemory-policy noeviction --appendonly yes']
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'REDISCLI_AUTH="$$REDIS_AUTH" redis-cli ping | /bin/grep -qx PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    logging: *logging
+  minio:
+    # Immutable multi-arch digest resolved from the upstream recipe's public image.
+    image: cgr.dev/chainguard/minio@sha256:3b6e40c30ecd5cea627e382ff0b82ca841f58c52294578787043ee80c8ef7c82
+    entrypoint: ["sh", "-ec"]
+    command: ['mkdir -p /data/langfuse; exec minio --quiet --anonymous server --address ":9000" --console-address ":9001" /data']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Missing generated credential}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Missing generated credential}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    logging: *logging
+networks:
+  default:
+    internal: true
+  # Docker 29 needs a noninternal web network for loopback port publication.
+  # Only web joins this network; databases, blob storage, and worker stay internal.
+  api_ingress:
+    internal: false
+volumes:
+  postgres_data:
+  clickhouse_data:
+  clickhouse_logs:
+  redis_data:
+  minio_data:
