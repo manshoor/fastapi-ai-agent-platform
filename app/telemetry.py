@@ -36,6 +36,7 @@ _SPANS = frozenset(
         "ai.enqueue",
         "ai.claim",
         "ai.generate",
+        "ai.embed",
         "ai.persist",
         "ai.publish",
         "ai.consume",
