@@ -1,0 +1,72 @@
+# Lint, the PostgreSQL/Redis suite with a schema drift check, and the
+# Kafka/provider-simulator/collector suite. No secrets are used: every
+# credential below is a literal test-only value from the compose files.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - run: uv python install 3.13
+      - run: uv sync --locked
+      - run: uv run --locked ruff check .
+      - run: uv run --locked ruff format --check .
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      COMPOSE: docker compose --env-file /dev/null -p fastapi-qa -f compose.test.yaml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run suite
+        run: $COMPOSE run --build --rm tests
+      # Fails when app/models.py and migrations/ disagree.
+      - name: Check schema drift
+        run: $COMPOSE run --rm tests alembic check
+      - name: Show service logs
+        if: failure()
+        run: $COMPOSE logs --no-color
+      - name: Stop services
+        if: always()
+        run: $COMPOSE down --volumes --remove-orphans
+
+  ai-qa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      COMPOSE: docker compose --env-file /dev/null -p fastapi-ai-qa -f compose.ai.test.yaml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run suite
+        run: $COMPOSE run --build --rm tests
+      - name: Show service logs
+        if: failure()
+        run: $COMPOSE logs --no-color
+      - name: Stop services
+        if: always()
+        run: $COMPOSE down --volumes --remove-orphans
