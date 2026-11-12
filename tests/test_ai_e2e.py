@@ -6,205 +6,43 @@ Never run this suite concurrently with the explicit live-HTTP smoke profile.
 """
 
 import asyncio
-import fcntl
 import json
 import os
-import subprocess
-import sys
-import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
-import httpx
 import pytest
 from aiokafka import AIOKafkaConsumer, TopicPartition
-from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from sqlalchemy import select
 
 from app.ai.config import AISettings
 from app.ai.contracts import RewriteEvent
 from app.ai.kafka import close_producer, create_producer
 from app.models import AIJob, AIOutbox
+from tests.support.e2e import ROOT, eventually, isolated_runtime
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("AI_QA") != "1", reason="requires isolated AI QA stack"
 )
-ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"succeeded", "failed", "needs_reconciliation"}
-
-
-async def eventually(check, *, seconds: float = 45, message: str = "condition deadline exceeded"):
-    deadline = time.monotonic() + seconds
-    while True:
-        value = await check()
-        if value:
-            return value
-        if time.monotonic() >= deadline:
-            raise AssertionError(message)
-        await asyncio.sleep(0.05)
-
-
-@dataclass
-class Runtime:
-    settings: AISettings
-    environment: dict[str, str]
-    simulator: httpx.AsyncClient
-    receiver: httpx.AsyncClient
-    processes: dict[str, subprocess.Popen] = field(default_factory=dict)
-
-    def start(self, role: str, **overrides: str) -> None:
-        if role in self.processes:
-            raise AssertionError("role already started")
-        self.processes[role] = subprocess.Popen(
-            [sys.executable, "-m", f"app.ai.{role}"],
-            cwd=ROOT,
-            env={**self.environment, **overrides},
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    async def stop(self, role: str, *, crash: bool = False) -> None:
-        process = self.processes.pop(role, None)
-        if process is None:
-            return
-        if process.poll() is None:
-            try:
-                process.kill() if crash else process.terminate()
-            except ProcessLookupError:
-                pass
-        try:
-            await asyncio.to_thread(process.wait, timeout=50)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            await asyncio.to_thread(process.wait, timeout=5)
-            if not crash:
-                raise AssertionError("AI child exceeded graceful shutdown deadline") from None
-
-    async def close(self) -> None:
-        failures = []
-        for role in tuple(self.processes):
-            try:
-                await self.stop(role)
-            except AssertionError as exc:
-                failures.append(exc)
-        if failures:
-            raise failures[0]
-
-    def healthy(self) -> None:
-        if any(process.poll() is not None for process in self.processes.values()):
-            raise AssertionError(
-                "AI child exited unexpectedly; no provider response details emitted"
-            )
-
-    async def control(self, modes: list[str], *, delay_seconds: float = 3, max_calls: int = 10):
-        response = await self.simulator.post(
-            "/__control",
-            json={"modes": modes, "delay_seconds": delay_seconds, "max_calls": max_calls},
-        )
-        assert response.status_code == 200
-
-    async def calls(self) -> int:
-        response = await self.simulator.get("/__state")
-        assert response.status_code == 200
-        return response.json()["calls"]
 
 
 @pytest.fixture
 async def runtime(app):
-    # Explicit guards in addition to the ordinary fixture's resolved driver safety guards.
-    if not app.state.ai_settings or not app.state.ai_settings.ai_enabled:
-        raise AssertionError("AI QA requires AI_ENABLED")
-    provider_url = os.environ.get("AI_PROVIDER_SIMULATOR_URL", "http://provider:8080")
-    receiver_url = os.environ.get("AI_OTLP_RECEIVER_URL", "http://otlp:4318")
-    for value, hosts in (
-        (provider_url, {"provider", "localhost", "127.0.0.1"}),
-        (receiver_url, {"otlp", "localhost", "127.0.0.1"}),
-    ):
-        parsed = urlsplit(value)
-        if parsed.scheme != "http" or parsed.hostname not in hosts or parsed.username:
-            raise AssertionError("AI QA refuses nonlocal infrastructure")
-    lock_fd = os.open(
-        "/tmp/item-rewrite-ai-e2e.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
-    )
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(lock_fd)
-        raise AssertionError("AI E2E cannot run concurrently") from None
     prefix = f"ai.qa.{uuid4().hex}"
     overrides = {
         "KAFKA_REQUEST_TOPIC": f"{prefix}.requests",
         "KAFKA_DEAD_LETTER_TOPIC": f"{prefix}.dead-letter",
         "KAFKA_GROUP_ID": prefix,
-        "OPENAI_BASE_URL": f"{provider_url}/v1",
-        "OPENAI_API_KEY": "local-simulator-only-not-a-real-key",
     }
-    # Processing roles receive neither JWT nor Redis credentials, even in subprocess QA.
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if key.startswith(("DB_", "AI_", "KAFKA_", "OTEL_"))
-        or key in {"DATABASE_URL", "PATH", "PYTHONPATH", "HOME", "LANG", "PYTHONUNBUFFERED"}
-    }
-    environment.update(overrides)
-    settings = AISettings(**{key.lower(): value for key, value in overrides.items()})
-    admin = AIOKafkaAdminClient(bootstrap_servers=settings.kafka_bootstrap_servers)
-    started = False
-    created = False
-    children = None
-    try:
-        async with asyncio.timeout(15):
-            await admin.start()
-        started = True
-        async with asyncio.timeout(15):
-            await admin.create_topics(
-                [
-                    NewTopic(
-                        topic,
-                        num_partitions=6,
-                        replication_factor=1,
-                        topic_configs={"retention.ms": "60000", "retention.bytes": "1048576"},
-                    )
-                    for topic in (settings.kafka_request_topic, settings.kafka_dead_letter_topic)
-                ]
-            )
-        created = True
-        async with (
-            httpx.AsyncClient(base_url=provider_url, timeout=5, trust_env=False) as simulator,
-            httpx.AsyncClient(base_url=receiver_url, timeout=5, trust_env=False) as receiver,
-        ):
-            children = Runtime(settings, environment, simulator, receiver)
-            await children.control([])
-            assert (await receiver.post("/__reset")).status_code == 200
-            children.start("dispatcher")
-            children.start("worker")
-            try:
-                yield children
-            finally:
-                await children.close()
-
-                async def idle():
-                    response = await simulator.get("/__state")
-                    return response.status_code == 200 and response.json()["in_flight"] == 0
-
-                await eventually(idle, seconds=10, message="simulator did not drain")
-    finally:
-        try:
-            if children is not None and children.processes:
-                await children.close()
-            if created:
-                async with asyncio.timeout(15):
-                    await admin.delete_topics(
-                        [settings.kafka_request_topic, settings.kafka_dead_letter_topic]
-                    )
-        finally:
-            if started:
-                await admin.close()
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
+    async with isolated_runtime(
+        app,
+        settings_type=AISettings,
+        overrides=overrides,
+        topics=[f"{prefix}.requests", f"{prefix}.dead-letter"],
+        roles=["dispatcher", "worker"],
+    ) as children:
+        yield children
 
 
 async def submit(client, owner, item, *, instruction="Clarify the synthetic wording.", key=None):

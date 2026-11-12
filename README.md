@@ -399,6 +399,58 @@ Real model comparisons require `--provider --allow-paid-requests`, an explicit `
 
 Implementation verification: 543 tests passed in the isolated AI topology, including actual Kafka/manual commits/rebalance, provider failure/retry bounds, worker crash after send, stale fences, publication commit gaps, logical/physical expiry, SDK debug-log privacy, Collector trace/metric routing, product-readback acceptance/privacy, and bounded-load safety. The deployed HTTP smoke and ordinary CRUD/cache smoke also passed through loopback port 8002. The original QA topology previously passed with AI infrastructure absent (infrastructure-specific cases skipped), and `alembic check` found no model/migration drift. These checks establish local behaviour, not AI quality, production capacity, cloud ingestion, or HA; the separately exercised local Langfuse ingestion is documented above.
 
+## Document question answering (RAG)
+
+RAG (retrieval-augmented generation) answers a question from the owner's own uploaded documents, with citations. It is off unless `RAG_ENABLED=true` **and** `AI_ENABLED=true`; it reuses the AI stack's Kafka, provider, and Collector. `compose.ai.yaml` and `compose.ai.test.yaml` enable it and add a `rag-worker` service.
+
+```
+upload --> API: auth -> bounded multipart read -> rag_documents(pending) + rag_outbox, one transaction -> 202
+                 dispatcher --> Kafka rag.document-ingest.requested.v1 --> rag-worker
+                 rag-worker: lease -> parse (PDF in a sandboxed child process) -> chunk -> embed -> rag_chunks -> ready
+query  --> API: auth -> query slot -> admit (rate limit) -> embed question -> owner-scoped pgvector KNN
+                 -> grounded answer -> citations checked against the passages -> 200
+```
+
+Start and smoke the local stack (simulator only, no paid calls):
+
+```bash
+python3 scripts/init_ai_env.py
+docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d --wait api worker rag-worker dispatcher
+uv run --locked python scripts/smoke_rag.py
+```
+
+The smoke uploads a Markdown file and a generated PDF, waits for `ready`, checks that the answer cites the right document, that a second account sees nothing, and that deletion turns the answer into `no_context`. It prints no tokens or content.
+
+### RAG HTTP contract
+
+All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
+
+| Route | Success | Notes |
+| --- | --- | --- |
+| `POST /api/v1/rag/documents` | 202; 200 on replay of a finished upload | Multipart `title` (1–200 chars) + one `file` (`.txt`, `.md`, `.pdf`). `Idempotency-Key` header. `Location` header. |
+| `GET /api/v1/rag/documents` | 200 | Owner's documents, newest first. |
+| `GET /api/v1/rag/documents/{id}` | 200 | Status, chunk and page counts, error code, timestamps. Never the content. |
+| `DELETE /api/v1/rag/documents/{id}` | 204 | Removes the document, its chunks, outbox rows **and its idempotency record**: the same key can then create a new document. |
+| `POST /api/v1/rag/query` | 200 | JSON `question` (1–2,000 chars), `top_k` (1–8, default 4), optional `document_ids` (1–20). Returns `status` (`answered`/`no_context`), `answer`, `citations[{document_id,title,ordinal,page,snippet}]`. |
+
+Upload errors: 401 before any body byte is read; 400 malformed multipart or disconnect; 408 slow body; 409 key reused with other content; 413 too large; 415 wrong type; 422 bad title, empty file, invalid UTF-8, NUL, or bad PDF header; 429 owner quota or another upload by the same owner in progress; 503 disabled, busy, or global backlog full.
+
+Query errors: 429 owner rate limit (`Retry-After`); 503 disabled, busy, or provider rate-limited; 504 provider timeout or the 60 s deadline; 502 any other provider failure. Foreign and missing documents share one 404, and a foreign `document_ids` filter gives `no_context`.
+
+### RAG rules and limits
+
+- Every SQL statement on documents, chunks and queries filters by owner. A composite foreign key stops a chunk from belonging to another owner's document.
+- No question with zero searchable chunks reaches the provider. An answer that cites no supplied passage becomes `no_context` with fixed text, so uncited model text is never shown.
+- No database transaction spans provider, Kafka, or child-process I/O. Each provider call is one attempt; the worker owns embedding retries (at most three attempts). Answers are never replayed.
+- Worker writes are fenced by status, attempt, lease token, lease generation, and database-clock expiry. A document deleted mid-ingestion stops the worker without writes.
+- Uploaded bytes are deleted when ingestion ends (`ready` or `failed`). Chunk text stays until the owner deletes the document. `rag_queries` keeps usage metadata only, never question or answer text.
+- The LCEL chain runs under `langsmith.tracing_context(enabled=False)`, so `LANGSMITH_TRACING` in the environment cannot export content. Telemetry carries IDs, counts, models, and fixed codes only; the Collector maps embedding, retriever, and chain observation types.
+- PDF parsing runs in a child process with CPU, memory, and file-size limits, a scrubbed environment, and a wall timeout. The Linux container is the supported runtime; on macOS the limits cannot be set, so PDF parsing fails closed.
+
+Defaults: text 1 MiB; PDF 5 MiB, 300 pages, 30 s, 1 GiB; 1,000,000 extracted characters; chunks of 1,200 characters with 200 overlap, at most 1,200 per document; 64 chunks per embedding request. 50 documents and 5 unsettled per owner; 100 unsettled globally; one upload per owner and 4 uploads and 4 queries per API process; 10 queries per 60 s per owner. Embeddings use `text-embedding-3-small` (1,536 dimensions) in pgvector 0.8.7 with an HNSW cosine index. Pools: API 10 + dispatcher 2 + worker 4 + rag-worker 4 = 20 of PostgreSQL's 100.
+
+With `compose.ai.live.yaml`, the rag-worker pays for document embeddings and the API pays for question embeddings and answers. The same paid-use authorisation applies.
+
 ## Isolated 20-user benchmark smoke
 
 Run this bounded setup from the repository root:
