@@ -1,5 +1,5 @@
 # Standalone only: never merge with compose.yaml, compose.bench.yaml, or compose.test.yaml.
-# docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d api worker dispatcher
+# docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d api worker rag-worker dispatcher
 name: fastapi-ai-local
 
 x-build: &build
@@ -32,6 +32,9 @@ x-processing-environment: &processing-environment
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   KAFKA_REQUEST_TOPIC: ai.item-rewrite.requested.v1
   KAFKA_DEAD_LETTER_TOPIC: ai.item-rewrite.dead-letter.v1
+  RAG_ENABLED: "true"
+  KAFKA_RAG_REQUEST_TOPIC: rag.document-ingest.requested.v1
+  KAFKA_RAG_DEAD_LETTER_TOPIC: rag.document-ingest.dead-letter.v1
   OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
   OTEL_EXPORTER_OTLP_TIMEOUT: "3"
   OTEL_BSP_SCHEDULE_DELAY: "200"
@@ -102,7 +105,7 @@ services:
     entrypoint: ["/bin/bash", "-ec"]
     command:
       - |
-        for topic in ai.item-rewrite.requested.v1 ai.item-rewrite.dead-letter.v1; do
+        for topic in ai.item-rewrite.requested.v1 ai.item-rewrite.dead-letter.v1 rag.document-ingest.requested.v1 rag.document-ingest.dead-letter.v1; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$topic" --partitions 6 --replication-factor 1 --config retention.ms=86400000 --config retention.bytes=268435456 --config max.message.bytes=65536
           description=$$(/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$topic")
           [[ "$$description" == *"PartitionCount: 6"* ]] || { echo 'Topic requires exactly six partitions' >&2; exit 1; }
@@ -183,6 +186,9 @@ services:
       REDIS_URL: redis://redis:6379/2
       JWT_SECRET: ${AI_JWT_SECRET:?Missing private AI signing credential}
       AUTH_TOKEN_TTL_SECONDS: ${AI_AUTH_TOKEN_TTL_SECONDS:-900}
+      # RAG queries embed the question and generate the answer from the API process.
+      OPENAI_API_KEY: local-simulator-only-not-a-real-key
+      OPENAI_BASE_URL: http://provider:8080/v1
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
     ports:
       - "127.0.0.1:${AI_API_PORT:-8002}:8000"
@@ -196,6 +202,8 @@ services:
       migrate:
         condition: service_completed_successfully
       redis:
+        condition: service_healthy
+      provider:
         condition: service_healthy
       collector-ready:
         condition: service_completed_successfully
@@ -226,6 +234,27 @@ services:
       OPENAI_API_KEY: local-simulator-only-not-a-real-key
       OPENAI_BASE_URL: http://provider:8080/v1
     command: ["python", "-m", "app.ai.worker"]
+    healthcheck: *processing-healthcheck
+    stop_grace_period: 50s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      topic-init:
+        condition: service_completed_successfully
+      provider:
+        condition: service_healthy
+      collector-ready:
+        condition: service_completed_successfully
+    logging: *logging
+
+  rag-worker:
+    build: *build
+    environment:
+      <<: *processing-environment
+      OPENAI_API_KEY: local-simulator-only-not-a-real-key
+      OPENAI_BASE_URL: http://provider:8080/v1
+    command: ["python", "-m", "app.rag.worker"]
     healthcheck: *processing-healthcheck
     stop_grace_period: 50s
     restart: unless-stopped

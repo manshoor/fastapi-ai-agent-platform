@@ -8,6 +8,8 @@ from app.ai.config import AISettings
 from app.ai.kafka import close_producer, create_producer, dispatch_once
 from app.ai.processing import maintain_jobs, recover_jobs
 from app.db import create_engine, create_session_factory
+from app.rag import ingestion, outbox
+from app.rag.config import RAGSettings
 from app.telemetry import configure_telemetry
 
 
@@ -34,9 +36,24 @@ async def run_dispatcher(settings: AISettings | None = None) -> None:
     engine = create_engine(settings)
     session_factory = create_session_factory(engine)
     producer = None
+    # RAG settings add only rag_* fields; the database and Kafka values are shared.
+    rag_settings = RAGSettings(**settings.model_dump())
     try:
         producer = await create_producer(settings)
         while not stop.is_set():
+            if rag_settings.rag_enabled:
+                await ingestion.recover_documents(
+                    session_factory=session_factory,
+                    settings=rag_settings,
+                    telemetry=telemetry,
+                )
+                await outbox.dispatch_once(
+                    session_factory=session_factory,
+                    settings=rag_settings,
+                    producer=producer,
+                    telemetry=telemetry,
+                    stop=stop,
+                )
             await recover_jobs(
                 session_factory=session_factory,
                 settings=settings,

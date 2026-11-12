@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from aiokafka import AIOKafkaConsumer, ConsumerRebalanceListener, TopicPartition
@@ -18,6 +18,8 @@ from app.telemetry import Telemetry, configure_telemetry
 
 DRAIN_SECONDS = 5
 PARTITION_COUNT = 6
+# Handles one Kafka record; called with keyword arguments as handle_record is.
+RecordHandler = Callable[..., Awaitable[HandleResult]]
 
 
 class PartitionProcessor(ConsumerRebalanceListener):
@@ -33,6 +35,8 @@ class PartitionProcessor(ConsumerRebalanceListener):
         provider_factory: ProviderFactory,
         stop: asyncio.Event,
         telemetry: Telemetry | None = None,
+        handler: RecordHandler | None = None,
+        topic: str | None = None,
     ) -> None:
         self.consumer = consumer
         self.producer = producer
@@ -41,6 +45,10 @@ class PartitionProcessor(ConsumerRebalanceListener):
         self.provider_factory = provider_factory
         self.stop = stop
         self.telemetry = telemetry
+        # Defaults to item rewrites; the RAG worker supplies its own record handler.
+        self.handler = handler or handle_record
+        # Metric label only: the topic this processor consumes.
+        self.topic = topic or settings.kafka_request_topic
         self.semaphore = asyncio.Semaphore(settings.ai_concurrency)
         self.commit_lock = asyncio.Lock()
         self.tasks: dict[TopicPartition, asyncio.Task] = {}
@@ -52,7 +60,7 @@ class PartitionProcessor(ConsumerRebalanceListener):
             self.telemetry.observe(
                 "ai.worker.utilization",
                 self.active / self.settings.ai_concurrency,
-                topic=self.settings.kafka_request_topic,
+                topic=self.topic,
             )
 
     async def observe_lag(self, tp: TopicPartition) -> None:
@@ -102,7 +110,7 @@ class PartitionProcessor(ConsumerRebalanceListener):
                         self.active += 1
                         self.observe_utilization()
                         try:
-                            result = await handle_record(
+                            result = await self.handler(
                                 session_factory=self.session_factory,
                                 settings=self.settings,
                                 record=record,

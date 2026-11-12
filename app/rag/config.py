@@ -25,7 +25,7 @@ class RAGSettings(AISettings):
     rag_chunk_size: int = Field(default=1200, ge=100, le=4000)
     rag_chunk_overlap: int = Field(default=200, ge=0, le=1000)
     rag_max_chunks: int = Field(default=1200, ge=1, le=10_000)
-    rag_embedding_batch_size: int = Field(default=64, ge=1, le=2048)
+    rag_embedding_batch_size: int = Field(default=64, ge=1, le=256)
 
     # Quotas: documents are kept until deleted; unsettled = pending or processing.
     rag_owner_document_limit: int = Field(default=50, ge=1, le=10_000)
@@ -36,7 +36,7 @@ class RAGSettings(AISettings):
     rag_query_limit: int = Field(default=10, ge=1, le=10_000)
     rag_query_window_seconds: float = Field(default=60, gt=0, le=86400)
     rag_query_concurrency: int = Field(default=4, ge=1, le=64)
-    rag_query_deadline_seconds: float = Field(default=45, gt=0, le=120)
+    rag_query_deadline_seconds: float = Field(default=60, gt=0, le=120)
 
     # Ingestion lifecycle.
     rag_lease_seconds: float = Field(default=120, gt=0)
@@ -48,16 +48,24 @@ class RAGSettings(AISettings):
 
     @model_validator(mode="after")
     def validate_rag(self) -> "RAGSettings":
-        if self.rag_enabled and not self.ai_enabled:
+        if not self.rag_enabled:
+            # The rewrite dispatcher builds these settings too; RAG-only rules apply when on.
+            return self
+        if not self.ai_enabled:
             raise ValueError("RAG_ENABLED requires AI_ENABLED")
         if self.ai_embedding_dimensions != RAG_EMBEDDING_DIMENSIONS:
             raise ValueError("AI_EMBEDDING_DIMENSIONS must match the vector column")
         if self.rag_chunk_overlap >= self.rag_chunk_size:
             raise ValueError("RAG_CHUNK_OVERLAP must be smaller than RAG_CHUNK_SIZE")
-        # A lease must outlive the slowest single step it covers.
-        slowest = max(self.rag_pdf_timeout_seconds, self.ai_embedding_timeout_seconds)
-        if self.rag_lease_seconds <= slowest + 5:
-            raise ValueError("RAG_LEASE_SECONDS must exceed parse and embedding timeouts by 5s")
+        # The first renewal comes only after parsing and the first embedding batch.
+        first_renewal = self.rag_pdf_timeout_seconds + self.ai_embedding_timeout_seconds
+        if self.rag_lease_seconds <= first_renewal + 5:
+            raise ValueError("RAG_LEASE_SECONDS must exceed parse + embedding timeouts by 5s")
+        # Provider timeouts must fire before the query deadline: a billed answer is never
+        # thrown away by the deadline.
+        provider_total = self.ai_embedding_timeout_seconds + self.ai_provider_timeout_seconds
+        if self.rag_query_deadline_seconds <= provider_total:
+            raise ValueError("RAG_QUERY_DEADLINE_SECONDS must exceed both provider timeouts")
         return self
 
     @property
