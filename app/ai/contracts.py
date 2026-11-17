@@ -40,6 +40,20 @@ class GroundedAnswer(StrictSchema):
     citations: list[PassageLabel] = Field(max_length=8)
 
 
+class AssistantReply(StrictSchema):
+    """Final assistant output. Citations are labels of passages returned by search this turn."""
+
+    answer: Answer
+    citations: list[PassageLabel] = Field(max_length=8)
+
+
+class JudgeVerdict(StrictSchema):
+    """Evaluation-only grade of one answer against the passages it cites."""
+
+    grounded: bool
+    answers_question: bool
+
+
 class RewriteEvent(StrictSchema):
     version: Literal[1]
     event_id: UUID
