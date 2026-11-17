@@ -4,8 +4,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.assistant.actions import confirm_action
 from app.assistant.config import AssistantSettings
-from app.assistant.contracts import ResidenceView
+from app.assistant.contracts import ConfirmResponse, ResidenceView
 from app.assistant.residence import Resident, create_demo_residence, load_resident, residence_view
 from app.config import Settings
 from app.db import get_session
@@ -67,3 +68,17 @@ async def create_demo(
     await session.rollback()
     response.headers["Cache-Control"] = "no-store"
     return view
+
+
+@router.post(
+    "/assistant/actions/{action_id}/confirm",
+    response_model=ConfirmResponse,
+    responses={403: {}, 404: {}, 409: {}, 503: {}},
+)
+async def confirm(
+    request: Request, response: Response, action_id: UUID, owner_id: Owner, session: Session
+) -> ConfirmResponse:
+    _settings(request)
+    response.headers["Cache-Control"] = "no-store"
+    resident = await _resident(session, owner_id)
+    return await confirm_action(session, resident, action_id)
