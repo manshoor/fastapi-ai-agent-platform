@@ -368,8 +368,12 @@ async def test_langsmith_environment_cannot_export_content(
         monkeypatch.setenv("LANGSMITH_TRACING", "true")
         monkeypatch.setenv("LANGSMITH_ENDPOINT", endpoint)
         monkeypatch.setenv("LANGSMITH_API_KEY", "synthetic-langsmith-key")
+        import langsmith.run_trees
         import langsmith.utils
 
+        # The process caches one LangSmith client: start and end with none, so no
+        # other test inherits this capture endpoint.
+        langsmith.run_trees._CLIENT = None
         langsmith.utils.get_env_var.cache_clear()
         try:
             # Positive control: this environment does export an ordinary chain run.
@@ -389,6 +393,7 @@ async def test_langsmith_environment_cannot_export_content(
             assert [entry for entry in received if entry[0] != "GET"] == []
         finally:
             monkeypatch.delenv("LANGSMITH_TRACING")
+            langsmith.run_trees._CLIENT = None
             langsmith.utils.get_env_var.cache_clear()
 
 

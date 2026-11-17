@@ -39,6 +39,7 @@ from app.assistant.residence import Resident
 from app.assistant.runtime import AssistantRuntime
 from app.assistant.tools import ToolContext
 from app.models import AssistantTurn, Device, PendingAction
+from app.telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
 # Two-key advisory lock namespace for per-user turn admission ("ASTA").
@@ -129,6 +130,7 @@ async def _resident_context(session_factory: SessionFactory, resident: Resident)
 
 
 async def _record(
+    telemetry: Telemetry,
     session_factory: SessionFactory,
     turn_id: UUID,
     status: str,
@@ -136,6 +138,9 @@ async def _record(
     error_code: str | None = None,
 ) -> None:
     """Best effort: a failed usage write never turns a committed result into an error."""
+    counts = {"model_calls": run.model_calls, "tool_calls": len(run.actions)} if run else {}
+    telemetry.annotate(status=status, error_code=error_code, **counts)
+    telemetry.increment("assistant.turns", status=status, error_code=error_code)
     values = {"status": status, "error_code": error_code, "finished_at": func.clock_timestamp()}
     if run is not None:
         values.update(
@@ -281,7 +286,7 @@ async def _finish(
         code = DEADLINE_CODE
     if code is not None:
         if not _committed(run.actions):
-            await _record(session_factory, turn_id, "failed", run, code)
+            await _record(runtime.telemetry, session_factory, turn_id, "failed", run, code)
             raise _http_error(code)
         # Never hide a committed action behind an error.
         status, answer, citations = "incomplete", INCOMPLETE_ANSWER, []
@@ -290,7 +295,7 @@ async def _finish(
     else:
         status, answer = "no_context", NO_CONTEXT_ANSWER
     pending = await _pending_views(session_factory, run)
-    await _record(session_factory, turn_id, status, run, code)
+    await _record(runtime.telemetry, session_factory, turn_id, status, run, code)
     return _response(turn_id, run, status, answer, citations, pending)
 
 
@@ -304,35 +309,56 @@ async def run_turn(
     settings = runtime.settings
     async with runtime.turn_slot(resident.user_id):
         turn_id = await _admit(session_factory, runtime, resident.user_id)
-        run: TurnRun | None = None
-        try:
-            context = await _resident_context(session_factory, resident)
-            run = TurnRun(
-                context=ToolContext(
-                    session_factory=session_factory,
-                    settings=settings,
-                    resident=resident,
-                    turn_id=turn_id,
-                    embedder=runtime.embedder,
-                    telemetry=runtime.telemetry,
-                ),
-                model=runtime.model,
-                deadline=time.monotonic() + settings.assistant_turn_deadline_seconds,
-                items=[first_input(context, message)],
-            )
-            return await _finish(session_factory, runtime, turn_id, run)
-        except HTTPException:
-            raise
-        except asyncio.CancelledError:
-            await _record(session_factory, turn_id, "failed", run, CANCELLED_CODE)
-            raise
-        except Exception as exc:
-            # Database outages (including builtin connect timeouts) and programming errors.
-            database = isinstance(exc, (SQLAlchemyError, OSError, TimeoutError))
-            code = DATABASE_CODE if database else "internal_error"
-            if run is not None and _committed(run.actions):
-                # The write stands; report it. Pending ids are in the actions.
-                await _record(session_factory, turn_id, "incomplete", run, code)
-                return _response(turn_id, run, "incomplete", INCOMPLETE_ANSWER, [], [])
-            await _record(session_factory, turn_id, "failed", run, code)
-            raise
+        with runtime.telemetry.span(
+            "assistant.turn",
+            turn_id=str(turn_id),
+            model=settings.ai_model,
+            prompt_version=ASSISTANT_PROMPT_VERSION,
+        ):
+            started = time.monotonic()
+            try:
+                return await _turn(session_factory, runtime, resident, message, turn_id)
+            finally:
+                runtime.telemetry.observe("assistant.turn.duration", time.monotonic() - started)
+
+
+async def _turn(
+    session_factory: SessionFactory,
+    runtime: AssistantRuntime,
+    resident: Resident,
+    message: str,
+    turn_id: UUID,
+) -> TurnResponse:
+    settings = runtime.settings
+    run: TurnRun | None = None
+    try:
+        context = await _resident_context(session_factory, resident)
+        run = TurnRun(
+            context=ToolContext(
+                session_factory=session_factory,
+                settings=settings,
+                resident=resident,
+                turn_id=turn_id,
+                embedder=runtime.embedder,
+                telemetry=runtime.telemetry,
+            ),
+            model=runtime.model,
+            deadline=time.monotonic() + settings.assistant_turn_deadline_seconds,
+            items=[first_input(context, message)],
+        )
+        return await _finish(session_factory, runtime, turn_id, run)
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        await _record(runtime.telemetry, session_factory, turn_id, "failed", run, CANCELLED_CODE)
+        raise
+    except Exception as exc:
+        # Database outages (including builtin connect timeouts) and programming errors.
+        database = isinstance(exc, (SQLAlchemyError, OSError, TimeoutError))
+        code = DATABASE_CODE if database else "internal_error"
+        if run is not None and _committed(run.actions):
+            # The write stands; report it. Pending ids are in the actions.
+            await _record(runtime.telemetry, session_factory, turn_id, "incomplete", run, code)
+            return _response(turn_id, run, "incomplete", INCOMPLETE_ANSWER, [], [])
+        await _record(runtime.telemetry, session_factory, turn_id, "failed", run, code)
+        raise

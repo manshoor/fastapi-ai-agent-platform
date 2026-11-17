@@ -511,6 +511,20 @@ TOOL_SCHEMAS = [
 
 async def execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     """Run one model tool call under the server's rules. Always audited."""
+    telemetry = ctx.telemetry
+    if telemetry is None:
+        return await _execute(ctx, call)
+    # The span names only allowlisted tools; anything else is "unknown".
+    tool = call.name if call.name in _SPECS else UNKNOWN_TOOL
+    with telemetry.span("assistant.tool", operation=tool, turn_id=str(ctx.turn_id)):
+        outcome = await _execute(ctx, call)
+        decision, result = str(outcome.action.decision), str(outcome.action.result)
+        telemetry.annotate(status=decision, outcome=result)
+        telemetry.increment("assistant.tool_calls", operation=tool, status=decision, outcome=result)
+    return outcome
+
+
+async def _execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     spec = _SPECS.get(call.name)
     if spec is None:
         await _audited(ctx, UNKNOWN_TOOL, Decision.DENIED, ResultCode.UNKNOWN_TOOL)

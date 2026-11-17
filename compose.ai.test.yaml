@@ -194,6 +194,8 @@ services:
       AI_QA: "1"
       # Each RAG test enables RAG itself; AI-off tests must not inherit it.
       RAG_ENABLED: "false"
+      ASSISTANT_ENABLED: "false"
+      ASSISTANT_DEMO_ENABLED: "false"
       AI_PROVIDER_SIMULATOR_URL: http://provider:8080
       AI_OTLP_RECEIVER_URL: http://otlp:4318
       OPENAI_API_KEY: local-simulator-only-not-a-real-key
@@ -219,6 +221,8 @@ services:
     environment:
       <<: *api-environment
       DB_POOL_SIZE: "10"
+      ASSISTANT_ENABLED: "true"
+      ASSISTANT_DEMO_ENABLED: "true"
       OPENAI_API_KEY: local-simulator-only-not-a-real-key
       OPENAI_BASE_URL: http://provider:8080/v1
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]

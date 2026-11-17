@@ -82,8 +82,10 @@ async def confirm(
 ) -> ConfirmResponse:
     _settings(request)
     response.headers["Cache-Control"] = "no-store"
-    resident = await _resident(session, owner_id)
-    return await confirm_action(session, resident, action_id)
+    telemetry = request.app.state.telemetry
+    with telemetry.span("assistant.confirm", action_id=str(action_id)):
+        resident = await _resident(session, owner_id)
+        return await confirm_action(session, resident, action_id)
 
 
 @router.post(

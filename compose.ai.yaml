@@ -186,6 +186,9 @@ services:
       REDIS_URL: redis://redis:6379/2
       JWT_SECRET: ${AI_JWT_SECRET:?Missing private AI signing credential}
       AUTH_TOKEN_TTL_SECONDS: ${AI_AUTH_TOKEN_TTL_SECONDS:-900}
+      # The resident assistant and its demo setup route run in the API process only.
+      ASSISTANT_ENABLED: "true"
+      ASSISTANT_DEMO_ENABLED: "true"
       # RAG queries embed the question and generate the answer from the API process.
       OPENAI_API_KEY: local-simulator-only-not-a-real-key
       OPENAI_BASE_URL: http://provider:8080/v1
