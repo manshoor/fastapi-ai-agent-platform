@@ -49,6 +49,8 @@ class DocumentResponse(StrictSchema):
     """Document metadata only; neither source bytes nor chunk text is ever returned."""
 
     id: UUID
+    # Set for building documents; residents of that building can search them.
+    building_id: UUID | None
     title: str
     content_type: ContentType
     size_bytes: int

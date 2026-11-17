@@ -19,6 +19,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.ai.config import AISettings
 from app.ai.router import router as ai_router
+from app.assistant.config import AssistantSettings
+from app.assistant.router import router as assistant_router
 from app.auth import router as auth_router
 from app.cache import ItemCache
 from app.config import Settings
@@ -59,6 +61,9 @@ _VALIDATION_LOCATIONS = frozenset(
         "question",
         "top_k",
         "document_ids",
+        "message",
+        "action_id",
+        "building_id",
     }
 )
 _VALIDATION_MESSAGES = {
@@ -288,6 +293,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 telemetry = configure_telemetry("rewrite-api")
                 application.state.telemetry = telemetry
+                application.state.assistant_settings = (
+                    AssistantSettings(**runtime_settings.model_dump())
+                    if runtime_settings.assistant_enabled
+                    else None
+                )
                 application.state.rag = None
                 application.state.rag_upload_ceiling = None
                 if runtime_settings.rag_enabled:
@@ -337,6 +347,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(items_router)
     application.include_router(ai_router)
     application.include_router(rag_router)
+    application.include_router(assistant_router)
     application.include_router(health_router)
     return application
 
