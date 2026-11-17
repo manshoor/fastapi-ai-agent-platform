@@ -43,19 +43,24 @@ async def read_residence(
     return view
 
 
+def _demo_enabled(request: Request) -> None:
+    # Runs before authentication: with the flag off the route is absent, not refused.
+    runtime_settings: Settings = request.app.state.settings
+    if not runtime_settings.assistant_demo_enabled:
+        raise HTTPException(404, "Not Found")
+
+
 @router.post(
     "/residence/demo",
     response_model=ResidenceView,
     status_code=201,
     responses={404: {}, 409: {}, 503: {}},
+    dependencies=[Depends(_demo_enabled)],
+    include_in_schema=False,
 )
 async def create_demo(
     request: Request, response: Response, owner_id: Owner, session: Session
 ) -> ResidenceView:
-    # Demo-only route: absent unless explicitly enabled.
-    runtime_settings: Settings = request.app.state.settings
-    if not runtime_settings.assistant_demo_enabled:
-        raise HTTPException(404, "Not Found")
     _settings(request)
     resident = await create_demo_residence(session, owner_id)
     view = await residence_view(session, resident)

@@ -98,8 +98,9 @@ async def test_unauthenticated_residence_is_401(client: httpx.AsyncClient):
     [
         ({"assistant_enabled": True, "assistant_demo_enabled": False}, 404, 403),
         ({"assistant_enabled": False, "assistant_demo_enabled": False}, 404, 503),
+        ({"assistant_enabled": False, "assistant_demo_enabled": True}, 503, 503),
     ],
-    ids=["demo-off", "assistant-off"],
+    ids=["demo-off", "assistant-off", "assistant-off-demo-on"],
 )
 async def test_disabled_flags(monkeypatch, simulator, flags, demo_status, residence_status):
     monkeypatch.setenv("OPENAI_BASE_URL", simulator + "/v1")
@@ -121,6 +122,10 @@ async def test_disabled_flags(monkeypatch, simulator, flags, demo_status, reside
                 data={"username": address, "password": "a-secure-password-123"},
             )
             headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+            if not flags["assistant_demo_enabled"]:
+                # Absent, not just refused: no auth challenge and no schema entry.
+                assert (await client.post(DEMO)).status_code == 404
+                assert DEMO not in (await client.get("/openapi.json")).json()["paths"]
             assert (await client.post(DEMO, headers=headers)).status_code == demo_status
             assert (await client.get(RESIDENCE, headers=headers)).status_code == residence_status
 
@@ -139,8 +144,16 @@ async def test_only_a_manager_uploads_building_documents(
 
     # A resident who is not a manager, a manager of another building, and a missing
     # building all get the same 404.
-    for caller, target in ((neighbour, building_id), (stranger, building_id), (manager, uuid4())):
-        assert (await upload(client, caller, target)).status_code == 404
+    refusals = [
+        await upload(client, caller, target)
+        for caller, target in (
+            (neighbour, building_id),
+            (stranger, building_id),
+            (manager, uuid4()),
+        )
+    ]
+    assert {response.status_code for response in refusals} == {404}
+    assert len({response.text for response in refusals}) == 1
 
     # An owner-only upload still works and has no building.
     private = await upload(client, neighbour, None)
