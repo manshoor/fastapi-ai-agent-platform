@@ -21,6 +21,7 @@ from app.ai.config import AISettings
 from app.ai.router import router as ai_router
 from app.assistant.config import AssistantSettings
 from app.assistant.router import router as assistant_router
+from app.assistant.runtime import AssistantRuntime
 from app.auth import router as auth_router
 from app.cache import ItemCache
 from app.config import Settings
@@ -293,11 +294,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 telemetry = configure_telemetry("rewrite-api")
                 application.state.telemetry = telemetry
-                application.state.assistant_settings = (
-                    AssistantSettings(**runtime_settings.model_dump())
-                    if runtime_settings.assistant_enabled
-                    else None
-                )
                 application.state.rag = None
                 application.state.rag_upload_ceiling = None
                 if runtime_settings.rag_enabled:
@@ -305,6 +301,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     rag = RAGRuntime(rag_settings, telemetry)
                     application.state.rag = rag
                     application.state.rag_upload_ceiling = rag_settings.rag_upload_ceiling_bytes
+                # The assistant requires RAG; its settings validator enforces that.
+                application.state.assistant_settings = None
+                application.state.assistant = None
+                if runtime_settings.assistant_enabled:
+                    assistant_settings = AssistantSettings(**runtime_settings.model_dump())
+                    application.state.assistant_settings = assistant_settings
+                    application.state.assistant = AssistantRuntime(
+                        assistant_settings, telemetry, rag
+                    )
                 application.state.engine = engine
                 application.state.session_factory = create_session_factory(engine)
                 application.state.redis = redis

@@ -6,8 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assistant.actions import confirm_action
 from app.assistant.config import AssistantSettings
-from app.assistant.contracts import ConfirmResponse, ResidenceView
+from app.assistant.contracts import ConfirmResponse, MessageRequest, ResidenceView, TurnResponse
 from app.assistant.residence import Resident, create_demo_residence, load_resident, residence_view
+from app.assistant.runtime import AssistantRuntime
+from app.assistant.turns import run_turn
 from app.config import Settings
 from app.db import get_session
 from app.security import get_current_user_id
@@ -82,3 +84,28 @@ async def confirm(
     response.headers["Cache-Control"] = "no-store"
     resident = await _resident(session, owner_id)
     return await confirm_action(session, resident, action_id)
+
+
+@router.post(
+    "/assistant/messages",
+    response_model=TurnResponse,
+    responses={403: {}, 422: {}, 429: {}, 502: {}, 503: {}, 504: {}},
+)
+async def send_message(
+    payload: MessageRequest, request: Request, response: Response, owner_id: Owner
+) -> TurnResponse:
+    # No Session dependency: no request-scoped session stays open across provider calls.
+    _settings(request)
+    runtime: AssistantRuntime = request.app.state.assistant
+    session_factory = request.app.state.session_factory
+    async with session_factory() as session:
+        resident = await _resident(session, owner_id)
+        await session.rollback()
+    result = await run_turn(
+        session_factory=session_factory,
+        runtime=runtime,
+        resident=resident,
+        message=payload.message,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return result
