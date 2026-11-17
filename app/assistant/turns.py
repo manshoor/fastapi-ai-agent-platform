@@ -356,6 +356,8 @@ async def _turn(
         # Database outages (including builtin connect timeouts) and programming errors.
         database = isinstance(exc, (SQLAlchemyError, OSError, TimeoutError))
         code = DATABASE_CODE if database else "internal_error"
+        # Type only: exception text may carry content.
+        logger.error("Assistant turn failure exception=%s", type(exc).__name__)
         if run is not None and _committed(run.actions):
             # The write stands; report it. Pending ids are in the actions.
             await _record(runtime.telemetry, session_factory, turn_id, "incomplete", run, code)

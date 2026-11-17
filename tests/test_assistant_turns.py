@@ -383,12 +383,18 @@ async def test_langsmith_environment_cannot_export_content(
             received.clear()
 
             owner = await resident()
+            building_id = UUID(owner["view"]["building"]["id"])
+            await add_ready_document(
+                app, UUID(owner["id"]), "House rules", [RULE], building_id=building_id
+            )
             script(
                 simulator,
+                {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
                 {"tool": "lock_door", "arguments": {"device": "Front door"}},
-                {"answer": "Locked.", "citations": []},
+                {"answer": "Quiet hours start at 22:00.", "citations": ["P1"]},
             )
-            assert (await send(client, owner)).json()["status"] == "answered"
+            body = (await send(client, owner)).json()
+            assert body["status"] == "answered" and body["citations"]
             await asyncio.to_thread(wait_for_all_tracers)
             assert [entry for entry in received if entry[0] != "GET"] == []
         finally:
@@ -510,3 +516,28 @@ async def test_tool_timeout_is_not_reported_as_the_turn_deadline(
     assert response.status_code == 503
     (row,) = await turns(app)
     assert row.error_code == "database_unavailable"
+
+
+async def test_programming_error_after_a_write_is_logged_and_reported(
+    app: FastAPI, client, resident, simulator, monkeypatch, caplog
+):
+    owner = await resident()
+
+    async def handler(ctx, args):
+        raise KeyError("synthetic bug")
+
+    spec = tools._SPECS["list_bookings"]
+    monkeypatch.setitem(tools._SPECS, "list_bookings", replace(spec, handler=handler))
+    script(
+        simulator,
+        {"tool": "lock_door", "arguments": {"device": "Front door"}},
+        {"tool": "list_bookings", "arguments": {}},
+    )
+    body = (await send(client, owner)).json()
+
+    # The committed lock is reported, and the bug is logged by type only.
+    assert body["status"] == "incomplete"
+    (row,) = await turns(app)
+    assert (row.status, row.error_code) == ("incomplete", "internal_error")
+    assert "Assistant turn failure exception=KeyError" in caplog.text
+    assert "synthetic bug" not in caplog.text
