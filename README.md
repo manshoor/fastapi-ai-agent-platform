@@ -519,7 +519,7 @@ uv run --locked python scripts/evaluate_assistant.py --allow-paid-requests
 uv run --locked python scripts/evaluate_assistant.py --allow-paid-requests --judge --judge-model MODEL
 ```
 
-`--judge` adds an LLM judge (needs `OPENAI_API_KEY`) that checks whether answered cases are grounded in their cited snippets and answer the question. The script accepts loopback destinations only and prints case IDs, failed check names and fixed codes.
+`--judge` adds an LLM judge (needs `OPENAI_API_KEY`) that checks whether answers that cite passages are grounded in those snippets and answer the question. Answers grounded only in tool results are scored by the rubric alone. The script accepts loopback destinations only and prints case IDs, failed check names and fixed codes.
 
 ## Isolated 20-user benchmark smoke
 

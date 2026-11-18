@@ -6,8 +6,9 @@ For each golden case (tests/evals/assistant_v1.jsonl):
 
 The API under test calls whatever model it is configured with, so every run is
 treated as paid: --allow-paid-requests is required. --judge also grades answered
-cases with an LLM judge (are the claims supported by the cited snippets, and is the
-question answered); it calls the provider directly and needs OPENAI_API_KEY.
+cases that cite passages with an LLM judge (are the claims supported by the cited
+snippets, and is the question answered); it calls the provider directly and needs
+OPENAI_API_KEY. Answers grounded only in tool results are scored by the rubric alone.
 
 Example (isolated AI stack on 8002, after explicit authorization):
   uv run --locked python scripts/evaluate_assistant.py --allow-paid-requests
@@ -84,6 +85,11 @@ def _upload_documents(client: httpx.Client, headers: dict, building_id: str, tim
             time.sleep(0.5)
 
 
+def should_judge(body: dict | None) -> bool:
+    """Judge only answers that cite passages: a tool-grounded answer has none to check."""
+    return body is not None and body["status"] == "answered" and bool(body["citations"])
+
+
 async def _judge(settings, case: dict, body: dict, model: str | None) -> str:
     from app.ai.provider import OpenAIJudge
 
@@ -158,7 +164,7 @@ def main(argv=None) -> int:
                 scores, body = run_case(client, case, args.timeout)
                 misses = sorted(name for name, ok in scores.items() if not ok)
                 verdict = "-"
-                if judge is not None and body is not None and body["status"] == "answered":
+                if judge is not None and should_judge(body):
                     verdict = asyncio.run(_judge(judge, case, body, args.judge_model))
                 passed = not misses and verdict in {"-", "pass"}
                 failed += not passed

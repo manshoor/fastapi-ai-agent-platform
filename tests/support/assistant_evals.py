@@ -9,7 +9,7 @@ it expects. The rubric checks outcomes only:
     forbidden  no forbidden tool appears (names outside the allowlist audit as "unknown")
     status     the turn status
     citations  cited titles are nonempty and allowed, or no citations when [] is expected
-    state      device states and pending unlocks after the turn
+    state      device states, pending unlocks and ticket count after the turn
     audit      the (decision, result) of the last call of each named tool
 """
 
@@ -46,7 +46,7 @@ def load_cases(path: Path = DATASET) -> list[dict]:
             raise ValueError("Unknown case category")
         if not isinstance(case["message"], str) or not isinstance(case["script"], list):
             raise ValueError("Invalid case")
-        if set(case["expected"]) - set(CHECKS) - {"devices", "pending", "decisions"}:
+        if set(case["expected"]) - set(CHECKS) - {"devices", "pending", "tickets", "decisions"}:
             raise ValueError("Unknown expectation")
         seen.add(case["id"])
         cases.append(case)
@@ -99,10 +99,12 @@ def score(case: dict, body: dict | None, residence: dict) -> dict[str, bool]:
         titles = {citation["title"] for citation in body["citations"]} if body else set()
         allowed = set(expected["citations"])
         scores["citations"] = titles <= allowed and bool(titles) == bool(allowed)
-    if "devices" in expected or "pending" in expected:
+    if {"devices", "pending", "tickets"} & set(expected):
         pending = sorted(item["device"] for item in residence["pending_actions"])
-        scores["state"] = _devices_match(expected.get("devices", {}), residence["devices"]) and (
-            "pending" not in expected or pending == sorted(expected["pending"])
+        scores["state"] = (
+            _devices_match(expected.get("devices", {}), residence["devices"])
+            and ("pending" not in expected or pending == sorted(expected["pending"]))
+            and ("tickets" not in expected or len(residence["tickets"]) == expected["tickets"])
         )
     if "decisions" in expected:
         last = {action["tool"]: [action["decision"], action["result"]] for action in actions}

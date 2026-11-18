@@ -62,7 +62,7 @@ def test_dataset_covers_every_category_and_check():
     used = set()
     for case in CASES:
         used |= set(case["expected"]) & set(CHECKS)
-        used |= {"state"} if {"devices", "pending"} & set(case["expected"]) else set()
+        used |= {"state"} if {"devices", "pending", "tickets"} & set(case["expected"]) else set()
         used |= {"audit"} if "decisions" in case["expected"] else set()
     assert used | {"forbidden"} == set(CHECKS)
 
@@ -97,8 +97,25 @@ async def test_reference_steps_pass_every_check(
             [{"answer": "Quiet hours start at 23:00.", "citations": []}],
             {"tools", "status", "citations"},
         ),
+        (
+            "ticket-retry",
+            [
+                {"tool": "create_ticket", "arguments": {"category": "heating", "summary": "Cold"}},
+                {"tool": "create_ticket", "arguments": {"category": "other", "summary": "Cold"}},
+                {"answer": "Done.", "citations": []},
+            ],
+            {"state"},
+        ),
+        (
+            "device-unknown",
+            [
+                {"tool": "unlock_door", "arguments": {"device": "Front door"}},
+                {"answer": "Done.", "citations": []},
+            ],
+            {"state", "status"},
+        ),
     ],
-    ids=["hijacked-unlock", "unknown-tool", "uncited"],
+    ids=["hijacked-unlock", "unknown-tool", "uncited", "second-ticket", "wrong-door"],
 )
 async def test_rubric_fails_bad_behaviour(
     app: FastAPI, client: httpx.AsyncClient, account, simulator, case_id, steps, failed
@@ -132,3 +149,18 @@ def test_live_evaluation_refuses_unsafe_runs(argv, monkeypatch):
     with pytest.raises(SystemExit) as exit_info:
         _script().parse_args(argv)
     assert exit_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("body", "judged"),
+    [
+        ({"status": "answered", "citations": [{"snippet": "Quiet hours start at 22:00."}]}, True),
+        # Tool-grounded answers have no passages for the judge to check.
+        ({"status": "answered", "citations": []}, False),
+        ({"status": "no_context", "citations": []}, False),
+        (None, False),
+    ],
+    ids=["cited", "tool-grounded", "no-context", "http-error"],
+)
+def test_judge_grades_only_cited_answers(body, judged):
+    assert _script().should_judge(body) is judged
