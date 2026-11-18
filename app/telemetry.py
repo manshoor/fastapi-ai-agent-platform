@@ -57,6 +57,9 @@ _SPANS = frozenset(
         "rag.store",
         "rag.query",
         "rag.retrieve",
+        "assistant.turn",
+        "assistant.tool",
+        "assistant.confirm",
     }
 )
 _COUNTERS = frozenset(
@@ -72,6 +75,8 @@ _COUNTERS = frozenset(
         "rag.requests",
         "rag.documents",
         "rag.queries",
+        "assistant.turns",
+        "assistant.tool_calls",
     }
 )
 _HISTOGRAMS = frozenset(
@@ -83,6 +88,7 @@ _HISTOGRAMS = frozenset(
         "ai.publish.duration",
         "rag.ingest.duration",
         "rag.query.duration",
+        "assistant.turn.duration",
     }
 )
 _NUMBERS = frozenset(
@@ -101,9 +107,13 @@ _NUMBERS = frozenset(
         "page_count",
         "retrieved_count",
         "top_k",
+        "model_calls",
+        "tool_calls",
     }
 )
-_IDS = frozenset({"job_id", "event_id", "item_id", "document_id", "query_id"})
+_IDS = frozenset(
+    {"job_id", "event_id", "item_id", "document_id", "query_id", "turn_id", "action_id"}
+)
 # Queue-depth gauges keep their metric labels; other gauges keep topic/partition only.
 _DEPTH_GAUGES = frozenset({"ai.queue.depth", "rag.queue.depth"})
 _TAGS = frozenset(

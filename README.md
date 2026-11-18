@@ -451,6 +451,76 @@ Defaults: text 1 MiB; PDF 5 MiB, 300 pages, 30 s, 1 GiB; 1,000,000 extracted cha
 
 With `compose.ai.live.yaml`, the rag-worker pays for document embeddings and the API pays for question embeddings and answers. The same paid-use authorisation applies.
 
+## Resident assistant (tool-using agent)
+
+A resident asks one question or request per turn. A LangGraph agent answers from their building's documents with citations, reads live data, and acts on **simulated** devices (rows in PostgreSQL; no hardware) through a fixed allowlist of typed tools. The server, not the prompt, enforces identity, permissions and limits. It is off unless `ASSISTANT_ENABLED=true`, which requires RAG. `compose.ai.yaml` enables it, with the demo setup route (`ASSISTANT_DEMO_ENABLED=true`).
+
+```
+POST /api/v1/assistant/messages
+  JWT -> resident (membership -> apartment, building) -> 403 if none
+  -> one running turn per user, bounded per process -> admit (rate limit, turn row)
+  -> LangGraph:  model --tool call--> tools --> model ... --reply--> END
+                   at most 4 model calls; a call starts only if its timeout fits the 120 s budget
+                 tools: allowlist -> validate arguments -> server checks
+                        -> one transaction: write + audit row
+  -> grounding rule -> usage row -> 200
+
+POST /api/v1/assistant/actions/{id}/confirm
+  JWT -> one transaction: own live pending unlock -> still a resident -> unlock -> audit -> 200
+```
+
+Smoke it against the simulator (no paid calls), with the AI stack above running:
+
+```bash
+uv run --locked python scripts/smoke_assistant.py
+```
+
+### Assistant HTTP contract
+
+All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
+
+| Route | Success | Errors |
+| --- | --- | --- |
+| `POST /api/v1/assistant/messages` with `{message}` (1–2,000 chars, no NUL) | 200 `{turn_id, status, answer, citations[], actions[], pending_actions[]}` | 403 no residence; 422; 429 turn limit or a turn already running (`Retry-After`); 503 disabled, busy, or provider rate-limited with nothing committed; 502/504 provider failure, timeout or budget with nothing committed |
+| `POST /api/v1/assistant/actions/{id}/confirm` | 200 `{id, action, status: "confirmed", device: {name, locked}}` | 403 no residence; 404 foreign or missing; 409 expired or already decided; 503 disabled |
+| `GET /api/v1/residence` | 200 building, apartment, devices, upcoming bookings, newest tickets, live pending unlocks | 403; 503 |
+| `POST /api/v1/residence/demo` | 201: a demo building, apartment `1A`, two thermostats, two door locks, an alarm, two bookings; the caller becomes resident and manager | 404 when the demo flag is off (before authentication); 409 already a resident |
+| `POST /api/v1/rag/documents?building_id=` | As for RAG uploads; the document belongs to the building | 404 unless the caller manages that building |
+
+`status` is `answered` (valid citations, or a successful non-search tool result), `no_context` (fixed text: nothing grounded the answer), or `incomplete` (fixed text: the turn stopped after committing a change; `actions` lists what happened). `actions[]` items are `{tool, decision, result, device, ticket_id, pending_action_id}`, built by the server from tool results, never from model text.
+
+### Tools and rules
+
+| Tool | Arguments | Effect | Limit |
+| --- | --- | --- | --- |
+| `search_documents` | `question` | Top passages from the resident's building documents, labels P1–P8 per turn | 8 passages per turn |
+| `list_bookings` | none | Up to 10 upcoming bookings of the apartment | none |
+| `create_ticket` | `category`, `summary` | Opens a ticket; the same category within 10 minutes returns the existing one | 3 per user per 24 h |
+| `set_thermostat` | `device`, `celsius` (16–26, steps of 0.5) | Sets the target | 10 device actions per user per hour |
+| `lock_door` | `device` | Locks the door | shares the device-action limit |
+| `unlock_door` | `device` | Creates a 60 s pending unlock; never unlocks | 3 per user per hour |
+
+- **Identity from the server.** The model supplies only tool names and values. User, apartment and building come from the caller's token and membership. Extra arguments are rejected.
+- **Checked, audited writes.** Each write runs in one transaction: per-user lock, membership share lock, limit count on the database clock, a write guarded by apartment, device name and kind, and an `assistant_tool_calls` audit row. Unknown tool names are audited as `unknown`.
+- **Only the resident confirms.** No tool can confirm an unlock. The alarm exists but no tool can reach it, and the model never sees it.
+- **Untrusted text.** The message, tool results and passages are data, never instructions. A hijacked model can at worst create an unconfirmed unlock request.
+- **No content stored or traced.** Turns and audit rows hold counts, IDs and fixed codes; ticket summaries live only in `tickets`. The graph runs with LangSmith tracing disabled; spans `assistant.turn` (Langfuse `agent`) and `assistant.tool` (Langfuse and LangSmith `tool`) carry IDs and counts only.
+- Defaults: 10 turns per 60 s per user, one running turn per user, 4 turns per API process.
+
+### Assistant evaluations
+
+`tests/evals/assistant_v1.jsonl` holds 21 golden cases (documents, bookings, tickets, devices, confirmation, safety) over the fixture documents in `tests/evals/assistant_documents/`, one of which carries planted instructions. Each case names the message, reference model steps, and expected outcomes: tools, forbidden tools, status, cited titles, device states, and audit decisions.
+
+- **CI (deterministic):** `tests/test_assistant_evals.py` replays each case's reference steps through the real route with the provider simulator. It checks the server pipeline, not model quality. The same rubric must fail hijacked or uncited runs.
+- **Live (opt-in, paid):** against the isolated AI stack started with `compose.ai.live.yaml`, after explicit authorisation:
+
+```bash
+uv run --locked python scripts/evaluate_assistant.py --allow-paid-requests
+uv run --locked python scripts/evaluate_assistant.py --allow-paid-requests --judge --judge-model MODEL
+```
+
+`--judge` adds an LLM judge (needs `OPENAI_API_KEY`) that checks whether answers that cite passages are grounded in those snippets and answer the question. Answers grounded only in tool results are scored by the rubric alone. The script accepts loopback destinations only and prints case IDs, failed check names and fixed codes.
+
 ## Isolated 20-user benchmark smoke
 
 Run this bounded setup from the repository root:

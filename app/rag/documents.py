@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.assistant.residence import is_manager
 from app.models import RAG_EMBEDDING_DIMENSIONS, RAGDocument, RAGOutbox
 from app.rag.config import RAGSettings
 from app.rag.contracts import (
@@ -28,6 +29,7 @@ ADMISSION_LOCK_KEY = 0x52414731
 def document_response(document: RAGDocument) -> DocumentResponse:
     return DocumentResponse(
         id=document.id,
+        building_id=document.building_id,
         title=document.title,
         content_type=document.content_type,
         size_bytes=document.size_bytes,
@@ -42,14 +44,18 @@ def document_response(document: RAGDocument) -> DocumentResponse:
     )
 
 
-def _fingerprint(upload: Upload) -> str:
+def _fingerprint(upload: Upload, building_id: UUID | None) -> str:
+    fields = [
+        "rag-upload-v1",
+        upload.title,
+        str(upload.content_type),
+        hashlib.sha256(upload.data).hexdigest(),
+    ]
+    # Owner-only uploads keep the original fingerprint, so earlier replays still match.
+    if building_id is not None:
+        fields.append(str(building_id))
     canonical = json.dumps(
-        [
-            "rag-upload-v1",
-            upload.title,
-            str(upload.content_type),
-            hashlib.sha256(upload.data).hexdigest(),
-        ],
+        fields,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -69,9 +75,10 @@ async def submit_document(
     idempotency_key: str,
     trace_context: dict[str, str],
     telemetry: Telemetry | None = None,
+    building_id: UUID | None = None,
 ) -> tuple[DocumentResponse, int]:
     key_hash = hashlib.sha256(idempotency_key.encode("ascii")).hexdigest()
-    fingerprint = _fingerprint(upload)
+    fingerprint = _fingerprint(upload, building_id)
 
     # Replay: same key and same content returns the original document.
     async def existing() -> tuple[DocumentResponse, int] | None:
@@ -100,6 +107,10 @@ async def submit_document(
     replay = await existing()
     if replay is not None:
         return replay
+    # Re-check under the lock: a manager removed since the route's check cannot upload.
+    if building_id is not None and not await is_manager(session, owner_id, building_id):
+        await session.rollback()
+        raise HTTPException(404, "Building not found")
     unsettled = RAGDocument.status.in_(UNSETTLED_STATES)
     if await _count(session, unsettled) >= settings.rag_global_unsettled_limit:
         await session.rollback()
@@ -120,6 +131,7 @@ async def submit_document(
     document = RAGDocument(
         id=document_id,
         owner_id=owner_id,
+        building_id=building_id,
         title=upload.title,
         content_type=str(upload.content_type),
         size_bytes=len(upload.data),

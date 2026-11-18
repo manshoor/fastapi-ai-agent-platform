@@ -1,9 +1,10 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.assistant.residence import is_manager
 from app.db import get_session
 from app.rag.contracts import DocumentList, DocumentResponse, QueryRequest, QueryResponse
 from app.rag.documents import delete_document, get_document, list_documents, submit_document
@@ -36,6 +37,7 @@ def _runtime(request: Request) -> RAGRuntime:
     responses={
         200: {"model": DocumentResponse},
         400: {},
+        404: {},
         408: {},
         409: {},
         413: {},
@@ -51,11 +53,19 @@ async def upload_document(
     owner_id: Owner,
     session: Session,
     idempotency_key: Key,
+    building_id: Annotated[UUID | None, Query()] = None,
 ) -> DocumentResponse:
     # No Form/File parameters: FastAPI would read the body before authentication.
     runtime = _runtime(request)
     telemetry = runtime.telemetry
     telemetry.increment("rag.requests", operation="upload")
+    # Building documents: only that building's managers, checked before any body read.
+    # Foreign and missing buildings share one 404.
+    if building_id is not None:
+        allowed = await is_manager(session, owner_id, building_id)
+        await session.rollback()
+        if not allowed:
+            raise HTTPException(404, "Building not found")
     async with runtime.upload_slot(owner_id):
         upload = await read_upload(request, runtime.settings)
         with telemetry.span("rag.upload"):
@@ -67,6 +77,7 @@ async def upload_document(
                 idempotency_key=idempotency_key,
                 trace_context=telemetry.capture_context(),
                 telemetry=telemetry,
+                building_id=building_id,
             )
     response.status_code = status_code
     response.headers["Location"] = result.status_url
