@@ -1,13 +1,27 @@
 # Optional override for compose.ai.yaml ONLY. Never use with normal, benchmark, or QA data.
 # Default compose.ai.yaml remains simulator-only on an internal network.
 # Supplying this file and AI_OPENAI_API_KEY explicitly enables potentially billable generations.
+x-live-provider: &live-provider
+  OPENAI_API_KEY: ${AI_OPENAI_API_KEY:?Explicitly authorise paid generation with AI_OPENAI_API_KEY}
+  OPENAI_BASE_URL: https://api.openai.com/v1
+
 services:
   worker:
-    environment:
-      OPENAI_API_KEY: ${AI_OPENAI_API_KEY:?Explicitly authorise paid generation with AI_OPENAI_API_KEY}
-      OPENAI_BASE_URL: https://api.openai.com/v1
+    environment: *live-provider
     networks:
       - default
+      - provider_egress
+  # RAG: the worker pays for document embeddings, the API for question embeddings and answers.
+  rag-worker:
+    environment: *live-provider
+    networks:
+      - default
+      - provider_egress
+  api:
+    environment: *live-provider
+    networks:
+      - default
+      - api_ingress
       - provider_egress
 
 networks:

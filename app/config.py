@@ -75,6 +75,10 @@ class Settings(DatabaseSettings):
     jwt_issuer: str = Field(default="fastapi-crud", min_length=1)
     jwt_audience: str = Field(default="fastapi-crud-api", min_length=1)
     ai_enabled: bool = False
+    rag_enabled: bool = False
+    assistant_enabled: bool = False
+    # Demo-only: lets any account create a demo residence for itself.
+    assistant_demo_enabled: bool = False
 
     @field_validator("jwt_secret")
     @classmethod

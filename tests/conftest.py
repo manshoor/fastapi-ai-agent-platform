@@ -33,7 +33,12 @@ async def app(settings: Settings) -> AsyncIterator[FastAPI]:
     async with LifespanManager(application):
         async with application.state.engine.begin() as connection:
             await connection.execute(
-                text("TRUNCATE TABLE ai_outbox, ai_jobs, items, users CASCADE")
+                text(
+                    "TRUNCATE TABLE assistant_tool_calls, pending_actions, assistant_turns, "
+                    "tickets, bookings, devices, memberships, apartments, buildings, "
+                    "rag_queries, rag_outbox, rag_chunks, rag_documents, "
+                    "ai_outbox, ai_jobs, items, users CASCADE"
+                )
             )
         await application.state.redis.flushdb()
         yield application

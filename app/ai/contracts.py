@@ -24,6 +24,36 @@ class RewriteSuggestion(StrictSchema):
     description: Description
 
 
+# Passage labels the answer prompt assigns, in retrieval order: P1 is the closest chunk.
+PassageLabel = Annotated[str, StringConstraints(pattern=r"^P[1-8]$")]
+Answer = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=4000),
+    AfterValidator(reject_nul),
+]
+
+
+class GroundedAnswer(StrictSchema):
+    """Structured model output for a RAG answer. Empty citations mean "not in passages"."""
+
+    answer: Answer
+    citations: list[PassageLabel] = Field(max_length=8)
+
+
+class AssistantReply(StrictSchema):
+    """Final assistant output. Citations are labels of passages returned by search this turn."""
+
+    answer: Answer
+    citations: list[PassageLabel] = Field(max_length=8)
+
+
+class JudgeVerdict(StrictSchema):
+    """Evaluation-only grade of one answer against the passages it cites."""
+
+    grounded: bool
+    answers_question: bool
+
+
 class RewriteEvent(StrictSchema):
     version: Literal[1]
     event_id: UUID

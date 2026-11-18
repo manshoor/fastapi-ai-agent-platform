@@ -2,7 +2,10 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
+import math
+import re
 import time
 from collections import Counter
 from contextlib import suppress
@@ -14,13 +17,205 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 MODES = frozenset(
-    {"success", "refusal", "invalid", "incomplete", "timeout", "rate_limit", "server_error"}
+    {
+        "success",
+        "refusal",
+        "invalid",
+        "incomplete",
+        "timeout",
+        "rate_limit",
+        "server_error",
+        # Grounded answer that cites no passage.
+        "uncited",
+    }
 )
 SUGGESTION = {"title": "Clear synthetic title", "description": "A clear synthetic description."}
+EMBEDDING_DIMENSIONS = 1536
+# Embedding requests carry up to 64 chunks of about 1200 characters each.
+EMBEDDING_BODY_LIMIT = 2 * 1024 * 1024
+WORD = re.compile(r"\w+")
+# Agent requests carry tool schemas, passages and resident context.
+RESPONSES_BODY_LIMIT = 256 * 1024
+SCRIPT_LIMIT = 50
+TOOL_NAMES = frozenset(
+    {
+        "search_documents",
+        "list_bookings",
+        "create_ticket",
+        "set_thermostat",
+        "lock_door",
+        "unlock_door",
+    }
+)
+NUMBER = re.compile(r"\d+(?:\.\d+)?")
+TICKET_WORDS = ("ticket", "broken", "leak", "repair")
+THERMOSTAT_WORDS = ("degree", "thermostat", "temperature")
+
+
+def embed_text(text: str, dimensions: int) -> list[float]:
+    """Deterministic hashed bag-of-words vector: shared words give nearby vectors."""
+    vector = [0.0] * dimensions
+    for word in WORD.findall(text.lower()):
+        digest = hashlib.sha256(word.encode()).digest()
+        index = int.from_bytes(digest[:4], "big") % dimensions
+        vector[index] += 1.0 if digest[4] & 1 else -1.0
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0:
+        vector[0] = 1.0
+        return vector
+    return [value / norm for value in vector]
+
+
+def grounded_answer(request: dict) -> dict:
+    """Cite the first passage; with no passages, answer that nothing was found."""
+    try:
+        passages = json.loads(request.get("input", "")).get("passages", [])
+    except (ValueError, AttributeError):
+        passages = []
+    first = passages[0] if isinstance(passages, list) and passages else None
+    if not isinstance(first, dict) or not isinstance(first.get("text"), str):
+        return {"answer": "The passages do not contain the answer.", "citations": []}
+    answer = f"Synthetic grounded answer: {first['text'][:200]}"
+    return {"answer": answer, "citations": ["P1"]}
+
+
+def _schema_properties(request: dict) -> dict:
+    text_format = request.get("text", {}).get("format", {})
+    properties = text_format.get("schema", {}).get("properties", {})
+    return properties if isinstance(properties, dict) else {}
+
+
+def wants_grounded_answer(request: dict) -> bool:
+    return "citations" in _schema_properties(request)
+
+
+def wants_verdict(request: dict) -> bool:
+    return "grounded" in _schema_properties(request)
+
+
+def valid_step(step) -> bool:
+    """A scripted agent step: one tool call, or one final answer."""
+    if not isinstance(step, dict):
+        return False
+    if set(step) == {"answer", "citations"}:
+        citations = step["citations"]
+        return (
+            isinstance(step["answer"], str)
+            and isinstance(citations, list)
+            and all(isinstance(label, str) for label in citations)
+        )
+    if "tool" not in step or not isinstance(step["tool"], str) or len(step["tool"]) > 64:
+        return False
+    rest = set(step) - {"tool"}
+    if rest == {"arguments"}:
+        return isinstance(step["arguments"], dict)
+    # Raw text lets tests send malformed argument JSON.
+    return rest == {"raw_arguments"} and isinstance(step["raw_arguments"], str)
+
+
+def agent_context(request: dict) -> tuple[dict, list[dict]]:
+    """The resident context of the first input item, and every parsed tool output."""
+    items = request.get("input")
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return {}, []
+    try:
+        context = json.loads(items[0].get("content", ""))
+    except (TypeError, ValueError):
+        context = {}
+    outputs = []
+    for item in items[1:]:
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            try:
+                outputs.append(json.loads(item.get("output", "")))
+            except (TypeError, ValueError):
+                continue
+    return (context if isinstance(context, dict) else {}), outputs
+
+
+def _device(devices: list, kind: str, message: str) -> str:
+    candidates = [d for d in devices if isinstance(d, dict) and d.get("kind") == kind]
+    for device in candidates:
+        if str(device.get("name", "")).lower() in message:
+            return device["name"]
+    return candidates[0]["name"] if candidates else "unknown"
+
+
+def keyword_step(request: dict) -> dict:
+    """Toy policy for unscripted agent requests: one tool from keywords, then an answer."""
+    context, outputs = agent_context(request)
+    if outputs:
+        for output in outputs:
+            passages = output.get("passages") if isinstance(output, dict) else None
+            first = passages[0] if isinstance(passages, list) and passages else None
+            if isinstance(first, dict) and isinstance(first.get("text"), str):
+                answer = f"Synthetic assistant answer: {first['text'][:200]}"
+                return {"answer": answer, "citations": [first.get("label", "P1")]}
+        return {"answer": "Done.", "citations": []}
+    message = str(context.get("message", "")).lower()
+    resident = context.get("resident")
+    devices = resident.get("devices", []) if isinstance(resident, dict) else []
+    if "unlock" in message:
+        return {
+            "tool": "unlock_door",
+            "arguments": {"device": _device(devices, "door_lock", message)},
+        }
+    if "lock" in message:
+        return {
+            "tool": "lock_door",
+            "arguments": {"device": _device(devices, "door_lock", message)},
+        }
+    if any(word in message for word in THERMOSTAT_WORDS):
+        number = NUMBER.search(message)
+        celsius = float(number.group()) if number else 21.0
+        arguments = {"device": _device(devices, "thermostat", message), "celsius": celsius}
+        return {"tool": "set_thermostat", "arguments": arguments}
+    if "booking" in message:
+        return {"tool": "list_bookings", "arguments": {}}
+    if any(word in message for word in TICKET_WORDS):
+        summary = "Synthetic maintenance request"
+        return {"tool": "create_ticket", "arguments": {"category": "other", "summary": summary}}
+    return {"tool": "search_documents", "arguments": {"question": message[:500] or "building"}}
+
+
+def agent_item(step: dict) -> dict:
+    if "tool" in step:
+        arguments = step.get("raw_arguments")
+        if arguments is None:
+            arguments = json.dumps(step["arguments"])
+        return {
+            "id": f"fc_sim_{uuid4().hex}",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": f"call_sim_{uuid4().hex}",
+            "name": step["tool"],
+            "arguments": arguments,
+        }
+    return message_item(
+        [
+            {
+                "type": "output_text",
+                "text": json.dumps({"answer": step["answer"], "citations": step["citations"]}),
+                "annotations": [],
+                "logprobs": [],
+            }
+        ]
+    )
+
+
+def message_item(content: list) -> dict:
+    return {
+        "id": f"msg_sim_{uuid4().hex}",
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": content,
+    }
 
 
 @dataclass
 class SimulatorState:
+    script: list[dict] = field(default_factory=list)
+    tool_counts: Counter = field(default_factory=Counter)
     modes: list[str] = field(default_factory=list)
     delay_seconds: float = 5.0
     max_calls: int = 100
@@ -30,11 +225,11 @@ class SimulatorState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
-async def bounded_json(request: Request) -> dict | None:
+async def bounded_json(request: Request, limit: int = 65536) -> dict | None:
     body = bytearray()
     async for chunk in request.stream():
         body.extend(chunk)
-        if len(body) > 65536:
+        if len(body) > limit:
             return None
     try:
         value = json.loads(body)
@@ -59,17 +254,25 @@ def create_app() -> FastAPI:
                 "calls": state.calls,
                 "in_flight": state.in_flight,
                 "counts": dict(state.counts),
+                "tool_counts": dict(state.tool_counts),
                 "max_calls": state.max_calls,
             }
 
     @app.post("/__control")
     async def control(request: Request) -> Response:
         value = await bounded_json(request)
-        if value is None or set(value) - {"modes", "delay_seconds", "max_calls"}:
+        if value is None or set(value) - {"modes", "delay_seconds", "max_calls", "script"}:
             return JSONResponse({"error": "invalid_control"}, status_code=400)
         modes = value.get("modes", [])
         delay = value.get("delay_seconds", 5.0)
         maximum = value.get("max_calls", 100)
+        script = value.get("script", [])
+        if (
+            not isinstance(script, list)
+            or len(script) > SCRIPT_LIMIT
+            or not all(valid_step(step) for step in script)
+        ):
+            return JSONResponse({"error": "invalid_control"}, status_code=400)
         if (
             not isinstance(modes, list)
             or len(modes) > 100
@@ -88,16 +291,13 @@ def create_app() -> FastAPI:
             state.modes = list(modes)
             state.delay_seconds = float(delay)
             state.max_calls = maximum
+            state.script = list(script)
             state.calls = 0
             state.counts.clear()
+            state.tool_counts.clear()
         return JSONResponse({"status": "configured"})
 
-    @app.post("/v1/responses")
-    async def responses(request: Request) -> Response:
-        # Parse the real request without retaining or echoing prompts, instructions, or headers.
-        value = await bounded_json(request)
-        if value is None:
-            return JSONResponse({"error": {"code": "invalid_request_error"}}, status_code=400)
+    async def admit() -> str | Response:
         async with state.lock:
             if state.calls >= state.max_calls:
                 return JSONResponse(
@@ -108,31 +308,152 @@ def create_app() -> FastAPI:
             state.calls += 1
             state.counts[mode] += 1
             state.in_flight += 1
-            delay = state.delay_seconds
+            return mode
+
+    async def fail(mode: str) -> Response | None:
+        if mode == "timeout":
+            await asyncio.sleep(state.delay_seconds)
+        if mode == "rate_limit":
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "Synthetic rate limit",
+                        "type": "rate_limit_exceeded",
+                        "code": "rate_limit_exceeded",
+                    }
+                },
+                status_code=429,
+                headers={"Retry-After": "1"},
+            )
+        if mode == "server_error":
+            return JSONResponse({"error": {"code": "server_error"}}, status_code=500)
+        return None
+
+    @app.post("/v1/embeddings")
+    async def embeddings(request: Request) -> Response:
+        # Never retains or echoes inputs; vectors depend only on the words they contain.
+        value = await bounded_json(request, EMBEDDING_BODY_LIMIT)
+        inputs = value.get("input") if value else None
+        dimensions = value.get("dimensions", EMBEDDING_DIMENSIONS) if value else None
+        if (
+            not isinstance(inputs, list)
+            or not 1 <= len(inputs) <= 2048
+            or any(not isinstance(item, str) for item in inputs)
+            or type(dimensions) is not int
+            or not 1 <= dimensions <= 3072
+        ):
+            return JSONResponse({"error": {"code": "invalid_request_error"}}, status_code=400)
+        admitted = await admit()
+        if isinstance(admitted, Response):
+            return admitted
         try:
-            if mode == "timeout":
-                await asyncio.sleep(delay)
-            if mode == "rate_limit":
-                return JSONResponse(
-                    {
-                        "error": {
-                            "message": "Synthetic rate limit",
-                            "type": "rate_limit_exceeded",
-                            "code": "rate_limit_exceeded",
-                        }
+            failure = await fail(admitted)
+            if failure is not None:
+                return failure
+            vectors = [embed_text(item, dimensions) for item in inputs]
+            if admitted == "invalid":
+                vectors = vectors[:-1]
+            return JSONResponse(
+                {
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "index": index, "embedding": vector}
+                        for index, vector in enumerate(vectors)
+                    ],
+                    "model": "simulator-embedding",
+                    "usage": {
+                        "prompt_tokens": sum(len(WORD.findall(item)) for item in inputs),
+                        "total_tokens": sum(len(WORD.findall(item)) for item in inputs),
                     },
-                    status_code=429,
-                    headers={"Retry-After": "1"},
-                )
-            if mode == "server_error":
-                return JSONResponse({"error": {"code": "server_error"}}, status_code=500)
+                },
+                headers={"x-request-id": f"req_sim_{uuid4().hex}"},
+            )
+        finally:
+            async with state.lock:
+                state.in_flight -= 1
+
+    async def agent_response(value: dict, mode: str) -> Response:
+        """Scripted step if one is queued, else the keyword policy. Modes still apply."""
+        async with state.lock:
+            step = state.script.pop(0) if state.script else None
+        step = step or keyword_step(value)
+        failure = await fail(mode)
+        if failure is not None:
+            return failure
+        if mode == "refusal":
+            items = [message_item([{"type": "refusal", "refusal": "Synthetic refusal"}])]
+        elif mode == "invalid":
+            text = {
+                "type": "output_text",
+                "text": "not valid JSON",
+                "annotations": [],
+                "logprobs": [],
+            }
+            items = [message_item([text])]
+        else:
+            items = [agent_item(step)]
+            if "tool" in step:
+                name = step["tool"] if step["tool"] in TOOL_NAMES else "other"
+                async with state.lock:
+                    state.tool_counts[name] += 1
+        return JSONResponse(
+            {
+                "id": f"resp_sim_{uuid4().hex}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "incomplete" if mode == "incomplete" else "completed",
+                "model": "simulator-assistant",
+                "error": None,
+                "incomplete_details": {"reason": "max_output_tokens"}
+                if mode == "incomplete"
+                else None,
+                "output": items,
+                "usage": {
+                    "input_tokens": 40,
+                    "output_tokens": 20,
+                    "total_tokens": 60,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                },
+                "parallel_tool_calls": False,
+                "tools": value.get("tools"),
+                "tool_choice": "auto",
+                "store": False,
+            },
+            headers={"x-request-id": f"req_sim_{uuid4().hex}"},
+        )
+
+    @app.post("/v1/responses")
+    async def responses(request: Request) -> Response:
+        # Parse the real request without retaining or echoing prompts, instructions, or headers.
+        value = await bounded_json(request, RESPONSES_BODY_LIMIT)
+        if value is None:
+            return JSONResponse({"error": {"code": "invalid_request_error"}}, status_code=400)
+        admitted = await admit()
+        if isinstance(admitted, Response):
+            return admitted
+        mode = admitted
+        try:
+            if value.get("tools"):
+                return await agent_response(value, mode)
+            if wants_verdict(value):
+                output = {"grounded": True, "answers_question": True}
+            elif wants_grounded_answer(value):
+                output = grounded_answer(value)
+            else:
+                output = SUGGESTION
+            if mode == "uncited":
+                output = {"answer": "Unsupported synthetic claim.", "citations": []}
+            failure = await fail(mode)
+            if failure is not None:
+                return failure
             content = (
                 [{"type": "refusal", "refusal": "Synthetic refusal"}]
                 if mode == "refusal"
                 else [
                     {
                         "type": "output_text",
-                        "text": "not valid JSON" if mode == "invalid" else json.dumps(SUGGESTION),
+                        "text": "not valid JSON" if mode == "invalid" else json.dumps(output),
                         "annotations": [],
                         "logprobs": [],
                     }

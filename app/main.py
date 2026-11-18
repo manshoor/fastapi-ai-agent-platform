@@ -19,12 +19,19 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.ai.config import AISettings
 from app.ai.router import router as ai_router
+from app.assistant.config import AssistantSettings
+from app.assistant.router import router as assistant_router
+from app.assistant.runtime import AssistantRuntime
 from app.auth import router as auth_router
 from app.cache import ItemCache
 from app.config import Settings
 from app.db import create_engine, create_session_factory
 from app.health import router as health_router
 from app.items import router as items_router
+from app.rag.config import RAGSettings
+from app.rag.router import UPLOAD_PATH
+from app.rag.router import router as rag_router
+from app.rag.runtime import RAGRuntime
 from app.security import PasswordService
 from app.telemetry import configure_telemetry
 
@@ -50,6 +57,14 @@ _VALIDATION_LOCATIONS = frozenset(
         "Idempotency-Key",
         "limit",
         "cursor",
+        "file",
+        "document_id",
+        "question",
+        "top_k",
+        "document_ids",
+        "message",
+        "action_id",
+        "building_id",
     }
 )
 _VALIDATION_MESSAGES = {
@@ -87,7 +102,17 @@ _NETWORK_ERRNOS = {
 }
 
 
+class _BodyTooLarge(Exception):
+    """Raised by the counting receive when a streamed body passes its ceiling."""
+
+
 class BoundedBodyMiddleware:
+    """Buffers small bodies before routing; streams the upload route under its own ceiling.
+
+    Ordinary route:   receive all (<= 32 KiB) -> app
+    Upload route:     app -> auth -> endpoint reads body -> counting receive -> 413 on excess
+    """
+
     def __init__(self, app: ASGIApp, limit: int = BODY_LIMIT_BYTES) -> None:
         self.app = app
         self.limit = limit
@@ -96,6 +121,12 @@ class BoundedBodyMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+
+        # The upload route is never buffered before authentication.
+        ceiling = None
+        if scope["method"] == "POST" and scope["path"] == UPLOAD_PATH:
+            ceiling = getattr(scope["app"].state, "rag_upload_ceiling", None)
+        limit = ceiling if ceiling is not None else self.limit
 
         lengths = [value for key, value in scope["headers"] if key == b"content-length"]
         if lengths:
@@ -108,11 +139,14 @@ class BoundedBodyMiddleware:
                     scope, receive, send
                 )
                 return
-            if declared_length > self.limit:
+            if declared_length > limit:
                 await JSONResponse({"detail": "Request body too large"}, status_code=413)(
                     scope, receive, send
                 )
                 return
+        if ceiling is not None:
+            await self._stream(scope, receive, send, ceiling)
+            return
 
         body = bytearray()
         while True:
@@ -139,6 +173,35 @@ class BoundedBodyMiddleware:
             return await receive()
 
         await self.app(scope, replay, send)
+
+    async def _stream(self, scope: Scope, receive: Receive, send: Send, ceiling: int) -> None:
+        received = 0
+        started = False
+
+        # Count bytes as the endpoint reads them; stop the read once past the ceiling.
+        async def counted() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > ceiling:
+                    raise _BodyTooLarge
+            return message
+
+        async def tracked(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, counted, tracked)
+        except _BodyTooLarge:
+            if started:
+                raise
+            await JSONResponse({"detail": "Request body too large"}, status_code=413)(
+                scope, receive, send
+            )
 
 
 def _is_transient_database_error(exc: Exception) -> bool:
@@ -194,9 +257,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         engine = None
         redis = None
         telemetry = None
+        rag = None
 
         async def close_resources() -> None:
             try:
+                if rag is not None:
+                    await rag.aclose()
                 if redis is not None:
                     await redis.aclose()
             finally:
@@ -228,6 +294,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 telemetry = configure_telemetry("rewrite-api")
                 application.state.telemetry = telemetry
+                application.state.rag = None
+                application.state.rag_upload_ceiling = None
+                if runtime_settings.rag_enabled:
+                    rag_settings = RAGSettings(**runtime_settings.model_dump())
+                    rag = RAGRuntime(rag_settings, telemetry)
+                    application.state.rag = rag
+                    application.state.rag_upload_ceiling = rag_settings.rag_upload_ceiling_bytes
+                # The assistant requires RAG; its settings validator enforces that.
+                application.state.assistant_settings = None
+                application.state.assistant = None
+                if runtime_settings.assistant_enabled:
+                    assistant_settings = AssistantSettings(**runtime_settings.model_dump())
+                    application.state.assistant_settings = assistant_settings
+                    application.state.assistant = AssistantRuntime(
+                        assistant_settings, telemetry, rag
+                    )
                 application.state.engine = engine
                 application.state.session_factory = create_session_factory(engine)
                 application.state.redis = redis
@@ -269,6 +351,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(auth_router)
     application.include_router(items_router)
     application.include_router(ai_router)
+    application.include_router(rag_router)
+    application.include_router(assistant_router)
     application.include_router(health_router)
     return application
 

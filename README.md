@@ -399,6 +399,128 @@ Real model comparisons require `--provider --allow-paid-requests`, an explicit `
 
 Implementation verification: 543 tests passed in the isolated AI topology, including actual Kafka/manual commits/rebalance, provider failure/retry bounds, worker crash after send, stale fences, publication commit gaps, logical/physical expiry, SDK debug-log privacy, Collector trace/metric routing, product-readback acceptance/privacy, and bounded-load safety. The deployed HTTP smoke and ordinary CRUD/cache smoke also passed through loopback port 8002. The original QA topology previously passed with AI infrastructure absent (infrastructure-specific cases skipped), and `alembic check` found no model/migration drift. These checks establish local behaviour, not AI quality, production capacity, cloud ingestion, or HA; the separately exercised local Langfuse ingestion is documented above.
 
+## Document question answering (RAG)
+
+RAG (retrieval-augmented generation) answers a question from the owner's own uploaded documents, with citations. It is off unless `RAG_ENABLED=true` **and** `AI_ENABLED=true`; it reuses the AI stack's Kafka, provider, and Collector. `compose.ai.yaml` and `compose.ai.test.yaml` enable it and add a `rag-worker` service.
+
+```
+upload --> API: auth -> bounded multipart read -> rag_documents(pending) + rag_outbox, one transaction -> 202
+                 dispatcher --> Kafka rag.document-ingest.requested.v1 --> rag-worker
+                 rag-worker: lease -> parse (PDF in a sandboxed child process) -> chunk -> embed -> rag_chunks -> ready
+query  --> API: auth -> query slot -> admit (rate limit) -> embed question -> owner-scoped pgvector KNN
+                 -> grounded answer -> citations checked against the passages -> 200
+```
+
+Start and smoke the local stack (simulator only, no paid calls):
+
+```bash
+python3 scripts/init_ai_env.py
+docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d --wait api worker rag-worker dispatcher
+uv run --locked python scripts/smoke_rag.py
+```
+
+The smoke uploads a Markdown file and a generated PDF, waits for `ready`, checks that the answer cites the right document, that a second account sees nothing, and that deletion turns the answer into `no_context`. It prints no tokens or content.
+
+### RAG HTTP contract
+
+All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
+
+| Route | Success | Notes |
+| --- | --- | --- |
+| `POST /api/v1/rag/documents` | 202; 200 on replay of a finished upload | Multipart `title` (1–200 chars) + one `file` (`.txt`, `.md`, `.pdf`). `Idempotency-Key` header. `Location` header. |
+| `GET /api/v1/rag/documents` | 200 | Owner's documents, newest first. |
+| `GET /api/v1/rag/documents/{id}` | 200 | Status, chunk and page counts, error code, timestamps. Never the content. |
+| `DELETE /api/v1/rag/documents/{id}` | 204 | Removes the document, its chunks, outbox rows **and its idempotency record**: the same key can then create a new document. |
+| `POST /api/v1/rag/query` | 200 | JSON `question` (1–2,000 chars), `top_k` (1–8, default 4), optional `document_ids` (1–20). Returns `status` (`answered`/`no_context`), `answer`, `citations[{document_id,title,ordinal,page,snippet}]`. |
+
+Upload errors: 401 before any body byte is read; 400 malformed multipart or disconnect; 408 slow body; 409 key reused with other content; 413 too large; 415 wrong type; 422 bad title, empty file, invalid UTF-8, NUL, or bad PDF header; 429 owner quota or another upload by the same owner in progress; 503 disabled, busy, or global backlog full.
+
+Query errors: 429 owner rate limit (`Retry-After`); 503 disabled, busy, or provider rate-limited; 504 provider timeout or the 60 s deadline; 502 any other provider failure. Foreign and missing documents share one 404, and a foreign `document_ids` filter gives `no_context`.
+
+### RAG rules and limits
+
+- Every SQL statement on documents, chunks and queries filters by owner. A composite foreign key stops a chunk from belonging to another owner's document.
+- No question with zero searchable chunks reaches the provider. An answer that cites no supplied passage becomes `no_context` with fixed text, so uncited model text is never shown.
+- No database transaction spans provider, Kafka, or child-process I/O. Each provider call is one attempt; the worker owns embedding retries (at most three attempts). Answers are never replayed.
+- Worker writes are fenced by status, attempt, lease token, lease generation, and database-clock expiry. A document deleted mid-ingestion stops the worker without writes.
+- Uploaded bytes are deleted when ingestion ends (`ready` or `failed`). Chunk text stays until the owner deletes the document. `rag_queries` keeps usage metadata only, never question or answer text.
+- The LCEL chain runs under `langsmith.tracing_context(enabled=False)`, so `LANGSMITH_TRACING` in the environment cannot export content. Telemetry carries IDs, counts, models, and fixed codes only; the Collector maps embedding, retriever, and chain observation types.
+- PDF parsing runs in a child process with CPU, memory, and file-size limits, a scrubbed environment, and a wall timeout. The Linux container is the supported runtime; on macOS the limits cannot be set, so PDF parsing fails closed.
+
+Defaults: text 1 MiB; PDF 5 MiB, 300 pages, 30 s, 1 GiB; 1,000,000 extracted characters; chunks of 1,200 characters with 200 overlap, at most 1,200 per document; 64 chunks per embedding request. 50 documents and 5 unsettled per owner; 100 unsettled globally; one upload per owner and 4 uploads and 4 queries per API process; 10 queries per 60 s per owner. Embeddings use `text-embedding-3-small` (1,536 dimensions) in pgvector 0.8.7 with an HNSW cosine index. Pools: API 10 + dispatcher 2 + worker 4 + rag-worker 4 = 20 of PostgreSQL's 100.
+
+With `compose.ai.live.yaml`, the rag-worker pays for document embeddings and the API pays for question embeddings and answers. The same paid-use authorisation applies.
+
+## Resident assistant (tool-using agent)
+
+A resident asks one question or request per turn. A LangGraph agent answers from their building's documents with citations, reads live data, and acts on **simulated** devices (rows in PostgreSQL; no hardware) through a fixed allowlist of typed tools. The server, not the prompt, enforces identity, permissions and limits. It is off unless `ASSISTANT_ENABLED=true`, which requires RAG. `compose.ai.yaml` enables it, with the demo setup route (`ASSISTANT_DEMO_ENABLED=true`).
+
+```
+POST /api/v1/assistant/messages
+  JWT -> resident (membership -> apartment, building) -> 403 if none
+  -> one running turn per user, bounded per process -> admit (rate limit, turn row)
+  -> LangGraph:  model --tool call--> tools --> model ... --reply--> END
+                   at most 4 model calls; a call starts only if its timeout fits the 120 s budget
+                 tools: allowlist -> validate arguments -> server checks
+                        -> one transaction: write + audit row
+  -> grounding rule -> usage row -> 200
+
+POST /api/v1/assistant/actions/{id}/confirm
+  JWT -> one transaction: own live pending unlock -> still a resident -> unlock -> audit -> 200
+```
+
+Smoke it against the simulator (no paid calls), with the AI stack above running:
+
+```bash
+uv run --locked python scripts/smoke_assistant.py
+```
+
+### Assistant HTTP contract
+
+All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
+
+| Route | Success | Errors |
+| --- | --- | --- |
+| `POST /api/v1/assistant/messages` with `{message}` (1–2,000 chars, no NUL) | 200 `{turn_id, status, answer, citations[], actions[], pending_actions[]}` | 403 no residence; 422; 429 turn limit or a turn already running (`Retry-After`); 503 disabled, busy, or provider rate-limited with nothing committed; 502/504 provider failure, timeout or budget with nothing committed |
+| `POST /api/v1/assistant/actions/{id}/confirm` | 200 `{id, action, status: "confirmed", device: {name, locked}}` | 403 no residence; 404 foreign or missing; 409 expired or already decided; 503 disabled |
+| `GET /api/v1/residence` | 200 building, apartment, devices, upcoming bookings, newest tickets, live pending unlocks | 403; 503 |
+| `POST /api/v1/residence/demo` | 201: a demo building, apartment `1A`, two thermostats, two door locks, an alarm, two bookings; the caller becomes resident and manager | 404 when the demo flag is off (before authentication); 409 already a resident |
+| `POST /api/v1/rag/documents?building_id=` | As for RAG uploads; the document belongs to the building | 404 unless the caller manages that building |
+
+`status` is `answered` (valid citations, or a successful non-search tool result), `no_context` (fixed text: nothing grounded the answer), or `incomplete` (fixed text: the turn stopped after committing a change; `actions` lists what happened). `actions[]` items are `{tool, decision, result, device, ticket_id, pending_action_id}`, built by the server from tool results, never from model text.
+
+### Tools and rules
+
+| Tool | Arguments | Effect | Limit |
+| --- | --- | --- | --- |
+| `search_documents` | `question` | Top passages from the resident's building documents, labels P1–P8 per turn | 8 passages per turn |
+| `list_bookings` | none | Up to 10 upcoming bookings of the apartment | none |
+| `create_ticket` | `category`, `summary` | Opens a ticket; the same category within 10 minutes returns the existing one | 3 per user per 24 h |
+| `set_thermostat` | `device`, `celsius` (16–26, steps of 0.5) | Sets the target | 10 device actions per user per hour |
+| `lock_door` | `device` | Locks the door | shares the device-action limit |
+| `unlock_door` | `device` | Creates a 60 s pending unlock; never unlocks | 3 per user per hour |
+
+- **Identity from the server.** The model supplies only tool names and values. User, apartment and building come from the caller's token and membership. Extra arguments are rejected.
+- **Checked, audited writes.** Each write runs in one transaction: per-user lock, membership share lock, limit count on the database clock, a write guarded by apartment, device name and kind, and an `assistant_tool_calls` audit row. Unknown tool names are audited as `unknown`.
+- **Only the resident confirms.** No tool can confirm an unlock. The alarm exists but no tool can reach it, and the model never sees it.
+- **Untrusted text.** The message, tool results and passages are data, never instructions. A hijacked model can at worst create an unconfirmed unlock request.
+- **No content stored or traced.** Turns and audit rows hold counts, IDs and fixed codes; ticket summaries live only in `tickets`. The graph runs with LangSmith tracing disabled; spans `assistant.turn` (Langfuse `agent`) and `assistant.tool` (Langfuse and LangSmith `tool`) carry IDs and counts only.
+- Defaults: 10 turns per 60 s per user, one running turn per user, 4 turns per API process.
+
+### Assistant evaluations
+
+`tests/evals/assistant_v1.jsonl` holds 21 golden cases (documents, bookings, tickets, devices, confirmation, safety) over the fixture documents in `tests/evals/assistant_documents/`, one of which carries planted instructions. Each case names the message, reference model steps, and expected outcomes: tools, forbidden tools, status, cited titles, device states, and audit decisions.
+
+- **CI (deterministic):** `tests/test_assistant_evals.py` replays each case's reference steps through the real route with the provider simulator. It checks the server pipeline, not model quality. The same rubric must fail hijacked or uncited runs.
+- **Live (opt-in, paid):** against the isolated AI stack started with `compose.ai.live.yaml`, after explicit authorisation:
+
+```bash
+uv run --locked python scripts/evaluate_assistant.py --allow-paid-requests
+uv run --locked python scripts/evaluate_assistant.py --allow-paid-requests --judge --judge-model MODEL
+```
+
+`--judge` adds an LLM judge (needs `OPENAI_API_KEY`) that checks whether answers that cite passages are grounded in those snippets and answer the question. Answers grounded only in tool results are scored by the rubric alone. The script accepts loopback destinations only and prints case IDs, failed check names and fixed codes.
+
 ## Isolated 20-user benchmark smoke
 
 Run this bounded setup from the repository root:
