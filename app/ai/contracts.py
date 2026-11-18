@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, AwareDatetime, Field, StringConstraints
+from pydantic import AfterValidator, AwareDatetime, Field, StringConstraints, model_validator
 
 from app.schemas import Description, StrictSchema, Title, reject_nul
 
@@ -59,11 +59,34 @@ class QuotedAnswer(StrictSchema):
     claims: list[Claim] = Field(max_length=8)
 
 
-class AssistantReply(StrictSchema):
-    """Final assistant output. Citations are labels of passages returned by search this turn."""
+# Where an assistant claim comes from: a search passage this turn, or a tool result.
+TOOL_SOURCE = "tool"
+ClaimSource = Annotated[str, StringConstraints(pattern=r"^(P[1-8]|tool)$")]
+AssistantQuote = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=300),
+    AfterValidator(reject_nul),
+]
 
-    answer: Answer
-    citations: list[PassageLabel] = Field(max_length=8)
+
+class AssistantClaim(StrictSchema):
+    """One reply sentence. A passage claim quotes its passage; a tool claim has no quote."""
+
+    statement: Statement
+    source: ClaimSource
+    quote: AssistantQuote
+
+    @model_validator(mode="after")
+    def _quote_fits_source(self) -> "AssistantClaim":
+        if (self.source == TOOL_SOURCE) != (self.quote == ""):
+            raise ValueError("A tool claim has no quote; a passage claim has one")
+        return self
+
+
+class AssistantReply(StrictSchema):
+    """Final assistant output. No claims means the assistant could not answer."""
+
+    claims: list[AssistantClaim] = Field(max_length=8)
 
 
 class JudgeVerdict(StrictSchema):

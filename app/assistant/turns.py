@@ -4,9 +4,15 @@
       -> admit: per-user lock, window count, turn row
       -> resident context (devices) read, transaction released
       -> graph under deadline backstop, LangSmith tracing off
-      -> grounding rule -> usage row -> TurnResponse
+      -> claim checks -> usage row -> TurnResponse
 
-    Failure after a committed write: 200 "incomplete" with the actions.
+    Claim checks (all-or-nothing, as for RAG queries):
+      passage claim -> quote and numbers checked against that passage's text
+      tool claim    -> needs a non-search tool result in GROUNDING_RESULTS
+      all verified  -> "answered"; no claims or a failed check -> "no_context",
+                       or "incomplete" (claim_unverified) after a committed write
+
+    Provider failure after a committed write: 200 "incomplete" with the actions.
     Failure with nothing committed: 503 / 504 / 502, as for RAG queries.
 
 No transaction is open during a provider call. Rows hold counts and codes only:
@@ -24,6 +30,7 @@ from langsmith import tracing_context
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.ai.contracts import TOOL_SOURCE, AssistantClaim, Claim
 from app.ai.processing import SessionFactory
 from app.ai.provider import ASSISTANT_PROMPT_VERSION, ProviderFailure
 from app.assistant.contracts import (
@@ -39,6 +46,7 @@ from app.assistant.residence import Resident
 from app.assistant.runtime import AssistantRuntime
 from app.assistant.tools import ToolContext
 from app.models import AssistantTurn, Device, PendingAction
+from app.rag.verification import ClaimFailure, check_claims
 from app.telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
@@ -58,6 +66,8 @@ VISIBLE_KINDS = ("thermostat", "door_lock")
 DEADLINE_CODE = "turn_deadline"
 DATABASE_CODE = "database_unavailable"
 CANCELLED_CODE = "turn_cancelled"
+# A reply whose claims failed their checks, after a write was committed.
+CLAIM_CODE = "claim_unverified"
 _UNAVAILABLE_CODES = frozenset({"provider_rate_limit"})
 _TIMEOUT_CODES = frozenset({"provider_timeout", DEADLINE_CODE, BUDGET_CODE})
 
@@ -136,12 +146,20 @@ async def _record(
     status: str,
     run: TurnRun | None,
     error_code: str | None = None,
+    claim_failure: ClaimFailure | None = None,
 ) -> None:
     """Best effort: a failed usage write never turns a committed result into an error."""
     counts = {"model_calls": run.model_calls, "tool_calls": len(run.actions)} if run else {}
+    # The claim failure is a fixed code: safe as a metric tag.
+    outcome = {"outcome": str(claim_failure)} if claim_failure else {}
     telemetry.annotate(status=status, error_code=error_code, **counts)
-    telemetry.increment("assistant.turns", status=status, error_code=error_code)
-    values = {"status": status, "error_code": error_code, "finished_at": func.clock_timestamp()}
+    telemetry.increment("assistant.turns", status=status, error_code=error_code, **outcome)
+    values = {
+        "status": status,
+        "error_code": error_code,
+        "claim_failure": claim_failure,
+        "finished_at": func.clock_timestamp(),
+    }
     if run is not None:
         values.update(
             model_calls=run.model_calls,
@@ -177,7 +195,7 @@ def _committed(actions: list[ActionResult]) -> bool:
 
 
 def _grounded_by_tools(actions: list[ActionResult]) -> bool:
-    # Search grounds an answer only through citations.
+    # Search grounds an answer only through quoted passage claims.
     return any(
         action.tool != ToolName.SEARCH_DOCUMENTS
         and (action.decision, action.result) in GROUNDING_RESULTS
@@ -186,16 +204,19 @@ def _grounded_by_tools(actions: list[ActionResult]) -> bool:
 
 
 def _citations(run: TurnRun) -> list[Citation]:
+    """One citation per passage the claims name, in claim order, with its quotes."""
     passages = run.context.passages
+    claims = run.reply.claims
     citations: list[Citation] = []
     seen: set[str] = set()
-    for label in run.reply.citations:
+    for claim in claims:
+        label = claim.source
+        if label == TOOL_SOURCE or label in seen:
+            continue
         index = int(label[1:]) - 1
         if index >= len(passages):
             # A label the server never gave out is invalid output.
             raise ProviderFailure("provider_invalid_output")
-        if label in seen:
-            continue
         seen.add(label)
         document = passages[index]["document"]
         citations.append(
@@ -205,9 +226,33 @@ def _citations(run: TurnRun) -> list[Citation]:
                 ordinal=document.metadata["ordinal"],
                 page=document.metadata["page"],
                 snippet=document.page_content[:SNIPPET_CHARACTERS],
+                quotes=[claim.quote for claim in claims if claim.source == label],
             )
         )
     return citations
+
+
+def _claim_failure(run: TurnRun) -> ClaimFailure | None:
+    """The first claim that fails its check, in reply order, or None when all pass.
+
+    Passage claims are checked against the exact text the search tool handed out.
+    A tool claim is only as trusted as today's tool grounding: some non-search tool
+    result this turn must have succeeded.
+    """
+    texts = [passage["document"].page_content for passage in run.context.passages]
+    tools_ground = _grounded_by_tools(run.actions)
+    for claim in run.reply.claims:
+        failure = _check(claim, texts, tools_ground)
+        if failure is not None:
+            return failure
+    return None
+
+
+def _check(claim: AssistantClaim, texts: list[str], tools_ground: bool) -> ClaimFailure | None:
+    if claim.source == TOOL_SOURCE:
+        return None if tools_ground else ClaimFailure.TOOL_CLAIM_UNGROUNDED
+    passage_claim = Claim(statement=claim.statement, citation=claim.source, quote=claim.quote)
+    return check_claims([passage_claim], texts)
 
 
 async def _pending_views(session_factory: SessionFactory, run: TurnRun) -> list[PendingActionView]:
@@ -274,28 +319,37 @@ async def _finish(
 ) -> TurnResponse:
     """Run the graph and ground the reply. Raises only when nothing was committed."""
     code = None
+    failure = None
     citations: list[Citation] = []
     try:
         await _run_graph(runtime, run)
         code = run.stop_code
         if code is None:
             citations = _citations(run)
+            failure = _claim_failure(run)
     except ProviderFailure as exc:
         code = exc.code
     except _Deadline:
         code = DEADLINE_CODE
+    committed = _committed(run.actions)
     if code is not None:
-        if not _committed(run.actions):
+        if not committed:
             await _record(runtime.telemetry, session_factory, turn_id, "failed", run, code)
             raise _http_error(code)
         # Never hide a committed action behind an error.
         status, answer, citations = "incomplete", INCOMPLETE_ANSWER, []
-    elif citations or _grounded_by_tools(run.actions):
-        status, answer = "answered", run.reply.answer
+    elif run.reply.claims and failure is None:
+        status = "answered"
+        answer = " ".join(claim.statement for claim in run.reply.claims)
+    elif committed:
+        # A reply that failed its checks never stands beside a committed write: report
+        # the write. Tool claims are trusted per turn, as before: any successful
+        # non-search tool grounds every tool claim.
+        status, answer, citations, code = "incomplete", INCOMPLETE_ANSWER, [], CLAIM_CODE
     else:
-        status, answer = "no_context", NO_CONTEXT_ANSWER
+        status, answer, citations = "no_context", NO_CONTEXT_ANSWER, []
     pending = await _pending_views(session_factory, run)
-    await _record(runtime.telemetry, session_factory, turn_id, status, run, code)
+    await _record(runtime.telemetry, session_factory, turn_id, status, run, code, failure)
     return _response(turn_id, run, status, answer, citations, pending)
 
 

@@ -105,15 +105,16 @@ def wants_verdict(request: dict) -> bool:
 
 
 def valid_step(step) -> bool:
-    """A scripted agent step: one tool call, or one final answer."""
+    """A scripted agent step: one tool call, or one final reply of claims."""
     if not isinstance(step, dict):
         return False
-    if set(step) == {"answer", "citations"}:
-        citations = step["citations"]
-        return (
-            isinstance(step["answer"], str)
-            and isinstance(citations, list)
-            and all(isinstance(label, str) for label in citations)
+    if set(step) == {"claims"}:
+        claims = step["claims"]
+        return isinstance(claims, list) and all(
+            isinstance(claim, dict)
+            and set(claim) == {"statement", "source", "quote"}
+            and all(isinstance(value, str) for value in claim.values())
+            for claim in claims
         )
     if "tool" not in step or not isinstance(step["tool"], str) or len(step["tool"]) > 64:
         return False
@@ -159,9 +160,10 @@ def keyword_step(request: dict) -> dict:
             passages = output.get("passages") if isinstance(output, dict) else None
             first = passages[0] if isinstance(passages, list) and passages else None
             if isinstance(first, dict) and isinstance(first.get("text"), str):
-                answer = f"Synthetic assistant answer: {first['text'][:200]}"
-                return {"answer": answer, "citations": [first.get("label", "P1")]}
-        return {"answer": "Done.", "citations": []}
+                quote = " ".join(first["text"].split()[:QUOTE_WORDS])
+                label = first.get("label", "P1")
+                return {"claims": [{"statement": quote, "source": label, "quote": quote}]}
+        return {"claims": [{"statement": "Done.", "source": "tool", "quote": ""}]}
     message = str(context.get("message", "")).lower()
     resident = context.get("resident")
     devices = resident.get("devices", []) if isinstance(resident, dict) else []
@@ -205,7 +207,7 @@ def agent_item(step: dict) -> dict:
         [
             {
                 "type": "output_text",
-                "text": json.dumps({"answer": step["answer"], "citations": step["citations"]}),
+                "text": json.dumps({"claims": step["claims"]}),
                 "annotations": [],
                 "logprobs": [],
             }
