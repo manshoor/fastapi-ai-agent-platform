@@ -26,7 +26,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.ai.processing import SessionFactory
 from app.ai.provider import RAG_PROMPT_VERSION, AnswerGeneration, Passage, ProviderFailure
 from app.models import RAGQuery
-from app.rag.contracts import Citation, QueryRequest, QueryResponse
+from app.rag.contracts import (
+    Citation,
+    DiagnosticPassage,
+    DiagnosticsResponse,
+    DiagnosticUsage,
+    QueryRequest,
+    QueryResponse,
+)
 from app.rag.retrieval import OwnerScopedRetriever, has_context
 from app.rag.runtime import RAGRuntime
 
@@ -40,6 +47,8 @@ _TIMEOUT_CODES = frozenset({"provider_timeout"})
 DEADLINE_CODE = "query_deadline"
 DATABASE_CODE = "database_unavailable"
 CANCELLED_CODE = "query_cancelled"
+# The answer call runs without reasoning until the effort setting exists.
+_REASONING_EFFORT = "none"
 
 
 @dataclass(frozen=True)
@@ -49,6 +58,14 @@ class _Outcome:
     citations: list[Citation]
     retrieved: int
     generation: AnswerGeneration | None = None
+    # The passages sent to the model, in label order (P1 first).
+    documents: tuple[Document, ...] = ()
+
+
+@dataclass(frozen=True)
+class _Result:
+    outcome: _Outcome
+    embedding_tokens: int | None
 
 
 async def _admit(
@@ -156,15 +173,17 @@ def _build_chain(runtime: RAGRuntime, retriever: OwnerScopedRetriever):
             for document in documents
         ]
         generation = await runtime.answerer.answer(inputs["question"], passages)
+        sent = tuple(documents)
         if not generation.citations:
             # Uncited text is not grounded: never show it as an answer.
-            return _Outcome("no_context", NO_CONTEXT_ANSWER, [], len(documents), generation)
+            return _Outcome("no_context", NO_CONTEXT_ANSWER, [], len(documents), generation, sent)
         return _Outcome(
             "answered",
             generation.answer,
             _citations(documents, generation),
             len(documents),
             generation,
+            sent,
         )
 
     return RunnableParallel(documents=retriever, question=RunnablePassthrough()) | RunnableLambda(
@@ -187,6 +206,69 @@ async def answer_query(
     owner_id: UUID,
     request: QueryRequest,
 ) -> QueryResponse:
+    result = await _run_query(
+        session_factory=session_factory, runtime=runtime, owner_id=owner_id, request=request
+    )
+    outcome = result.outcome
+    return QueryResponse(status=outcome.status, answer=outcome.answer, citations=outcome.citations)
+
+
+async def diagnose_query(
+    *,
+    session_factory: SessionFactory,
+    runtime: RAGRuntime,
+    owner_id: UUID,
+    request: QueryRequest,
+) -> DiagnosticsResponse:
+    """Eval-only: the same query, plus the exact passages sent to the model and the usage.
+
+    The passage text returns only to its owner, in the response. It never reaches a span,
+    a log line or the usage row.
+    """
+    result = await _run_query(
+        session_factory=session_factory, runtime=runtime, owner_id=owner_id, request=request
+    )
+    outcome = result.outcome
+    generation = outcome.generation
+    passages = [
+        DiagnosticPassage(
+            label=f"P{number}",
+            document_id=document.metadata["document_id"],
+            title=document.metadata["title"],
+            ordinal=document.metadata["ordinal"],
+            page=document.metadata["page"],
+            distance=document.metadata["distance"],
+            section=None,
+            text=document.page_content,
+        )
+        for number, document in enumerate(outcome.documents, start=1)
+    ]
+    usage = DiagnosticUsage(
+        embedding_tokens=result.embedding_tokens,
+        input_tokens=generation.input_tokens if generation else None,
+        output_tokens=generation.output_tokens if generation else None,
+        chat_calls=None,
+        reasoning_effort=_REASONING_EFFORT,
+    )
+    return DiagnosticsResponse(
+        status=outcome.status,
+        answer=outcome.answer,
+        citations=outcome.citations,
+        no_context_reason=None,
+        passages=passages,
+        claims=None,
+        verdicts=None,
+        usage=usage,
+    )
+
+
+async def _run_query(
+    *,
+    session_factory: SessionFactory,
+    runtime: RAGRuntime,
+    owner_id: UUID,
+    request: QueryRequest,
+) -> _Result:
     async with runtime.query_slot():
         query_id = await _admit(
             session_factory=session_factory, runtime=runtime, owner_id=owner_id, top_k=request.top_k
@@ -241,9 +323,7 @@ async def answer_query(
             telemetry.observe(
                 "rag.query.duration", time.monotonic() - started, status=outcome.status
             )
-            return QueryResponse(
-                status=outcome.status, answer=outcome.answer, citations=outcome.citations
-            )
+            return _Result(outcome, retriever.embedding_tokens)
 
 
 async def _answer(

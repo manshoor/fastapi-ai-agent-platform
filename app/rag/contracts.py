@@ -99,6 +99,49 @@ class QueryResponse(StrictSchema):
     citations: list[Citation]
 
 
+class DiagnosticPassage(StrictSchema):
+    """One passage exactly as the answer model received it."""
+
+    label: str
+    document_id: UUID
+    title: str
+    ordinal: int
+    page: int | None
+    distance: float
+    section: str | None
+    text: str
+
+
+class DiagnosticClaim(StrictSchema):
+    statement: str
+    citation: str
+    quote: str
+    check: str
+
+
+class DiagnosticVerdict(StrictSchema):
+    claim: str
+    supported: bool
+
+
+class DiagnosticUsage(StrictSchema):
+    embedding_tokens: int | None
+    input_tokens: int | None
+    output_tokens: int | None
+    chat_calls: int | None
+    reasoning_effort: str
+
+
+class DiagnosticsResponse(QueryResponse):
+    """Eval-only view of one query. Fields of later grounding steps stay null until they run."""
+
+    no_context_reason: str | None
+    passages: list[DiagnosticPassage]
+    claims: list[DiagnosticClaim] | None
+    verdicts: list[DiagnosticVerdict] | None
+    usage: DiagnosticUsage
+
+
 class IngestEvent(StrictSchema):
     version: Literal[1]
     event_id: UUID

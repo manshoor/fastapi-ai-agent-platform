@@ -17,6 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tracers.langchain import wait_for_all_tracers
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from sqlalchemy import func, insert, select
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
@@ -24,8 +25,10 @@ from app.config import Settings
 from app.models import RAG_EMBEDDING_DIMENSIONS, RAGChunk, RAGDocument, RAGQuery
 from app.rag.contracts import QueryRequest
 from app.rag.pipeline import NO_CONTEXT_ANSWER, answer_query
+from app.telemetry import Telemetry
 
 URL = "/api/v1/rag/query"
+DIAGNOSTICS = "/api/v1/rag/query/diagnostics"
 QUERY_LIMIT = 3
 EMBEDDING_MODEL = "text-embedding-3-small"
 PUMP = "The pump runs at 40 litres per minute when the valve is open."
@@ -423,3 +426,80 @@ async def test_cancelled_query_is_recorded(app, account, simulator):
     (row,) = await query_rows(app)
     assert (row.status, row.error_code) == ("failed", "query_cancelled")
     assert row.embedding_tokens is not None
+
+
+async def test_diagnostics_route_is_absent_unless_enabled(app, client, account):
+    owner = await account()
+    body = {"question": QUESTION}
+    # Absent, not just refused: no auth challenge, no schema entry, no usage row.
+    assert (await client.post(DIAGNOSTICS, json=body)).status_code == 404
+    assert (await client.post(DIAGNOSTICS, headers=owner["headers"], json=body)).status_code == 404
+    assert DIAGNOSTICS not in (await client.get("/openapi.json")).json()["paths"]
+    assert await query_rows(app) == []
+
+
+async def test_diagnostics_return_the_passages_sent_to_the_model(
+    app, client, account, settings, simulator, monkeypatch
+):
+    settings.rag_diagnostics_enabled = True
+    exporter = InMemorySpanExporter()
+    telemetry = Telemetry("rag-diagnostics-test", trace_exporter=exporter)
+    runtime = app.state.rag
+    for holder in (runtime, runtime.embedder, runtime.answerer):
+        monkeypatch.setattr(holder, "telemetry", telemetry)
+    owner = await account()
+    owner_id = UUID(owner["id"])
+    pump = await add_ready_document(app, owner_id, "Pump manual", PUMP)
+    await add_ready_document(app, owner_id, "Garden notes", GARDEN)
+    stranger = await account()
+    await add_ready_document(app, UUID(stranger["id"]), "Stranger manual", PUMP)
+    try:
+        unauthenticated = await client.post(DIAGNOSTICS, json={"question": QUESTION})
+        response = await client.post(
+            DIAGNOSTICS, headers=owner["headers"], json={"question": QUESTION, "top_k": 3}
+        )
+        assert telemetry.provider.force_flush(timeout_millis=1000)
+        spans = exporter.get_finished_spans()
+    finally:
+        telemetry.shutdown()
+
+    assert unauthenticated.status_code == 401
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert body["status"] == "answered"
+    # Only the owner's two documents, closest first, exactly as the model received them.
+    assert [passage["label"] for passage in body["passages"]] == ["P1", "P2"]
+    first = body["passages"][0]
+    assert (first["document_id"], first["title"], first["ordinal"]) == (str(pump), "Pump manual", 0)
+    assert (first["text"], first["section"], first["page"]) == (PUMP, None, None)
+    assert body["passages"][1]["title"] == "Garden notes"
+    assert body["passages"][0]["distance"] <= body["passages"][1]["distance"]
+    assert body["citations"][0]["document_id"] == str(pump)
+    assert (body["no_context_reason"], body["claims"], body["verdicts"]) == (None, None, None)
+    (row,) = await query_rows(app)
+    assert row.status == "answered"
+    assert body["usage"] == {
+        "embedding_tokens": row.embedding_tokens,
+        "input_tokens": 25,
+        "output_tokens": 15,
+        "chat_calls": None,
+        "reasoning_effort": "none",
+    }
+    # Passage and question text return only in the response body, never in a span.
+    assert {"rag.query", "rag.retrieve"} <= {span.name for span in spans}
+    assert not any(PUMP in span.to_json() or QUESTION in span.to_json() for span in spans)
+
+
+async def test_diagnostics_count_toward_the_query_limit(app, client, account, settings):
+    settings.rag_diagnostics_enabled = True
+    owner = await account()
+    for _ in range(QUERY_LIMIT - 1):
+        assert (await ask(client, owner)).status_code == 200
+    body = {"question": QUESTION}
+    first = await client.post(DIAGNOSTICS, headers=owner["headers"], json=body)
+    assert first.status_code == 200
+    assert (first.json()["status"], first.json()["passages"]) == ("no_context", [])
+    limited = await client.post(DIAGNOSTICS, headers=owner["headers"], json=body)
+    assert limited.status_code == 429
+    assert len(await query_rows(app)) == QUERY_LIMIT

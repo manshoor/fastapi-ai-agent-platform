@@ -6,9 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assistant.residence import is_manager
 from app.db import get_session
-from app.rag.contracts import DocumentList, DocumentResponse, QueryRequest, QueryResponse
+from app.rag.contracts import (
+    DiagnosticsResponse,
+    DocumentList,
+    DocumentResponse,
+    QueryRequest,
+    QueryResponse,
+)
 from app.rag.documents import delete_document, get_document, list_documents, submit_document
-from app.rag.pipeline import answer_query
+from app.rag.pipeline import answer_query, diagnose_query
 from app.rag.runtime import RAGRuntime
 from app.rag.uploads import read_upload
 from app.security import get_current_user_id
@@ -128,6 +134,35 @@ async def query_documents(
     runtime = _runtime(request)
     runtime.telemetry.increment("rag.requests", operation="query")
     result = await answer_query(
+        session_factory=request.app.state.session_factory,
+        runtime=runtime,
+        owner_id=owner_id,
+        request=payload,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return result
+
+
+def _diagnostics_enabled(request: Request) -> None:
+    # Runs before authentication: with the flag off, a valid request gets 404, not 401.
+    if not request.app.state.settings.rag_diagnostics_enabled:
+        raise HTTPException(404, "Not Found")
+
+
+@router.post(
+    "/query/diagnostics",
+    response_model=DiagnosticsResponse,
+    responses={404: {}, 422: {}, 429: {}, 502: {}, 503: {}, 504: {}},
+    dependencies=[Depends(_diagnostics_enabled)],
+    include_in_schema=False,
+)
+async def diagnose_documents(
+    payload: QueryRequest, request: Request, response: Response, owner_id: Owner
+) -> DiagnosticsResponse:
+    """Eval-only: the same query, counted and limited like /query, plus its passages."""
+    runtime = _runtime(request)
+    runtime.telemetry.increment("rag.requests", operation="diagnostics")
+    result = await diagnose_query(
         session_factory=request.app.state.session_factory,
         runtime=runtime,
         owner_id=owner_id,
