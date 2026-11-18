@@ -1,4 +1,4 @@
-"""Embedding and grounded-answer adapters over real TCP with the installed SDK."""
+"""Embedding and quoted-answer adapters over real TCP with the installed SDK."""
 
 import asyncio
 import importlib.util
@@ -261,7 +261,7 @@ async def test_embedding_returns_vectors_in_input_order(simulator):
     assert [vector[0] for vector in result.vectors] == [0.5, 0.25]
 
 
-async def test_grounded_answer_wire_contract_and_citations(simulator):
+async def test_quoted_answer_wire_contract_and_claims(simulator):
     url, _, captured = simulator
     answerer = OpenAIAnswerer(settings_for(url, ai_model="pinned-answer-model"))
     try:
@@ -280,13 +280,18 @@ async def test_grounded_answer_wire_contract_and_citations(simulator):
         ],
     }
     schema = wire["text"]["format"]
-    assert schema["strict"] is True and set(schema["schema"]["required"]) == {
-        "answer",
-        "citations",
-    }
+    assert schema["strict"] is True and set(schema["schema"]["required"]) == {"claims"}
+    claim_schema = schema["schema"]["$defs"]["Claim"]
+    assert set(claim_schema["required"]) == {"statement", "citation", "quote"}
+    assert claim_schema["additionalProperties"] is False
     assert result.citations == (0,)
-    assert result.answer.startswith("Synthetic grounded answer")
+    (claim,) = result.claims
+    assert claim.citation == "P1" and claim.quote == PASSAGES[0].text
+    assert result.answer == claim.statement
     assert result.model == "simulator-item-rewrite"
+
+
+CLAIM = {"statement": "It runs fast.", "citation": "P1", "quote": "runs at 40 litres"}
 
 
 def answer_body(answer: dict) -> dict:
@@ -311,15 +316,31 @@ def answer_body(answer: dict) -> dict:
 @pytest.mark.parametrize(
     "answer",
     [
-        {"answer": "Outside", "citations": ["P3"]},
-        {"answer": "Bad label", "citations": ["S1"]},
-        {"answer": "", "citations": []},
-        {"answer": "Nine", "citations": ["P1"] * 9},
-        {"answer": "Extra", "citations": [], "confidence": 1},
+        {"claims": [CLAIM | {"citation": "P3"}]},
+        {"claims": [CLAIM | {"citation": "S1"}]},
+        {"claims": [CLAIM | {"statement": ""}]},
+        {"claims": [CLAIM | {"quote": ""}]},
+        {"claims": [CLAIM | {"quote": "x" * 301}]},
+        {"claims": [CLAIM | {"statement": "Nul\u0000"}]},
+        {"claims": [CLAIM] * 9},
+        {"claims": [CLAIM | {"confidence": 1}]},
+        {"claims": [], "answer": "Extra"},
+        {"answer": "Old shape", "citations": ["P1"]},
     ],
-    ids=["outside-passages", "label", "empty", "too-many", "extra-field"],
+    ids=[
+        "outside-passages",
+        "label",
+        "empty-statement",
+        "empty-quote",
+        "long-quote",
+        "nul",
+        "too-many",
+        "extra-claim-field",
+        "extra-field",
+        "v1-shape",
+    ],
 )
-async def test_grounded_answer_rejects_invalid_output(simulator, answer):
+async def test_quoted_answer_rejects_invalid_output(simulator, answer):
     url, app, _ = simulator
 
     async def malformed(request: Request):
@@ -335,11 +356,16 @@ async def test_grounded_answer_rejects_invalid_output(simulator, answer):
     assert error.value.code == "provider_invalid_output"
 
 
-async def test_grounded_answer_deduplicates_citations_in_order(simulator):
+async def test_quoted_answer_joins_claims_and_deduplicates_citations(simulator):
     url, app, _ = simulator
+    claims = [
+        CLAIM | {"citation": "P2", "statement": "Clean it monthly."},
+        CLAIM | {"statement": "It runs fast."},
+        CLAIM | {"citation": "P2", "statement": "Use a brush."},
+    ]
 
     async def repeated(request: Request):
-        return JSONResponse(answer_body({"answer": "Both", "citations": ["P2", "P1", "P2"]}))
+        return JSONResponse(answer_body({"claims": claims}))
 
     replace_route(app, "/v1/responses", repeated)
     answerer = OpenAIAnswerer(settings_for(url))
@@ -348,6 +374,19 @@ async def test_grounded_answer_deduplicates_citations_in_order(simulator):
     finally:
         await answerer.aclose()
     assert result.citations == (1, 0)
+    assert result.answer == "Clean it monthly. It runs fast. Use a brush."
+    assert [claim.citation for claim in result.claims] == ["P2", "P1", "P2"]
+
+
+async def test_no_claims_means_not_in_passages(simulator):
+    url, _, _ = simulator
+    await configure(url, "uncited")
+    answerer = OpenAIAnswerer(settings_for(url))
+    try:
+        result = await answerer.answer("Question?", PASSAGES)
+    finally:
+        await answerer.aclose()
+    assert (result.answer, result.citations, result.claims) == ("", (), ())
 
 
 async def test_out_of_range_batches_never_send(simulator):
@@ -388,7 +427,7 @@ async def test_rewrite_refuses_the_rag_prompt(simulator):
         ("timeout", "provider_timeout"),
     ],
 )
-async def test_grounded_answer_failures_are_classified_once(simulator, mode, code):
+async def test_quoted_answer_failures_are_classified_once(simulator, mode, code):
     url, app, captured = simulator
     await configure(url, mode)
     answerer = OpenAIAnswerer(

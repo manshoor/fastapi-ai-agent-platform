@@ -167,11 +167,17 @@ async def test_answer_cites_the_matching_document(app, client, account, simulato
     assert [citation["document_id"] for citation in body["citations"]] == [str(pump)]
     assert body["citations"][0]["title"] == "Pump manual"
     assert body["citations"][0]["snippet"] == PUMP
+    # The simulator quotes the first eight words of P1 and states them as the claim.
+    quote = " ".join(PUMP.split()[:8])
+    assert body["citations"][0]["quotes"] == [quote]
+    assert body["answer"] == quote
     # One question embedding, one answer.
     assert state.calls == 2
     (row,) = await query_rows(app)
     assert (row.status, row.retrieved_count, row.top_k) == ("answered", 1, 1)
     assert row.finished_at is not None and row.input_tokens == 25 and row.output_tokens == 15
+    assert (row.chat_calls, row.reasoning_effort, row.no_context_reason) == (1, "none", None)
+    assert row.prompt_version == "rag-answer-v2"
     assert row.provider_request_id.startswith("req_sim_")
 
 
@@ -193,6 +199,7 @@ async def test_other_owner_gets_no_context_without_provider_calls(app, client, a
     assert state.calls == 0
     rows = await query_rows(app)
     assert {(row.status, row.retrieved_count) for row in rows} == {("no_context", 0)}
+    assert {(row.no_context_reason, row.chat_calls) for row in rows} == {("no_chunks", 0)}
 
 
 async def test_document_filter_limits_the_search(app, client, account):
@@ -223,9 +230,17 @@ async def test_unsearchable_documents_are_excluded(app, client, account, simulat
     assert state.calls == 0
 
 
-async def test_uncited_answer_is_never_shown(app, client, account, simulator):
+@pytest.mark.parametrize(
+    ("mode", "reason"),
+    [
+        ("uncited", "no_claims"),
+        ("misquote", "quote_not_found"),
+        ("wrong_number", "number_not_in_passage"),
+    ],
+)
+async def test_unverified_answer_is_never_shown(app, client, account, simulator, mode, reason):
     state, _ = simulator
-    state.modes = ["success", "uncited"]
+    state.modes = ["success", mode]
     owner = await account()
     await add_ready_document(app, UUID(owner["id"]), "Pump manual", PUMP)
 
@@ -233,9 +248,11 @@ async def test_uncited_answer_is_never_shown(app, client, account, simulator):
 
     assert response.status_code == 200
     assert response.json() == {"status": "no_context", "answer": NO_CONTEXT_ANSWER, "citations": []}
-    assert "Unsupported" not in response.text
+    assert "9999" not in response.text and "no passage" not in response.text
     (row,) = await query_rows(app)
     assert (row.status, row.retrieved_count, row.output_tokens) == ("no_context", 1, 15)
+    # The refusal reason is recorded on the usage row, never in the response.
+    assert (row.no_context_reason, row.chat_calls) == (reason, 1)
 
 
 async def test_parallel_queries_admit_exactly_the_limit(app, client, account):
@@ -277,6 +294,8 @@ async def test_provider_failures_map_to_fixed_errors(
     assert QUESTION not in response.text and PUMP not in response.text
     (row,) = await query_rows(app)
     assert (row.status, row.error_code) == ("failed", error_code)
+    # The failed call's own tokens are unknown: no completed chat call is counted.
+    assert (row.chat_calls, row.input_tokens, row.no_context_reason) == (0, None, None)
     assert row.finished_at is not None
 
 
@@ -476,14 +495,18 @@ async def test_diagnostics_return_the_passages_sent_to_the_model(
     assert body["passages"][1]["title"] == "Garden notes"
     assert body["passages"][0]["distance"] <= body["passages"][1]["distance"]
     assert body["citations"][0]["document_id"] == str(pump)
-    assert (body["no_context_reason"], body["claims"], body["verdicts"]) == (None, None, None)
+    quote = " ".join(PUMP.split()[:8])
+    assert body["claims"] == [
+        {"statement": quote, "citation": "P1", "quote": quote, "check": "verified"}
+    ]
+    assert (body["no_context_reason"], body["verdicts"]) == (None, None)
     (row,) = await query_rows(app)
     assert row.status == "answered"
     assert body["usage"] == {
         "embedding_tokens": row.embedding_tokens,
         "input_tokens": 25,
         "output_tokens": 15,
-        "chat_calls": None,
+        "chat_calls": 1,
         "reasoning_effort": "none",
     }
     # Passage and question text return only in the response body, never in a span.
@@ -500,6 +523,22 @@ async def test_diagnostics_count_toward_the_query_limit(app, client, account, se
     first = await client.post(DIAGNOSTICS, headers=owner["headers"], json=body)
     assert first.status_code == 200
     assert (first.json()["status"], first.json()["passages"]) == ("no_context", [])
+    assert (first.json()["no_context_reason"], first.json()["claims"]) == ("no_chunks", None)
     limited = await client.post(DIAGNOSTICS, headers=owner["headers"], json=body)
     assert limited.status_code == 429
     assert len(await query_rows(app)) == QUERY_LIMIT
+
+
+async def test_diagnostics_name_the_failed_claim_check(app, client, account, settings, simulator):
+    state, _ = simulator
+    settings.rag_diagnostics_enabled = True
+    state.modes = ["success", "wrong_number"]
+    owner = await account()
+    await add_ready_document(app, UUID(owner["id"]), "Pump manual", PUMP)
+
+    response = await client.post(DIAGNOSTICS, headers=owner["headers"], json={"question": QUESTION})
+
+    body = response.json()
+    assert (body["status"], body["no_context_reason"]) == ("no_context", "number_not_in_passage")
+    assert [claim["check"] for claim in body["claims"]] == ["number_not_in_passage"]
+    assert body["usage"]["chat_calls"] == 1

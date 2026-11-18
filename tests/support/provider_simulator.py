@@ -25,8 +25,10 @@ MODES = frozenset(
         "timeout",
         "rate_limit",
         "server_error",
-        # Grounded answer that cites no passage.
+        # RAG answers: no claims, a quote absent from the passage, a number absent from it.
         "uncited",
+        "misquote",
+        "wrong_number",
     }
 )
 SUGGESTION = {"title": "Clear synthetic title", "description": "A clear synthetic description."}
@@ -66,17 +68,26 @@ def embed_text(text: str, dimensions: int) -> list[float]:
     return [value / norm for value in vector]
 
 
-def grounded_answer(request: dict) -> dict:
-    """Cite the first passage; with no passages, answer that nothing was found."""
+# Words of the first passage the synthetic claim quotes.
+QUOTE_WORDS = 8
+
+
+def quoted_answer(request: dict, mode: str) -> dict:
+    """One claim quoting the first words of P1; no passages or "uncited" give no claims."""
     try:
         passages = json.loads(request.get("input", "")).get("passages", [])
     except (ValueError, AttributeError):
         passages = []
     first = passages[0] if isinstance(passages, list) and passages else None
-    if not isinstance(first, dict) or not isinstance(first.get("text"), str):
-        return {"answer": "The passages do not contain the answer.", "citations": []}
-    answer = f"Synthetic grounded answer: {first['text'][:200]}"
-    return {"answer": answer, "citations": ["P1"]}
+    if mode == "uncited" or not isinstance(first, dict) or not isinstance(first.get("text"), str):
+        return {"claims": []}
+    quote = " ".join(first["text"].split()[:QUOTE_WORDS])
+    statement = quote
+    if mode == "misquote":
+        quote = "words that appear in no passage"
+    elif mode == "wrong_number":
+        statement = f"{quote} 9999"
+    return {"claims": [{"statement": statement, "citation": "P1", "quote": quote}]}
 
 
 def _schema_properties(request: dict) -> dict:
@@ -85,8 +96,8 @@ def _schema_properties(request: dict) -> dict:
     return properties if isinstance(properties, dict) else {}
 
 
-def wants_grounded_answer(request: dict) -> bool:
-    return "citations" in _schema_properties(request)
+def wants_claims(request: dict) -> bool:
+    return "claims" in _schema_properties(request)
 
 
 def wants_verdict(request: dict) -> bool:
@@ -438,12 +449,10 @@ def create_app() -> FastAPI:
                 return await agent_response(value, mode)
             if wants_verdict(value):
                 output = {"grounded": True, "answers_question": True}
-            elif wants_grounded_answer(value):
-                output = grounded_answer(value)
+            elif wants_claims(value):
+                output = quoted_answer(value, mode)
             else:
                 output = SUGGESTION
-            if mode == "uncited":
-                output = {"answer": "Unsupported synthetic claim.", "citations": []}
             failure = await fail(mode)
             if failure is not None:
                 return failure

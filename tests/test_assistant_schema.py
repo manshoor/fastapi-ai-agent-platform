@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import insert, update
+from sqlalchemy import func, insert, update
 from sqlalchemy.exc import IntegrityError
 
 from app.models import (
@@ -293,3 +293,35 @@ async def test_records_must_use_an_apartment_of_their_building(app: FastAPI, acc
         else insert(Ticket).values(user_id=user, category="other", summary="Leak", **mixed)
     )
     await rejected(app, statement, f"fk_{table}_apartment_building")
+
+
+@pytest.mark.parametrize(
+    ("values", "valid"),
+    [
+        ({"status": "no_context", "claim_failure": "quote_not_found"}, True),
+        (
+            {
+                "status": "incomplete",
+                "error_code": "claim_unverified",
+                "claim_failure": "tool_claim_ungrounded",
+            },
+            True,
+        ),
+        ({"status": "answered", "claim_failure": "quote_not_found"}, False),
+        ({"status": "no_context", "claim_failure": "no_claims"}, False),
+    ],
+    ids=["no-context", "incomplete", "answered", "unknown-code"],
+)
+async def test_claim_failure_names_a_refused_turn(app: FastAPI, account, values, valid):
+    user = UUID((await account())["id"])
+    statement = insert(AssistantTurn).values(
+        user_id=user,
+        model="model",
+        prompt_version="assistant-v1",
+        finished_at=func.now(),
+        **values,
+    )
+    if valid:
+        await write(app, statement)
+        return
+    await rejected(app, statement, "ck_assistant_turns_claim_failure")

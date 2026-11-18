@@ -91,6 +91,8 @@ class Citation(StrictSchema):
     ordinal: int
     page: int | None
     snippet: str
+    # The verified word-for-word quotes this answer takes from the passage.
+    quotes: list[str]
 
 
 class QueryResponse(StrictSchema):

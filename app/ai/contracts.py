@@ -33,11 +33,30 @@ Answer = Annotated[
 ]
 
 
-class GroundedAnswer(StrictSchema):
-    """Structured model output for a RAG answer. Empty citations mean "not in passages"."""
+Statement = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=480),
+    AfterValidator(reject_nul),
+]
+Quote = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=300),
+    AfterValidator(reject_nul),
+]
 
-    answer: Answer
-    citations: list[PassageLabel] = Field(max_length=8)
+
+class Claim(StrictSchema):
+    """One answer sentence, the passage it comes from, and a word-for-word quote from it."""
+
+    statement: Statement
+    citation: PassageLabel
+    quote: Quote
+
+
+class QuotedAnswer(StrictSchema):
+    """Structured model output for a RAG answer. No claims means "not in passages"."""
+
+    claims: list[Claim] = Field(max_length=8)
 
 
 class AssistantReply(StrictSchema):

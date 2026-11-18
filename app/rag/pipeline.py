@@ -1,9 +1,15 @@
-"""Synchronous RAG query: admit, retrieve, answer, cite, record usage.
+"""Synchronous RAG query: admit, retrieve, answer in quoted claims, check, cite, record usage.
 
     slot -> admit (per-owner lock, window count, usage row) -> any searchable chunk?
-      no  -> no_context (no provider call)
-      yes -> LCEL chain: retriever (embed question + owner KNN) -> passages -> answer
-          -> citations mapped back to chunks -> usage row -> 200
+      no  -> no_context, reason no_chunks (no provider call)
+      yes -> LCEL chain: retriever (embed question + owner KNN) -> passages -> claims
+          -> no claims                    -> no_context, reason no_claims
+          -> any claim fails its check    -> no_context, reason = that check
+          -> all claims verified          -> answered, citations with their quotes
+          -> usage row (summed chat usage, reason, effort) -> 200
+
+The answer is the claim statements joined with spaces. Refusal is all-or-nothing: one
+failed claim refuses the whole answer, since dropping it could flip the meaning.
 
 No database transaction is open during provider calls. The chain runs with LangSmith
 tracing disabled, so no question, passage or answer text can leave through it.
@@ -28,6 +34,7 @@ from app.ai.provider import RAG_PROMPT_VERSION, AnswerGeneration, Passage, Provi
 from app.models import RAGQuery
 from app.rag.contracts import (
     Citation,
+    DiagnosticClaim,
     DiagnosticPassage,
     DiagnosticsResponse,
     DiagnosticUsage,
@@ -36,6 +43,7 @@ from app.rag.contracts import (
 )
 from app.rag.retrieval import OwnerScopedRetriever, has_context
 from app.rag.runtime import RAGRuntime
+from app.rag.verification import check_claims
 
 logger = logging.getLogger(__name__)
 # Two-key advisory lock namespace for per-owner query admission ("RAGQ").
@@ -49,6 +57,13 @@ DATABASE_CODE = "database_unavailable"
 CANCELLED_CODE = "query_cancelled"
 # The answer call runs without reasoning until the effort setting exists.
 _REASONING_EFFORT = "none"
+# No-context reasons decided here; claim check reasons come from app.rag.verification.
+NO_CHUNKS = "no_chunks"
+NO_PASSAGES = "no_passages"
+NO_CLAIMS = "no_claims"
+# Diagnostics: a claim that passed, or one after the first failure (never checked).
+_VERIFIED = "verified"
+_NOT_CHECKED = "not_checked"
 
 
 @dataclass(frozen=True)
@@ -60,12 +75,43 @@ class _Outcome:
     generation: AnswerGeneration | None = None
     # The passages sent to the model, in label order (P1 first).
     documents: tuple[Document, ...] = ()
+    no_context_reason: str | None = None
+
+
+def _add(total: int | None, tokens: int | None) -> int | None:
+    if tokens is None:
+        return total
+    return (total or 0) + tokens
+
+
+@dataclass
+class _Usage:
+    """Billed usage of one query: embeddings plus every completed chat call.
+
+    Filled as calls complete, so a failure after a billed answer still records it.
+    A call that raises is not counted, even when the provider billed it (truncated or
+    invalid output): the adapter does not return that call's usage.
+    """
+
+    embedding_tokens: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    chat_calls: int = 0
+    response_model: str | None = None
+    request_id: str | None = None
+
+    def add(self, generation: AnswerGeneration) -> None:
+        self.chat_calls += 1
+        self.input_tokens = _add(self.input_tokens, generation.input_tokens)
+        self.output_tokens = _add(self.output_tokens, generation.output_tokens)
+        self.response_model = generation.model
+        self.request_id = generation.request_id
 
 
 @dataclass(frozen=True)
 class _Result:
     outcome: _Outcome
-    embedding_tokens: int | None
+    usage: _Usage
 
 
 async def _admit(
@@ -114,26 +160,26 @@ async def _record(
     session_factory: SessionFactory,
     query_id: UUID,
     status: str,
+    usage: _Usage,
     retrieved: int | None = None,
-    embedding_tokens: int | None = None,
-    generation: AnswerGeneration | None = None,
+    no_context_reason: str | None = None,
     error_code: str | None = None,
 ) -> None:
     """Best effort: a failed usage write never turns a paid answer into an error."""
     values = {
         "status": status,
         "retrieved_count": retrieved,
-        "embedding_tokens": embedding_tokens,
+        "embedding_tokens": usage.embedding_tokens,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "chat_calls": usage.chat_calls,
+        "response_model": usage.response_model,
+        "provider_request_id": usage.request_id,
+        "reasoning_effort": _REASONING_EFFORT,
+        "no_context_reason": no_context_reason,
         "error_code": error_code,
         "finished_at": func.clock_timestamp(),
     }
-    if generation is not None:
-        values.update(
-            response_model=generation.model,
-            input_tokens=generation.input_tokens,
-            output_tokens=generation.output_tokens,
-            provider_request_id=generation.request_id,
-        )
     try:
         async with session_factory() as session:
             await session.execute(
@@ -147,23 +193,29 @@ async def _record(
 
 
 def _citations(documents: list[Document], generation: AnswerGeneration) -> list[Citation]:
-    return [
-        Citation(
-            document_id=documents[index].metadata["document_id"],
-            title=documents[index].metadata["title"],
-            ordinal=documents[index].metadata["ordinal"],
-            page=documents[index].metadata["page"],
-            snippet=documents[index].page_content[:SNIPPET_CHARACTERS],
+    """One citation per cited passage, in claim order, with that passage's quotes."""
+    citations = []
+    for index in generation.citations:
+        label = f"P{index + 1}"
+        metadata = documents[index].metadata
+        citations.append(
+            Citation(
+                document_id=metadata["document_id"],
+                title=metadata["title"],
+                ordinal=metadata["ordinal"],
+                page=metadata["page"],
+                snippet=documents[index].page_content[:SNIPPET_CHARACTERS],
+                quotes=[claim.quote for claim in generation.claims if claim.citation == label],
+            )
         )
-        for index in generation.citations
-    ]
+    return citations
 
 
-def _build_chain(runtime: RAGRuntime, retriever: OwnerScopedRetriever):
+def _build_chain(runtime: RAGRuntime, retriever: OwnerScopedRetriever, usage: _Usage):
     async def generate(inputs: dict) -> _Outcome:
         documents: list[Document] = inputs["documents"]
         if not documents:
-            return _Outcome("no_context", NO_CONTEXT_ANSWER, [], 0)
+            return _Outcome("no_context", NO_CONTEXT_ANSWER, [], 0, no_context_reason=NO_PASSAGES)
         passages = [
             Passage(
                 title=document.metadata["title"],
@@ -173,10 +225,25 @@ def _build_chain(runtime: RAGRuntime, retriever: OwnerScopedRetriever):
             for document in documents
         ]
         generation = await runtime.answerer.answer(inputs["question"], passages)
+        usage.add(generation)
         sent = tuple(documents)
-        if not generation.citations:
-            # Uncited text is not grounded: never show it as an answer.
-            return _Outcome("no_context", NO_CONTEXT_ANSWER, [], len(documents), generation, sent)
+
+        # Unquoted or misquoted text is not grounded: never show it as an answer.
+        failure = (
+            check_claims(generation.claims, [passage.text for passage in passages])
+            if generation.claims
+            else NO_CLAIMS
+        )
+        if failure is not None:
+            return _Outcome(
+                "no_context",
+                NO_CONTEXT_ANSWER,
+                [],
+                len(documents),
+                generation,
+                sent,
+                no_context_reason=str(failure),
+            )
         return _Outcome(
             "answered",
             generation.answer,
@@ -229,7 +296,7 @@ async def diagnose_query(
         session_factory=session_factory, runtime=runtime, owner_id=owner_id, request=request
     )
     outcome = result.outcome
-    generation = outcome.generation
+    usage = result.usage
     passages = [
         DiagnosticPassage(
             label=f"P{number}",
@@ -243,23 +310,44 @@ async def diagnose_query(
         )
         for number, document in enumerate(outcome.documents, start=1)
     ]
-    usage = DiagnosticUsage(
-        embedding_tokens=result.embedding_tokens,
-        input_tokens=generation.input_tokens if generation else None,
-        output_tokens=generation.output_tokens if generation else None,
-        chat_calls=None,
-        reasoning_effort=_REASONING_EFFORT,
-    )
     return DiagnosticsResponse(
         status=outcome.status,
         answer=outcome.answer,
         citations=outcome.citations,
-        no_context_reason=None,
+        no_context_reason=outcome.no_context_reason,
         passages=passages,
-        claims=None,
+        claims=_diagnostic_claims(outcome),
         verdicts=None,
-        usage=usage,
+        usage=DiagnosticUsage(
+            embedding_tokens=usage.embedding_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            chat_calls=usage.chat_calls,
+            reasoning_effort=_REASONING_EFFORT,
+        ),
     )
+
+
+def _diagnostic_claims(outcome: _Outcome) -> list[DiagnosticClaim] | None:
+    """Each claim with its own check result, up to and including the first failure."""
+    generation = outcome.generation
+    if generation is None:
+        return None
+    texts = [document.page_content for document in outcome.documents]
+    claims = []
+    failed = False
+    for claim in generation.claims:
+        check = _NOT_CHECKED
+        if not failed:
+            failure = check_claims([claim], texts)
+            failed = failure is not None
+            check = str(failure) if failed else _VERIFIED
+        claims.append(
+            DiagnosticClaim(
+                statement=claim.statement, citation=claim.citation, quote=claim.quote, check=check
+            )
+        )
+    return claims
 
 
 async def _run_query(
@@ -286,19 +374,22 @@ async def _run_query(
                 telemetry=telemetry,
             )
 
+            usage = _Usage()
+
             # Every exit after admission closes the usage row, paid or not.
             async def fail(code: str) -> None:
+                usage.embedding_tokens = retriever.embedding_tokens
                 await _record(
                     session_factory=session_factory,
                     query_id=query_id,
                     status="failed",
-                    embedding_tokens=retriever.embedding_tokens,
+                    usage=usage,
                     error_code=code,
                 )
                 telemetry.increment("rag.queries", status="failed", error_code=code)
 
             try:
-                outcome = await _answer(runtime, retriever, request)
+                outcome = await _answer(runtime, retriever, request, usage)
             except (ProviderFailure, TimeoutError) as exc:
                 code = exc.code if isinstance(exc, ProviderFailure) else DEADLINE_CODE
                 await fail(code)
@@ -311,23 +402,26 @@ async def _run_query(
                 await asyncio.shield(fail(CANCELLED_CODE))
                 raise
             telemetry.annotate(retrieved_count=outcome.retrieved)
+            usage.embedding_tokens = retriever.embedding_tokens
             await _record(
                 session_factory=session_factory,
                 query_id=query_id,
                 status=outcome.status,
+                usage=usage,
                 retrieved=outcome.retrieved,
-                embedding_tokens=retriever.embedding_tokens,
-                generation=outcome.generation,
+                no_context_reason=outcome.no_context_reason,
             )
-            telemetry.increment("rag.queries", status=outcome.status)
+            # The no-context reason is a fixed code: safe as a metric tag.
+            tags = {"outcome": outcome.no_context_reason} if outcome.no_context_reason else {}
+            telemetry.increment("rag.queries", status=outcome.status, **tags)
             telemetry.observe(
                 "rag.query.duration", time.monotonic() - started, status=outcome.status
             )
-            return _Result(outcome, retriever.embedding_tokens)
+            return _Result(outcome, usage)
 
 
 async def _answer(
-    runtime: RAGRuntime, retriever: OwnerScopedRetriever, request: QueryRequest
+    runtime: RAGRuntime, retriever: OwnerScopedRetriever, request: QueryRequest, usage: _Usage
 ) -> _Outcome:
     """No searchable chunk: no provider call. Otherwise run the chain under the deadline."""
     if not await has_context(
@@ -336,8 +430,8 @@ async def _answer(
         embedding_model=retriever.embedding_model,
         document_ids=request.document_ids,
     ):
-        return _Outcome("no_context", NO_CONTEXT_ANSWER, [], 0)
-    chain = _build_chain(runtime, retriever)
+        return _Outcome("no_context", NO_CONTEXT_ANSWER, [], 0, no_context_reason=NO_CHUNKS)
+    chain = _build_chain(runtime, retriever, usage)
     async with asyncio.timeout(runtime.settings.rag_query_deadline_seconds):
         with tracing_context(enabled=False):
             return await chain.ainvoke(request.question)
