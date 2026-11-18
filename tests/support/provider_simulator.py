@@ -29,6 +29,8 @@ MODES = frozenset(
         "uncited",
         "misquote",
         "wrong_number",
+        # Rerank: keep no passage.
+        "unranked",
     }
 )
 SUGGESTION = {"title": "Clear synthetic title", "description": "A clear synthetic description."}
@@ -98,6 +100,24 @@ def _schema_properties(request: dict) -> dict:
 
 def wants_claims(request: dict) -> bool:
     return "claims" in _schema_properties(request)
+
+
+def wants_ranking(request: dict) -> bool:
+    return "passages" in _schema_properties(request)
+
+
+def ranking(request: dict, mode: str) -> dict:
+    """Keep the passages in their given order, up to the request's limit."""
+    try:
+        payload = json.loads(request.get("input", ""))
+    except (ValueError, AttributeError):
+        payload = {}
+    passages = payload.get("passages", []) if isinstance(payload, dict) else []
+    limit = payload.get("limit", 0) if isinstance(payload, dict) else 0
+    if mode == "unranked" or not isinstance(passages, list) or type(limit) is not int:
+        return {"passages": []}
+    labels = [item.get("label") for item in passages if isinstance(item, dict)]
+    return {"passages": [label for label in labels if isinstance(label, str)][:limit]}
 
 
 def wants_verdict(request: dict) -> bool:
@@ -453,6 +473,8 @@ def create_app() -> FastAPI:
                 output = {"grounded": True, "answers_question": True}
             elif wants_claims(value):
                 output = quoted_answer(value, mode)
+            elif wants_ranking(value):
+                output = ranking(value, mode)
             else:
                 output = SUGGESTION
             failure = await fail(mode)

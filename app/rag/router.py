@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.assistant.residence import is_manager
 from app.db import get_session
 from app.rag.contracts import (
+    DiagnosticsRequest,
     DiagnosticsResponse,
     DocumentList,
     DocumentResponse,
@@ -157,7 +158,7 @@ def _diagnostics_enabled(request: Request) -> None:
     include_in_schema=False,
 )
 async def diagnose_documents(
-    payload: QueryRequest, request: Request, response: Response, owner_id: Owner
+    payload: DiagnosticsRequest, request: Request, response: Response, owner_id: Owner
 ) -> DiagnosticsResponse:
     """Eval-only: the same query, counted and limited like /query, plus its passages."""
     runtime = _runtime(request)

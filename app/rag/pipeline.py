@@ -2,7 +2,9 @@
 
     slot -> admit (per-owner lock, window count, usage row) -> any searchable chunk?
       no  -> no_context, reason no_chunks (no provider call)
-      yes -> LCEL chain: retriever (embed question + owner KNN) -> passages -> claims
+      yes -> LCEL chain: retriever (embed question + owner KNN)
+          -> relevance margin -> optional LLM rerank (empty -> no_context, rerank_empty)
+          -> neighbor windows (same owner scope) -> passages -> claims
           -> no claims                    -> no_context, reason no_claims
           -> any claim fails its check    -> no_context, reason = that check
           -> all claims verified          -> answered, citations with their quotes
@@ -30,12 +32,20 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.ai.processing import SessionFactory
-from app.ai.provider import RAG_PROMPT_VERSION, AnswerGeneration, Passage, ProviderFailure
+from app.ai.provider import (
+    RAG_PROMPT_VERSION,
+    AnswerGeneration,
+    Passage,
+    ProviderFailure,
+    Ranking,
+)
 from app.models import RAGQuery
+from app.rag.config import RERANK_LLM, RAGSettings, RerankMode, query_deadline_floor
 from app.rag.contracts import (
     Citation,
     DiagnosticClaim,
     DiagnosticPassage,
+    DiagnosticsRequest,
     DiagnosticsResponse,
     DiagnosticUsage,
     QueryRequest,
@@ -61,9 +71,44 @@ _REASONING_EFFORT = "none"
 NO_CHUNKS = "no_chunks"
 NO_PASSAGES = "no_passages"
 NO_CLAIMS = "no_claims"
+RERANK_EMPTY = "rerank_empty"
+# Rerank reads up to twice the requested passages, within the prompt's label range.
+MAX_CANDIDATES = 8
 # Diagnostics: a claim that passed, or one after the first failure (never checked).
 _VERIFIED = "verified"
 _NOT_CHECKED = "not_checked"
+
+
+@dataclass(frozen=True)
+class _Options:
+    """Answer-context settings for one query: the server's, or eval overrides."""
+
+    neighbor_chunks: int
+    relevance_margin: float | None
+    rerank: RerankMode
+
+    def candidates(self, top_k: int) -> int:
+        return min(MAX_CANDIDATES, 2 * top_k) if self.rerank == RERANK_LLM else top_k
+
+
+def _options(settings: RAGSettings, request: QueryRequest) -> _Options:
+    overrides = getattr(request, "overrides", None)
+    options = _Options(
+        neighbor_chunks=settings.rag_neighbor_chunks,
+        relevance_margin=settings.rag_relevance_margin,
+        rerank=settings.rag_rerank,
+    )
+    if overrides is None:
+        return options
+    return _Options(
+        neighbor_chunks=_pick(overrides.neighbor_chunks, options.neighbor_chunks),
+        relevance_margin=_pick(overrides.relevance_margin, options.relevance_margin),
+        rerank=_pick(overrides.rerank, options.rerank),
+    )
+
+
+def _pick(override, default):
+    return default if override is None else override
 
 
 @dataclass(frozen=True)
@@ -100,7 +145,7 @@ class _Usage:
     response_model: str | None = None
     request_id: str | None = None
 
-    def add(self, generation: AnswerGeneration) -> None:
+    def add(self, generation: AnswerGeneration | Ranking) -> None:
         self.chat_calls += 1
         self.input_tokens = _add(self.input_tokens, generation.input_tokens)
         self.output_tokens = _add(self.output_tokens, generation.output_tokens)
@@ -204,26 +249,61 @@ def _citations(documents: list[Document], generation: AnswerGeneration) -> list[
                 title=metadata["title"],
                 ordinal=metadata["ordinal"],
                 page=metadata["page"],
-                snippet=documents[index].page_content[:SNIPPET_CHARACTERS],
+                # A window cites its anchor chunk: the snippet is that chunk's text.
+                snippet=metadata.get("anchor_text", documents[index].page_content)[
+                    :SNIPPET_CHARACTERS
+                ],
                 quotes=[claim.quote for claim in generation.claims if claim.citation == label],
             )
         )
     return citations
 
 
-def _build_chain(runtime: RAGRuntime, retriever: OwnerScopedRetriever, usage: _Usage):
+def _passage(document: Document) -> Passage:
+    metadata = document.metadata
+    return Passage(
+        title=metadata["title"],
+        page=metadata["page"],
+        text=document.page_content,
+        section=metadata.get("heading"),
+    )
+
+
+def _within_margin(documents: list[Document], margin: float | None) -> list[Document]:
+    """Drop candidates much farther than the closest one; the closest always stays."""
+    if margin is None or not documents:
+        return documents
+    limit = documents[0].metadata["distance"] + margin
+    return [document for document in documents if document.metadata["distance"] <= limit]
+
+
+def _build_chain(
+    runtime: RAGRuntime,
+    retriever: OwnerScopedRetriever,
+    usage: _Usage,
+    options: _Options,
+    top_k: int,
+):
     async def generate(inputs: dict) -> _Outcome:
-        documents: list[Document] = inputs["documents"]
+        documents: list[Document] = _within_margin(inputs["documents"], options.relevance_margin)
         if not documents:
             return _Outcome("no_context", NO_CONTEXT_ANSWER, [], 0, no_context_reason=NO_PASSAGES)
-        passages = [
-            Passage(
-                title=document.metadata["title"],
-                page=document.metadata["page"],
-                text=document.page_content,
+
+        # Rerank picks and orders retrieved chunks before any window widens them.
+        if options.rerank == RERANK_LLM:
+            ranking = await runtime.reranker.rerank(
+                inputs["question"],
+                [_passage(document) for document in documents],
+                min(top_k, len(documents)),
             )
-            for document in documents
-        ]
+            usage.add(ranking)
+            documents = [documents[index] for index in ranking.order]
+            if not documents:
+                return _Outcome(
+                    "no_context", NO_CONTEXT_ANSWER, [], 0, no_context_reason=RERANK_EMPTY
+                )
+        documents = await retriever.expand(documents, options.neighbor_chunks)
+        passages = [_passage(document) for document in documents]
         generation = await runtime.answerer.answer(inputs["question"], passages)
         usage.add(generation)
         sent = tuple(documents)
@@ -285,13 +365,19 @@ async def diagnose_query(
     session_factory: SessionFactory,
     runtime: RAGRuntime,
     owner_id: UUID,
-    request: QueryRequest,
+    request: DiagnosticsRequest,
 ) -> DiagnosticsResponse:
     """Eval-only: the same query, plus the exact passages sent to the model and the usage.
 
     The passage text returns only to its owner, in the response. It never reaches a span,
-    a log line or the usage row.
+    a log line or the usage row. Overrides that the query deadline cannot fit are refused
+    before admission.
     """
+    options = _options(runtime.settings, request)
+    if runtime.settings.rag_query_deadline_seconds <= query_deadline_floor(
+        runtime.settings, options.rerank
+    ):
+        raise HTTPException(422, "Overrides do not fit the query deadline")
     result = await _run_query(
         session_factory=session_factory, runtime=runtime, owner_id=owner_id, request=request
     )
@@ -305,7 +391,7 @@ async def diagnose_query(
             ordinal=document.metadata["ordinal"],
             page=document.metadata["page"],
             distance=document.metadata["distance"],
-            section=None,
+            section=document.metadata.get("heading"),
             text=document.page_content,
         )
         for number, document in enumerate(outcome.documents, start=1)
@@ -363,13 +449,14 @@ async def _run_query(
         )
         telemetry = runtime.telemetry
         started = time.monotonic()
+        options = _options(runtime.settings, request)
         with telemetry.span("rag.query", query_id=str(query_id), top_k=request.top_k):
             retriever = OwnerScopedRetriever(
                 session_factory=session_factory,
                 embedder=runtime.embedder,
                 owner_id=owner_id,
                 embedding_model=runtime.settings.ai_embedding_model,
-                top_k=request.top_k,
+                top_k=options.candidates(request.top_k),
                 document_ids=request.document_ids,
                 telemetry=telemetry,
             )
@@ -389,7 +476,7 @@ async def _run_query(
                 telemetry.increment("rag.queries", status="failed", error_code=code)
 
             try:
-                outcome = await _answer(runtime, retriever, request, usage)
+                outcome = await _answer(runtime, retriever, request, usage, options)
             except (ProviderFailure, TimeoutError) as exc:
                 code = exc.code if isinstance(exc, ProviderFailure) else DEADLINE_CODE
                 await fail(code)
@@ -421,7 +508,11 @@ async def _run_query(
 
 
 async def _answer(
-    runtime: RAGRuntime, retriever: OwnerScopedRetriever, request: QueryRequest, usage: _Usage
+    runtime: RAGRuntime,
+    retriever: OwnerScopedRetriever,
+    request: QueryRequest,
+    usage: _Usage,
+    options: _Options,
 ) -> _Outcome:
     """No searchable chunk: no provider call. Otherwise run the chain under the deadline."""
     if not await has_context(
@@ -431,7 +522,7 @@ async def _answer(
         document_ids=request.document_ids,
     ):
         return _Outcome("no_context", NO_CONTEXT_ANSWER, [], 0, no_context_reason=NO_CHUNKS)
-    chain = _build_chain(runtime, retriever, usage)
+    chain = _build_chain(runtime, retriever, usage, options, request.top_k)
     async with asyncio.timeout(runtime.settings.rag_query_deadline_seconds):
         with tracing_context(enabled=False):
             return await chain.ainvoke(request.question)

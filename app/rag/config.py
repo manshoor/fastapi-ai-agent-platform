@@ -1,9 +1,14 @@
+from typing import Literal
+
 from pydantic import Field, model_validator
 
 from app.ai.config import AISettings
 from app.models import RAG_EMBEDDING_DIMENSIONS
 
 MIB = 1024 * 1024
+# off: answer from the nearest chunks; llm: one paid call picks and orders them first.
+RerankMode = Literal["off", "llm"]
+RERANK_LLM = "llm"
 
 
 class RAGSettings(AISettings):
@@ -38,6 +43,13 @@ class RAGSettings(AISettings):
     rag_query_concurrency: int = Field(default=4, ge=1, le=64)
     rag_query_deadline_seconds: float = Field(default=60, gt=0, le=120)
 
+    # Answer context for /api/v1/rag/query; the assistant's search is unaffected.
+    # Neighbor chunks on each side of a retrieved chunk, merged into one passage.
+    rag_neighbor_chunks: int = Field(default=1, ge=0, le=2)
+    # Drop candidates more than this cosine distance behind the closest; unset keeps all.
+    rag_relevance_margin: float | None = Field(default=None, gt=0, le=2)
+    rag_rerank: RerankMode = "off"
+
     # Ingestion lifecycle.
     rag_lease_seconds: float = Field(default=120, gt=0)
     rag_max_attempts: int = Field(default=3, ge=1, le=3)
@@ -61,14 +73,21 @@ class RAGSettings(AISettings):
         first_renewal = self.rag_pdf_timeout_seconds + self.ai_embedding_timeout_seconds
         if self.rag_lease_seconds <= first_renewal + 5:
             raise ValueError("RAG_LEASE_SECONDS must exceed parse + embedding timeouts by 5s")
-        # Provider timeouts must fire before the query deadline: a billed answer is never
-        # thrown away by the deadline.
-        provider_total = self.ai_embedding_timeout_seconds + self.ai_provider_timeout_seconds
-        if self.rag_query_deadline_seconds <= provider_total:
-            raise ValueError("RAG_QUERY_DEADLINE_SECONDS must exceed both provider timeouts")
+        if self.rag_query_deadline_seconds <= query_deadline_floor(self, self.rag_rerank):
+            raise ValueError(
+                "RAG_QUERY_DEADLINE_SECONDS must exceed the embedding timeout plus the "
+                "provider timeout per chat call (two calls with RAG_RERANK=llm)"
+            )
         return self
 
     @property
     def rag_upload_ceiling_bytes(self) -> int:
         # Largest accepted file plus room for multipart headers and the title field.
         return max(self.rag_text_max_bytes, self.rag_pdf_max_bytes) + 64 * 1024
+
+
+def query_deadline_floor(settings: RAGSettings, rerank: RerankMode) -> float:
+    """Provider timeouts must fire before the query deadline: a billed answer is never
+    thrown away by the deadline. One embedding plus every chat call in sequence."""
+    chat_calls = 2 if rerank == RERANK_LLM else 1
+    return settings.ai_embedding_timeout_seconds + settings.ai_provider_timeout_seconds * chat_calls

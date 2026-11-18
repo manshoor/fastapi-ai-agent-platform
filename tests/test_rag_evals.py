@@ -19,6 +19,7 @@ from app.rag.chunking import chunk_document
 from app.rag.config import RAGSettings
 from app.rag.contracts import ContentType
 from app.rag.parsing import ParsedDocument
+from app.rag.retrieval import _join_chunks
 from tests.support.rag_evals import (
     CHECKS,
     cited_texts,
@@ -53,6 +54,11 @@ def _holders(item: str) -> list[dict]:
 
 def _chunks(document: dict) -> list[str]:
     """Chunk texts under the default chunk settings."""
+    return [chunk.content for chunk in _chunk_rows(document)]
+
+
+def _chunk_rows(document: dict):
+    """Chunks under the default chunk settings."""
     fields = RAGSettings.model_fields
     settings = SimpleNamespace(
         rag_chunk_size=fields["rag_chunk_size"].default,
@@ -60,8 +66,7 @@ def _chunks(document: dict) -> list[str]:
         rag_max_chunks=fields["rag_max_chunks"].default,
     )
     parsed = ParsedDocument([(None, document["text"])], None)
-    chunks = chunk_document(parsed, ContentType.MARKDOWN, settings)
-    return [chunk.content for chunk in chunks]
+    return chunk_document(parsed, ContentType.MARKDOWN, settings)
 
 
 def _cases(category: str) -> list[dict]:
@@ -108,15 +113,32 @@ def test_split_evidence_needs_two_adjacent_chunks():
         ), case["id"]
 
 
+def test_split_evidence_is_in_one_neighbor_window():
+    for case in _cases("split"):
+        (name,) = {_holders(item)[0]["name"] for item in case["evidence"]}
+        chunks = _chunks(next(document for document in DOCUMENTS if document["name"] == name))
+        windows = []
+        for index in range(len(chunks)):
+            texts = chunks[max(index - 1, 0) : index + 2]
+            window = texts[0]
+            for text in texts[1:]:
+                window = _join_chunks(window, text)
+            windows.append(window)
+        found = any(all(contains(window, item) for item in case["evidence"]) for window in windows)
+        assert found, case["id"]
+
+
 def test_heading_evidence_chunks_lack_their_heading():
     for case in _cases("heading"):
         (evidence,) = case["evidence"]
         (document,) = _holders(evidence)
         pattern = rf"^#{{2,6}} {re.escape(case['heading'])}$"
         assert re.search(pattern, document["text"], re.MULTILINE), case["id"]
-        holding = [chunk for chunk in _chunks(document) if contains(chunk, evidence)]
+        holding = [chunk for chunk in _chunk_rows(document) if contains(chunk.content, evidence)]
         assert holding, case["id"]
-        assert not any(contains(chunk, case["heading"]) for chunk in holding), case["id"]
+        assert not any(contains(chunk.content, case["heading"]) for chunk in holding), case["id"]
+        # The chunker records the section the text alone lacks.
+        assert all(case["heading"] in (chunk.heading or "") for chunk in holding), case["id"]
 
 
 def test_judge_controls_cover_both_failure_kinds():
@@ -260,6 +282,7 @@ def _script():
         ["--allow-paid-requests", "--top-k", "9"],
         ["--allow-paid-requests", "--config", "Bad Name"],
         ["--allow-paid-requests", "--config", "fast=unknown:1"],
+        ["--allow-paid-requests", "--config", "x=rerank:maybe"],
         ["--allow-paid-requests", "--config", "a", "--config", "a"],
         ["--allow-paid-requests", "--output", "/tmp/rag-eval.json"],
     ],
@@ -273,6 +296,7 @@ def _script():
         "top-k-limit",
         "bad-config-name",
         "unknown-override",
+        "bad-rerank",
         "duplicate-config",
         "output-outside-artifacts",
     ],
@@ -398,3 +422,10 @@ def test_setup_stops_when_the_route_is_not_reachable(status, message):
     with pytest.raises(script.SetupError, match=message):
         script.check_route(_Client(status))
     script.check_route(_Client(401))
+
+
+def test_configurations_carry_typed_overrides():
+    args = _script().parse_args(
+        ["--allow-paid-requests", "--config", "base", "--config", "x=neighbor_chunks:2,rerank:llm"]
+    )
+    assert args.configs == [("base", {}), ("x", {"neighbor_chunks": 2, "rerank": "llm"})]

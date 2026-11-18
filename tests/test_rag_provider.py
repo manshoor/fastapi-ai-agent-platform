@@ -20,6 +20,7 @@ from app.ai.provider import (
     RAG_PROMPT_VERSION,
     OpenAIAnswerer,
     OpenAIEmbedder,
+    OpenAIReranker,
     OpenAIRewriter,
     Passage,
     ProviderFailure,
@@ -275,8 +276,20 @@ async def test_quoted_answer_wire_contract_and_claims(simulator):
     assert json.loads(wire["input"]) == {
         "question": "How fast is the pump?",
         "passages": [
-            {"label": "P1", "title": "Pump manual", "page": 3, "text": PASSAGES[0].text},
-            {"label": "P2", "title": "Pump manual", "page": 4, "text": PASSAGES[1].text},
+            {
+                "label": "P1",
+                "title": "Pump manual",
+                "section": None,
+                "page": 3,
+                "text": PASSAGES[0].text,
+            },
+            {
+                "label": "P2",
+                "title": "Pump manual",
+                "section": None,
+                "page": 4,
+                "text": PASSAGES[1].text,
+            },
         ],
     }
     schema = wire["text"]["format"]
@@ -469,3 +482,51 @@ async def test_borrowed_client_with_sdk_retries_is_rejected(simulator):
             OpenAIEmbedder(settings_for(url), client=client)
     finally:
         await client.close()
+
+
+async def test_rerank_wire_contract_and_order(simulator):
+    url, _, captured = simulator
+    reranker = OpenAIReranker(settings_for(url))
+    try:
+        result = await reranker.rerank("How fast?", PASSAGES, 1)
+    finally:
+        await reranker.aclose()
+    (_, wire) = captured[0]
+    payload = json.loads(wire["input"])
+    assert payload["limit"] == 1 and [item["label"] for item in payload["passages"]] == ["P1", "P2"]
+    assert set(wire["text"]["format"]["schema"]["required"]) == {"passages"}
+    assert result.order == (0,)
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [["P1", "P1"], ["P3"], ["P1", "P2", "P1"], ["P2", "P1", "P2"]],
+    ids=["duplicate", "outside-passages", "over-limit", "duplicate-over-limit"],
+)
+async def test_rerank_rejects_invalid_rankings(simulator, labels):
+    url, app, _ = simulator
+
+    async def malformed(request: Request):
+        return JSONResponse(answer_body({"passages": labels}))
+
+    replace_route(app, "/v1/responses", malformed)
+    reranker = OpenAIReranker(settings_for(url))
+    try:
+        with pytest.raises(ProviderFailure) as error:
+            await reranker.rerank("Question?", PASSAGES, 2)
+    finally:
+        await reranker.aclose()
+    assert error.value.code == "provider_invalid_output"
+
+
+async def test_section_reaches_the_answer_prompt(simulator):
+    url, _, captured = simulator
+    answerer = OpenAIAnswerer(settings_for(url))
+    try:
+        await answerer.answer(
+            "Q?", [Passage(title="T", page=None, text="a b c d", section="A > B")]
+        )
+    finally:
+        await answerer.aclose()
+    (_, wire) = captured[0]
+    assert json.loads(wire["input"])["passages"][0]["section"] == "A > B"

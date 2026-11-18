@@ -19,6 +19,9 @@ Example (isolated AI stack on 8002, after explicit authorization):
   uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --repeat 3 \
     --judge --output artifacts/rag-baseline.json
 
+Compare answer-context settings in one run (each --config is a name and its overrides):
+  ... --config base --config wide=neighbor_chunks:2 --config ranked=rerank:llm
+
 Exit 0 when every run passes, 1 for failed runs, 2 for invalid configuration, failed
 judge controls or failed setup. Prints only case IDs, check names, rates and fixed
 codes: never questions, answers, document text or credentials.
@@ -55,8 +58,21 @@ HTTP_TOO_MANY_REQUESTS = 429
 RETRY_LIMIT = 30
 DEFAULT_RETRY_SECONDS = 5
 MAX_RETRY_SECONDS = 120
-# Server settings a configuration may override; each grounding step adds its own keys.
-OVERRIDES: dict[str, Callable[[str], object]] = {}
+RERANK_MODES = frozenset({"off", "llm"})
+
+
+def _rerank(value: str) -> str:
+    if value not in RERANK_MODES:
+        raise ValueError("Unknown rerank mode")
+    return value
+
+
+# Server settings a configuration may override (the diagnostics route's `overrides`).
+OVERRIDES: dict[str, Callable[[str], object]] = {
+    "neighbor_chunks": int,
+    "relevance_margin": float,
+    "rerank": _rerank,
+}
 _NAME = re.compile(r"[a-z0-9-]{1,32}\Z")
 
 

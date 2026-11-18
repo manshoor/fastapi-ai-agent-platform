@@ -12,7 +12,7 @@ from app.schemas import StrictSchema, Title, reject_nul
 DocumentStatus = Literal["pending", "processing", "ready", "failed"]
 TERMINAL_STATES = frozenset({"ready", "failed"})
 UNSETTLED_STATES = ("pending", "processing")
-CHUNKER_VERSION = "recursive-v1"
+CHUNKER_VERSION = "recursive-v2"
 
 
 class ContentType(StrEnum):
@@ -93,6 +93,18 @@ class Citation(StrictSchema):
     snippet: str
     # The verified word-for-word quotes this answer takes from the passage.
     quotes: list[str]
+
+
+class DiagnosticOverrides(StrictSchema):
+    """Eval-only answer-context settings for one query; unset fields use the server's."""
+
+    neighbor_chunks: int | None = Field(default=None, ge=0, le=2, strict=True)
+    relevance_margin: float | None = Field(default=None, gt=0, le=2)
+    rerank: Literal["off", "llm"] | None = None
+
+
+class DiagnosticsRequest(QueryRequest):
+    overrides: DiagnosticOverrides | None = None
 
 
 class QueryResponse(StrictSchema):

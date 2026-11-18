@@ -542,3 +542,176 @@ async def test_diagnostics_name_the_failed_claim_check(app, client, account, set
     assert (body["status"], body["no_context_reason"]) == ("no_context", "number_not_in_passage")
     assert [claim["check"] for claim in body["claims"]] == ["number_not_in_passage"]
     assert body["usage"]["chat_calls"] == 1
+
+
+# Neighbor windows, relevance margin and rerank (answer context for /rag/query only).
+SEAM = "shared seam text of the splitter overlap"
+INTRO = f"Pump manual introduction for owners. {SEAM}"
+FLOW = f"{SEAM} {PUMP}"
+SERVICE = "Service the pump every spring before the season starts."
+APPENDIX = "Appendix on another page about pump spare parts."
+
+
+async def add_chunks(app: FastAPI, owner_id: UUID, document_id: UUID, chunks: list[tuple]):
+    """Extra chunks (ordinal, page, content, heading) for a document made by add_ready_document."""
+    async with app.state.session_factory() as session:
+        for ordinal, page, content, heading in chunks:
+            session.add(
+                RAGChunk(
+                    document_id=document_id,
+                    owner_id=owner_id,
+                    ordinal=ordinal,
+                    page=page,
+                    content=content,
+                    heading=heading,
+                    embedding=SIMULATOR.embed_text(content, RAG_EMBEDDING_DIMENSIONS),
+                )
+            )
+        await session.commit()
+
+
+async def diagnose(client, owner: dict, **body) -> dict:
+    response = await client.post(
+        DIAGNOSTICS, headers=owner["headers"], json={"question": QUESTION, **body}
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def manual(app: FastAPI, owner_id: UUID) -> UUID:
+    """Ordinals 0-3: intro, the answer (closest), service note, then a page-2 appendix."""
+    document_id = await add_ready_document(app, owner_id, "Pump manual", INTRO)
+    await add_chunks(
+        app,
+        owner_id,
+        document_id,
+        [
+            (1, None, FLOW, "Pump > Flow"),
+            (2, None, SERVICE, "Pump > Service"),
+            (3, 2, APPENDIX, None),
+        ],
+    )
+    return document_id
+
+
+async def test_neighbor_window_merges_overlap_and_cites_the_anchor(app, client, account, settings):
+    settings.rag_diagnostics_enabled = True
+    owner = await account()
+    pump = await manual(app, UUID(owner["id"]))
+
+    body = await diagnose(client, owner, top_k=1)
+
+    (passage,) = body["passages"]
+    # One seam copy: the repeated overlap between intro and flow is removed.
+    assert passage["text"] == f"{INTRO} {PUMP}\n{SERVICE}"
+    assert (passage["ordinal"], passage["section"]) == (1, "Pump > Flow")
+    (citation,) = body["citations"]
+    assert (citation["document_id"], citation["ordinal"]) == (str(pump), 1)
+    assert citation["snippet"] == FLOW
+
+
+async def test_windows_stay_on_their_page(app, client, account, settings):
+    settings.rag_diagnostics_enabled = True
+    owner = await account()
+    owner_id = UUID(owner["id"])
+    document_id = await add_ready_document(app, owner_id, "Pump manual", INTRO)
+    await add_chunks(app, owner_id, document_id, [(1, 2, PUMP, None)])
+
+    body = await diagnose(client, owner, top_k=1, overrides={"neighbor_chunks": 2})
+
+    assert [passage["text"] for passage in body["passages"]] == [PUMP]
+
+
+async def test_neighbor_windows_can_be_turned_off(app, client, account, settings):
+    settings.rag_diagnostics_enabled = True
+    owner = await account()
+    await manual(app, UUID(owner["id"]))
+
+    body = await diagnose(client, owner, top_k=1, overrides={"neighbor_chunks": 0})
+
+    assert [passage["text"] for passage in body["passages"]] == [FLOW]
+
+
+async def test_relevance_margin_drops_distant_candidates(app, client, account, settings):
+    settings.rag_diagnostics_enabled = True
+    owner = await account()
+    owner_id = UUID(owner["id"])
+    await add_ready_document(app, owner_id, "Pump manual", PUMP)
+    await add_ready_document(app, owner_id, "Garden notes", GARDEN)
+
+    wide = await diagnose(client, owner, top_k=2)
+    narrow = await diagnose(client, owner, top_k=2, overrides={"relevance_margin": 0.01})
+
+    assert [passage["title"] for passage in wide["passages"]] == ["Pump manual", "Garden notes"]
+    assert [passage["title"] for passage in narrow["passages"]] == ["Pump manual"]
+
+
+def room_for_rerank(app: FastAPI, monkeypatch) -> None:
+    runtime = app.state.rag
+    settings = runtime.settings
+    floor = settings.ai_embedding_timeout_seconds + 2 * settings.ai_provider_timeout_seconds
+    monkeypatch.setattr(
+        runtime, "settings", settings.model_copy(update={"rag_query_deadline_seconds": floor + 1})
+    )
+
+
+async def test_rerank_reads_twice_the_candidates_and_keeps_top_k(
+    app, client, account, settings, simulator, monkeypatch
+):
+    state, _ = simulator
+    settings.rag_diagnostics_enabled = True
+    room_for_rerank(app, monkeypatch)
+    owner = await account()
+    owner_id = UUID(owner["id"])
+    await add_ready_document(app, owner_id, "Pump manual", PUMP)
+    await add_ready_document(app, owner_id, "Garden notes", GARDEN)
+
+    body = await diagnose(client, owner, top_k=1, overrides={"rerank": "llm"})
+
+    assert body["status"] == "answered"
+    assert [passage["title"] for passage in body["passages"]] == ["Pump manual"]
+    # Embedding, rerank, answer.
+    assert (state.calls, body["usage"]["chat_calls"]) == (3, 2)
+    (row,) = await query_rows(app)
+    assert (row.top_k, row.chat_calls) == (1, 2)
+    assert row.input_tokens == 50 and row.output_tokens == 30
+
+
+async def test_empty_rerank_is_no_context(app, client, account, settings, simulator, monkeypatch):
+    state, _ = simulator
+    settings.rag_diagnostics_enabled = True
+    room_for_rerank(app, monkeypatch)
+    state.modes = ["success", "unranked"]
+    owner = await account()
+    await add_ready_document(app, UUID(owner["id"]), "Pump manual", PUMP)
+
+    body = await diagnose(client, owner, overrides={"rerank": "llm"})
+
+    assert (body["status"], body["no_context_reason"], body["passages"]) == (
+        "no_context",
+        "rerank_empty",
+        [],
+    )
+    (row,) = await query_rows(app)
+    assert (row.no_context_reason, row.chat_calls) == ("rerank_empty", 1)
+
+
+async def test_rerank_override_must_fit_the_deadline(app, client, account, settings, monkeypatch):
+    settings.rag_diagnostics_enabled = True
+    runtime = app.state.rag
+    provider = runtime.settings.ai_provider_timeout_seconds
+    one_call = runtime.settings.ai_embedding_timeout_seconds + provider
+    # Room for one chat call, not for the rerank call as well.
+    monkeypatch.setattr(
+        runtime,
+        "settings",
+        runtime.settings.model_copy(update={"rag_query_deadline_seconds": one_call + provider / 2}),
+    )
+    owner = await account()
+    response = await client.post(
+        DIAGNOSTICS,
+        headers=owner["headers"],
+        json={"question": QUESTION, "overrides": {"rerank": "llm"}},
+    )
+    assert response.status_code == 422
+    assert await query_rows(app) == []

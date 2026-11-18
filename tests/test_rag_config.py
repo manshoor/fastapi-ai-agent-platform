@@ -55,3 +55,22 @@ def test_defaults_are_valid():
     assert settings.rag_query_deadline_seconds > (
         settings.ai_embedding_timeout_seconds + settings.ai_provider_timeout_seconds
     )
+
+
+def test_rerank_needs_room_for_a_second_chat_call():
+    # Small values keep AI_LEASE_SECONDS from the QA environment valid.
+    timeouts = {"ai_embedding_timeout_seconds": 2, "ai_provider_timeout_seconds": 2}
+    assert build(rag_enabled=True, rag_query_deadline_seconds=5, **timeouts).rag_rerank == "off"
+    with pytest.raises(ValidationError) as error:
+        build(rag_enabled=True, rag_query_deadline_seconds=5, rag_rerank="llm", **timeouts)
+    assert "RAG_RERANK=llm" in str(error.value)
+    assert build(rag_enabled=True, rag_query_deadline_seconds=7, rag_rerank="llm", **timeouts)
+
+
+def test_answer_context_defaults():
+    settings = build(rag_enabled=True)
+    assert (settings.rag_neighbor_chunks, settings.rag_relevance_margin, settings.rag_rerank) == (
+        1,
+        None,
+        "off",
+    )

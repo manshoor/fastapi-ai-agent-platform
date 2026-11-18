@@ -53,6 +53,12 @@ class Claim(StrictSchema):
     quote: Quote
 
 
+class PassageRanking(StrictSchema):
+    """Rerank output: labels of the passages that help answer, most useful first."""
+
+    passages: list[PassageLabel] = Field(max_length=8)
+
+
 class QuotedAnswer(StrictSchema):
     """Structured model output for a RAG answer. No claims means "not in passages"."""
 
