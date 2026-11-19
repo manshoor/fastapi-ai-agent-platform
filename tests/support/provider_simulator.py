@@ -5,6 +5,8 @@ import asyncio
 import hashlib
 import json
 import math
+import os
+import random
 import re
 import time
 from collections import Counter
@@ -58,6 +60,41 @@ TOOL_NAMES = frozenset(
 NUMBER = re.compile(r"\d+(?:\.\d+)?")
 TICKET_WORDS = ("ticket", "broken", "leak", "repair")
 THERMOSTAT_WORDS = ("degree", "thermostat", "temperature")
+# Benchmark knobs, read once at startup. Unset: no added latency and a cap of
+# 100 calls, as the tests expect.
+LATENCY_ENV = "SIMULATOR_LATENCY_MS"
+EMBEDDING_LATENCY_ENV = "SIMULATOR_EMBEDDING_LATENCY_MS"
+MAX_CALLS_ENV = "SIMULATOR_MAX_CALLS"
+DEFAULT_MAX_CALLS = 100
+MAX_LATENCY_MS = 60_000
+
+
+def latency_range(name: str) -> tuple[float, float]:
+    """Seconds from "N" or "LOW-HIGH" milliseconds in the environment; unset is none."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return 0.0, 0.0
+    low, _, high = value.partition("-")
+    bounds = (float(low), float(high or low))
+    if bounds[0] > bounds[1] or not all(
+        math.isfinite(bound) and 0 <= bound <= MAX_LATENCY_MS for bound in bounds
+    ):
+        raise ValueError(f"{name} must be N or LOW-HIGH milliseconds, 0 to {MAX_LATENCY_MS}")
+    return bounds[0] / 1000, bounds[1] / 1000
+
+
+def initial_max_calls() -> int:
+    value = int(os.environ.get(MAX_CALLS_ENV, DEFAULT_MAX_CALLS))
+    if value < 1:
+        raise ValueError(f"{MAX_CALLS_ENV} must be a positive integer")
+    return value
+
+
+async def pause(bounds: tuple[float, float]) -> None:
+    # Outside state.lock: concurrent requests wait in parallel, as with a real provider.
+    low, high = bounds
+    if high > 0:
+        await asyncio.sleep(random.uniform(low, high))
 
 
 def embed_text(text: str, dimensions: int) -> list[float]:
@@ -272,7 +309,10 @@ class SimulatorState:
     tool_counts: Counter = field(default_factory=Counter)
     modes: list[str] = field(default_factory=list)
     delay_seconds: float = 5.0
-    max_calls: int = 100
+    max_calls: int = DEFAULT_MAX_CALLS
+    # Added to every admitted call, in seconds: (low, high).
+    latency: tuple[float, float] = (0.0, 0.0)
+    embedding_latency: tuple[float, float] = (0.0, 0.0)
     calls: int = 0
     in_flight: int = 0
     counts: Counter = field(default_factory=Counter)
@@ -294,7 +334,11 @@ async def bounded_json(request: Request, limit: int = 65536) -> dict | None:
 
 def create_app() -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    state = SimulatorState()
+    state = SimulatorState(
+        max_calls=initial_max_calls(),
+        latency=latency_range(LATENCY_ENV),
+        embedding_latency=latency_range(EMBEDDING_LATENCY_ENV),
+    )
     app.state.simulator = state
 
     @app.get("/health/live")
@@ -401,6 +445,7 @@ def create_app() -> FastAPI:
         if isinstance(admitted, Response):
             return admitted
         try:
+            await pause(state.embedding_latency)
             failure = await fail(admitted)
             if failure is not None:
                 return failure
@@ -488,6 +533,7 @@ def create_app() -> FastAPI:
             return admitted
         mode = admitted
         try:
+            await pause(state.latency)
             if value.get("tools"):
                 return await agent_response(value, mode)
             if wants_verdict(value):

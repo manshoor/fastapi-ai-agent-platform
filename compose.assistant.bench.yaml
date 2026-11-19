@@ -1,0 +1,117 @@
+# Standalone resident assistant benchmark. Never merge this file with another Compose file.
+# Use scripts/benchmark_assistant.py: it creates a fresh project and private credentials.
+x-benchmark-environment: &benchmark-environment
+  DATABASE_URL: ""
+  DB_HOST: db
+  DB_PORT: "5432"
+  DB_NAME: app
+  DB_USER: app
+  DB_PASSWORD: ${BENCH_POSTGRES_PASSWORD:?Use scripts/benchmark_assistant.py}
+  DB_POOL_SIZE: "10"
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET: ${BENCH_JWT_SECRET:?Use scripts/benchmark_assistant.py}
+  AUTH_TOKEN_TTL_SECONDS: "7200"
+  AI_ENABLED: "true"
+  RAG_ENABLED: "true"
+  ASSISTANT_ENABLED: "true"
+  # The provider simulator only. Literals, never interpolated: no run reaches a paid API.
+  OPENAI_API_KEY: local-simulator-only-not-a-real-key
+  OPENAI_BASE_URL: http://provider:8080/v1
+
+x-runtime-build: &runtime-build
+  context: .
+  target: runtime
+
+x-test-build: &test-build
+  context: .
+  target: test
+
+services:
+  db:
+    image: fastapi-crud-postgres:19rc1-pgvector-0.8.7
+    build: docker/postgres
+    command: ["postgres", "-c", "max_connections=100"]
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${BENCH_POSTGRES_PASSWORD:?Use scripts/benchmark_assistant.py}
+    volumes:
+      - benchmark_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+
+  redis:
+    image: redis:7.4.2-bookworm
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru",
+              "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  migrate:
+    build: *runtime-build
+    environment: *benchmark-environment
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  provider:
+    build: *test-build
+    command: ["python", "tests/support/provider_simulator.py", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      # Provider-like latency per call, and no call cap within a run.
+      SIMULATOR_LATENCY_MS: "800-1500"
+      SIMULATOR_EMBEDDING_LATENCY_MS: "100-200"
+      SIMULATOR_MAX_CALLS: "1000000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/live', timeout=1)"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  api:
+    build: *runtime-build
+    environment: *benchmark-environment
+    ports:
+      - "127.0.0.1:8006:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      provider:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).close()"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    stop_grace_period: 20s
+
+  tools:
+    profiles: ["tools"]
+    build: *test-build
+    environment: *benchmark-environment
+    user: "${BENCH_UID:?Use scripts/benchmark_assistant.py}:${BENCH_GID:?Use scripts/benchmark_assistant.py}"
+    volumes:
+      - type: bind
+        source: ${BENCH_ARTIFACTS:?Use scripts/benchmark_assistant.py}
+        target: /artifacts
+        bind:
+          create_host_path: false
+
+volumes:
+  benchmark_postgres_data:
