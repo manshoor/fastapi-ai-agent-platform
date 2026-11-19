@@ -1,0 +1,62 @@
+# TLS edge overlay for compose.yaml or compose.ai.yaml; list it last. nginx serves
+# https://127.0.0.1:${EDGE_PORT:-8443} with docker/edge/nginx.conf, and the API's own
+# plain HTTP port is no longer published. Create the certificates once, first:
+#   uv run --locked python scripts/init_edge_tls.py
+#   docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml \
+#     -f compose.edge.yaml up --build -d --wait api edge
+#   uv run --locked python scripts/smoke_edge.py
+services:
+  edge:
+    image: nginx:1.30.7-alpine
+    # nginx itself, without the image's entrypoint scripts: they edit files under the
+    # read-only root.
+    entrypoint: ["nginx", "-g", "daemon off;"]
+    read_only: true
+    tmpfs:
+      # Buffered request bodies (uploads up to 6 MiB) and the pid file.
+      - /var/cache/nginx:size=128m
+      - /tmp:size=1m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    # The master chowns its temp directories and starts workers as nginx. DAC_OVERRIDE
+    # reads the key: on Linux it keeps its host owner and mode 0600.
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE]
+    volumes:
+      - type: bind
+        source: ./docker/edge/nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.edge-local
+        target: /etc/nginx/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${EDGE_PORT:-8443}:8443"
+    networks: [edge_ingress]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "--cacert", "/etc/nginx/tls/ca.crt", "https://127.0.0.1:8443/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    depends_on:
+      api:
+        condition: service_healthy
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  api:
+    # Reachable only through the edge.
+    ports: !reset []
+    networks: [default, edge_ingress]
+
+networks:
+  # Not internal: Docker publishes the edge's port only from a non-internal network.
+  edge_ingress: {}
