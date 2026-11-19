@@ -28,6 +28,14 @@ SECRET = "private-message-7f3a"
 RULE = "Quiet hours start at 22:00 and end at 07:00."
 
 
+def tool_reply(statement: str) -> dict:
+    return {"claims": [{"statement": statement, "source": "tool", "quote": ""}]}
+
+
+def passage_reply(statement: str, quote: str, source: str = "P1") -> dict:
+    return {"claims": [{"statement": statement, "source": source, "quote": quote}]}
+
+
 @pytest.fixture
 async def simulator():
     application = SIMULATOR.create_app()
@@ -98,7 +106,7 @@ async def test_tool_then_reply_is_answered_and_recorded_without_text(
             "tool": "set_thermostat",
             "arguments": {"device": "Living room thermostat", "celsius": 23},
         },
-        {"answer": f"Set to 23 degrees {SECRET}", "citations": []},
+        tool_reply(f"Set to 23 degrees {SECRET}"),
     )
     response = await send(client, owner)
 
@@ -121,6 +129,7 @@ async def test_tool_then_reply_is_answered_and_recorded_without_text(
     (row,) = await turns(app)
     assert (row.status, row.model_calls, row.tool_calls) == ("answered", 2, 1)
     assert (row.input_tokens, row.output_tokens, row.error_code) == (80, 40, None)
+    assert row.claim_failure is None and row.prompt_version == "assistant-v2"
     assert row.model == "simulator-assistant" and row.finished_at is not None
     async with app.state.session_factory() as session:
         stored = [
@@ -138,7 +147,7 @@ async def test_the_model_sees_context_without_the_alarm(app: FastAPI, client, re
 
     def spy(request):
         seen.append(SIMULATOR.agent_context(request)[0])
-        return {"answer": "Hello.", "citations": []}
+        return tool_reply("Hello.")
 
     SIMULATOR.keyword_step = spy
     try:
@@ -162,36 +171,47 @@ async def test_search_and_cite_returns_citations(app: FastAPI, client, resident,
     script(
         simulator,
         {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
-        {"answer": "Quiet hours start at 22:00.", "citations": ["P1", "P1"]},
+        {
+            "claims": [
+                {"statement": "Quiet starts at 22:00.", "source": "P1", "quote": "start at 22:00"},
+                {"statement": "It ends at 07:00.", "source": "P1", "quote": "end at 07:00"},
+            ]
+        },
     )
     body = (await send(client, owner)).json()
 
     assert body["status"] == "answered"
+    assert body["answer"] == "Quiet starts at 22:00. It ends at 07:00."
     assert [(c["document_id"], c["title"]) for c in body["citations"]] == [
         (str(document_id), "House rules")
     ]
     assert body["citations"][0]["snippet"] == RULE
+    assert body["citations"][0]["quotes"] == ["start at 22:00", "end at 07:00"]
 
 
-async def test_uncited_answer_without_tool_results_is_replaced(client, resident, simulator):
+async def test_uncited_answer_without_tool_results_is_replaced(
+    app: FastAPI, client, resident, simulator
+):
     owner = await resident()
     script(
         simulator,
         {"tool": "search_documents", "arguments": {"question": "pets"}},
-        {"answer": "Pets are allowed.", "citations": []},
+        tool_reply("Pets are allowed."),
     )
     body = (await send(client, owner)).json()
 
     assert body["status"] == "no_context"
     assert body["answer"] == NO_CONTEXT_ANSWER
     assert body["actions"][0]["result"] == "no_documents"
+    (row,) = await turns(app)
+    assert (row.status, row.claim_failure) == ("no_context", "tool_claim_ungrounded")
 
 
 async def test_unknown_citation_label_with_nothing_committed_is_502(
     app: FastAPI, client, resident, simulator
 ):
     owner = await resident()
-    script(simulator, {"answer": "Made up.", "citations": ["P3"]})
+    script(simulator, passage_reply("Made up claim.", "made up words here", "P3"))
     response = await send(client, owner)
 
     assert response.status_code == 502
@@ -391,7 +411,7 @@ async def test_langsmith_environment_cannot_export_content(
                 simulator,
                 {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
                 {"tool": "lock_door", "arguments": {"device": "Front door"}},
-                {"answer": "Quiet hours start at 22:00.", "citations": ["P1"]},
+                passage_reply("Quiet hours start at 22:00.", "Quiet hours start at 22:00"),
             )
             body = (await send(client, owner)).json()
             assert body["status"] == "answered" and body["citations"]
@@ -462,7 +482,7 @@ async def test_failed_pending_lookup_still_reports_the_unlock(
     script(
         simulator,
         {"tool": "unlock_door", "arguments": {"device": "Front door"}},
-        {"answer": "Confirm it in the app.", "citations": []},
+        tool_reply("Confirm it in the app."),
     )
     body = (await send(client, owner)).json()
 
@@ -481,12 +501,103 @@ async def test_search_results_alone_do_not_ground_an_uncited_answer(
     script(
         simulator,
         {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
-        {"answer": "Quiet hours start at 21:00.", "citations": []},
+        tool_reply("Quiet hours start at 21:00."),
     )
     body = (await send(client, owner)).json()
 
     assert body["actions"][0]["result"] == "ok"
     assert (body["status"], body["answer"]) == ("no_context", NO_CONTEXT_ANSWER)
+
+
+@pytest.mark.parametrize(
+    ("quote", "statement", "failure"),
+    [
+        ("Quiet hours start at 21:00", "Quiet hours start at 21:00.", "quote_not_found"),
+        ("Quiet hours start at 22:00", "Quiet hours start at 21:00.", "number_not_in_passage"),
+        ("at 22:00", "Quiet hours start at 22:00.", "quote_too_short"),
+    ],
+)
+async def test_misquoted_passage_claim_is_refused(
+    app: FastAPI, client, resident, simulator, quote, statement, failure
+):
+    owner = await resident()
+    building_id = UUID(owner["view"]["building"]["id"])
+    await add_ready_document(app, UUID(owner["id"]), "House rules", [RULE], building_id=building_id)
+    script(
+        simulator,
+        {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
+        passage_reply(statement, quote),
+    )
+    body = (await send(client, owner)).json()
+
+    assert (body["status"], body["answer"], body["citations"]) == (
+        "no_context",
+        NO_CONTEXT_ANSWER,
+        [],
+    )
+    (row,) = await turns(app)
+    assert (row.status, row.error_code, row.claim_failure) == ("no_context", None, failure)
+
+
+async def test_unverified_reply_after_a_write_is_incomplete(
+    app: FastAPI, client, resident, simulator
+):
+    owner = await resident()
+    building_id = UUID(owner["view"]["building"]["id"])
+    await add_ready_document(app, UUID(owner["id"]), "House rules", [RULE], building_id=building_id)
+    script(
+        simulator,
+        {"tool": "lock_door", "arguments": {"device": "Front door"}},
+        {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
+        passage_reply("Quiet hours start at 21:00.", "Quiet hours start at 21:00"),
+    )
+    body = (await send(client, owner)).json()
+
+    # The write stands and is reported; the unverified sentence is not shown.
+    assert (body["status"], body["answer"], body["citations"]) == (
+        "incomplete",
+        INCOMPLETE_ANSWER,
+        [],
+    )
+    assert body["actions"][0]["tool"] == "lock_door"
+    (row,) = await turns(app)
+    assert (row.status, row.error_code, row.claim_failure) == (
+        "incomplete",
+        "claim_unverified",
+        "quote_not_found",
+    )
+
+
+async def test_empty_reply_after_a_write_is_incomplete(app: FastAPI, client, resident, simulator):
+    owner = await resident()
+    script(simulator, {"tool": "lock_door", "arguments": {"device": "Front door"}}, {"claims": []})
+    body = (await send(client, owner)).json()
+
+    assert (body["status"], body["actions"][0]["tool"]) == ("incomplete", "lock_door")
+    (row,) = await turns(app)
+    assert (row.status, row.error_code, row.claim_failure) == (
+        "incomplete",
+        "claim_unverified",
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "claim",
+    [
+        {"statement": "Done.", "source": "tool", "quote": "some quoted words"},
+        {"statement": "Quiet hours start at 22:00.", "source": "P1", "quote": ""},
+    ],
+    ids=["tool-claim-with-quote", "passage-claim-without-quote"],
+)
+async def test_claim_quote_must_fit_its_source(app: FastAPI, client, resident, simulator, claim):
+    owner = await resident()
+    script(simulator, {"claims": [claim]})
+    response = await send(client, owner)
+
+    assert response.status_code == 502
+    (row,) = await turns(app)
+    assert (row.status, row.error_code) == ("failed", "provider_invalid_output")
 
 
 async def test_full_process_sheds_load_with_503(app: FastAPI, client, resident):

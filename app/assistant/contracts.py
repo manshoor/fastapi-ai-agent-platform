@@ -194,6 +194,8 @@ class Citation(StrictSchema):
     ordinal: int
     page: int | None
     snippet: str
+    # The verified word-for-word quotes the reply takes from this passage.
+    quotes: list[str]
 
 
 class TurnResponse(StrictSchema):

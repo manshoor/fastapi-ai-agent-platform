@@ -12,7 +12,7 @@ from app.schemas import StrictSchema, Title, reject_nul
 DocumentStatus = Literal["pending", "processing", "ready", "failed"]
 TERMINAL_STATES = frozenset({"ready", "failed"})
 UNSETTLED_STATES = ("pending", "processing")
-CHUNKER_VERSION = "recursive-v1"
+CHUNKER_VERSION = "recursive-v2"
 
 
 class ContentType(StrEnum):
@@ -91,12 +91,71 @@ class Citation(StrictSchema):
     ordinal: int
     page: int | None
     snippet: str
+    # The verified word-for-word quotes this answer takes from the passage.
+    quotes: list[str]
+
+
+class DiagnosticOverrides(StrictSchema):
+    """Eval-only answer-context settings for one query; unset fields use the server's."""
+
+    neighbor_chunks: int | None = Field(default=None, ge=0, le=2, strict=True)
+    relevance_margin: float | None = Field(default=None, gt=0, le=2)
+    rerank: Literal["off", "llm"] | None = None
+    reasoning_effort: Literal["none", "low", "medium"] | None = None
+    verifier: Literal["off", "on"] | None = None
+
+
+class DiagnosticsRequest(QueryRequest):
+    overrides: DiagnosticOverrides | None = None
 
 
 class QueryResponse(StrictSchema):
     status: Literal["answered", "no_context"]
     answer: str
     citations: list[Citation]
+
+
+class DiagnosticPassage(StrictSchema):
+    """One passage exactly as the answer model received it."""
+
+    label: str
+    document_id: UUID
+    title: str
+    ordinal: int
+    page: int | None
+    distance: float
+    section: str | None
+    text: str
+
+
+class DiagnosticClaim(StrictSchema):
+    statement: str
+    citation: str
+    quote: str
+    check: str
+
+
+class DiagnosticVerdict(StrictSchema):
+    claim: str
+    supported: bool
+
+
+class DiagnosticUsage(StrictSchema):
+    embedding_tokens: int | None
+    input_tokens: int | None
+    output_tokens: int | None
+    chat_calls: int | None
+    reasoning_effort: str
+
+
+class DiagnosticsResponse(QueryResponse):
+    """Eval-only view of one query. Fields of later grounding steps stay null until they run."""
+
+    no_context_reason: str | None
+    passages: list[DiagnosticPassage]
+    claims: list[DiagnosticClaim] | None
+    verdicts: list[DiagnosticVerdict] | None
+    usage: DiagnosticUsage
 
 
 class IngestEvent(StrictSchema):

@@ -25,8 +25,16 @@ MODES = frozenset(
         "timeout",
         "rate_limit",
         "server_error",
-        # Grounded answer that cites no passage.
+        # RAG answers: no claims, a quote absent from the passage, a number absent from it.
         "uncited",
+        "misquote",
+        "wrong_number",
+        # Rerank: keep no passage.
+        "unranked",
+        # Verifier: reject the first claim.
+        "unsupported",
+        # A reasoning item precedes the message, as with a reasoning effort above none.
+        "reasoning",
     }
 )
 SUGGESTION = {"title": "Clear synthetic title", "description": "A clear synthetic description."}
@@ -66,17 +74,26 @@ def embed_text(text: str, dimensions: int) -> list[float]:
     return [value / norm for value in vector]
 
 
-def grounded_answer(request: dict) -> dict:
-    """Cite the first passage; with no passages, answer that nothing was found."""
+# Words of the first passage the synthetic claim quotes.
+QUOTE_WORDS = 8
+
+
+def quoted_answer(request: dict, mode: str) -> dict:
+    """One claim quoting the first words of P1; no passages or "uncited" give no claims."""
     try:
         passages = json.loads(request.get("input", "")).get("passages", [])
     except (ValueError, AttributeError):
         passages = []
     first = passages[0] if isinstance(passages, list) and passages else None
-    if not isinstance(first, dict) or not isinstance(first.get("text"), str):
-        return {"answer": "The passages do not contain the answer.", "citations": []}
-    answer = f"Synthetic grounded answer: {first['text'][:200]}"
-    return {"answer": answer, "citations": ["P1"]}
+    if mode == "uncited" or not isinstance(first, dict) or not isinstance(first.get("text"), str):
+        return {"claims": []}
+    quote = " ".join(first["text"].split()[:QUOTE_WORDS])
+    statement = quote
+    if mode == "misquote":
+        quote = "words that appear in no passage"
+    elif mode == "wrong_number":
+        statement = f"{quote} 9999"
+    return {"claims": [{"statement": statement, "citation": "P1", "quote": quote}]}
 
 
 def _schema_properties(request: dict) -> dict:
@@ -85,8 +102,43 @@ def _schema_properties(request: dict) -> dict:
     return properties if isinstance(properties, dict) else {}
 
 
-def wants_grounded_answer(request: dict) -> bool:
-    return "citations" in _schema_properties(request)
+def wants_claims(request: dict) -> bool:
+    return "claims" in _schema_properties(request)
+
+
+def wants_claim_verdicts(request: dict) -> bool:
+    return "verdicts" in _schema_properties(request)
+
+
+def claim_verdicts(request: dict, mode: str) -> dict:
+    """Support every claim label in the request; "unsupported" rejects the first."""
+    try:
+        claims = json.loads(request.get("input", "")).get("claims", [])
+    except (ValueError, AttributeError):
+        claims = []
+    labels = [item.get("label") for item in claims if isinstance(item, dict)]
+    verdicts = [{"claim": label, "supported": True} for label in labels if isinstance(label, str)]
+    if mode == "unsupported" and verdicts:
+        verdicts[0]["supported"] = False
+    return {"verdicts": verdicts}
+
+
+def wants_ranking(request: dict) -> bool:
+    return "passages" in _schema_properties(request)
+
+
+def ranking(request: dict, mode: str) -> dict:
+    """Keep the passages in their given order, up to the request's limit."""
+    try:
+        payload = json.loads(request.get("input", ""))
+    except (ValueError, AttributeError):
+        payload = {}
+    passages = payload.get("passages", []) if isinstance(payload, dict) else []
+    limit = payload.get("limit", 0) if isinstance(payload, dict) else 0
+    if mode == "unranked" or not isinstance(passages, list) or type(limit) is not int:
+        return {"passages": []}
+    labels = [item.get("label") for item in passages if isinstance(item, dict)]
+    return {"passages": [label for label in labels if isinstance(label, str)][:limit]}
 
 
 def wants_verdict(request: dict) -> bool:
@@ -94,15 +146,16 @@ def wants_verdict(request: dict) -> bool:
 
 
 def valid_step(step) -> bool:
-    """A scripted agent step: one tool call, or one final answer."""
+    """A scripted agent step: one tool call, or one final reply of claims."""
     if not isinstance(step, dict):
         return False
-    if set(step) == {"answer", "citations"}:
-        citations = step["citations"]
-        return (
-            isinstance(step["answer"], str)
-            and isinstance(citations, list)
-            and all(isinstance(label, str) for label in citations)
+    if set(step) == {"claims"}:
+        claims = step["claims"]
+        return isinstance(claims, list) and all(
+            isinstance(claim, dict)
+            and set(claim) == {"statement", "source", "quote"}
+            and all(isinstance(value, str) for value in claim.values())
+            for claim in claims
         )
     if "tool" not in step or not isinstance(step["tool"], str) or len(step["tool"]) > 64:
         return False
@@ -148,9 +201,10 @@ def keyword_step(request: dict) -> dict:
             passages = output.get("passages") if isinstance(output, dict) else None
             first = passages[0] if isinstance(passages, list) and passages else None
             if isinstance(first, dict) and isinstance(first.get("text"), str):
-                answer = f"Synthetic assistant answer: {first['text'][:200]}"
-                return {"answer": answer, "citations": [first.get("label", "P1")]}
-        return {"answer": "Done.", "citations": []}
+                quote = " ".join(first["text"].split()[:QUOTE_WORDS])
+                label = first.get("label", "P1")
+                return {"claims": [{"statement": quote, "source": label, "quote": quote}]}
+        return {"claims": [{"statement": "Done.", "source": "tool", "quote": ""}]}
     message = str(context.get("message", "")).lower()
     resident = context.get("resident")
     devices = resident.get("devices", []) if isinstance(resident, dict) else []
@@ -194,7 +248,7 @@ def agent_item(step: dict) -> dict:
         [
             {
                 "type": "output_text",
-                "text": json.dumps({"answer": step["answer"], "citations": step["citations"]}),
+                "text": json.dumps({"claims": step["claims"]}),
                 "annotations": [],
                 "logprobs": [],
             }
@@ -438,12 +492,14 @@ def create_app() -> FastAPI:
                 return await agent_response(value, mode)
             if wants_verdict(value):
                 output = {"grounded": True, "answers_question": True}
-            elif wants_grounded_answer(value):
-                output = grounded_answer(value)
+            elif wants_claim_verdicts(value):
+                output = claim_verdicts(value, mode)
+            elif wants_claims(value):
+                output = quoted_answer(value, mode)
+            elif wants_ranking(value):
+                output = ranking(value, mode)
             else:
                 output = SUGGESTION
-            if mode == "uncited":
-                output = {"answer": "Unsupported synthetic claim.", "citations": []}
             failure = await fail(mode)
             if failure is not None:
                 return failure
@@ -471,13 +527,18 @@ def create_app() -> FastAPI:
                     if mode == "incomplete"
                     else None,
                     "output": [
+                        *(
+                            [{"id": f"rs_sim_{uuid4().hex}", "type": "reasoning", "summary": []}]
+                            if mode == "reasoning"
+                            else []
+                        ),
                         {
                             "id": f"msg_sim_{uuid4().hex}",
                             "type": "message",
                             "status": "completed",
                             "role": "assistant",
                             "content": content,
-                        }
+                        },
                     ],
                     "usage": {
                         "input_tokens": 25,

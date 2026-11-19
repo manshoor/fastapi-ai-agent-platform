@@ -342,3 +342,97 @@ async def test_owner_filtered_cosine_search_round_trips(app: FastAPI, account):
     # The closer foreign chunk is never visible to this owner.
     assert [content for content, _ in rows] == ["mine"]
     assert len(rows[0].embedding) == RAG_EMBEDDING_DIMENSIONS
+
+
+def query_row(owner_id: UUID, **overrides) -> dict:
+    row = {
+        "id": uuid4(),
+        "owner_id": owner_id,
+        "top_k": 4,
+        "embedding_model": "text-embedding-3-small",
+        "model": "gpt-5.6-terra",
+        "prompt_version": "rag-answer-v2",
+    }
+    return {**row, **overrides}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "constraint"),
+    [
+        # A reason explains a no_context result only, from the fixed list.
+        (
+            {"status": "answered", "no_context_reason": "no_claims", "finished_at": func.now()},
+            "ck_rag_queries_no_context_reason",
+        ),
+        (
+            {"status": "no_context", "no_context_reason": "other", "finished_at": func.now()},
+            "ck_rag_queries_no_context_reason",
+        ),
+        ({"reasoning_effort": "high"}, "ck_rag_queries_reasoning_effort"),
+        ({"chat_calls": -1}, "ck_rag_queries_chat_calls"),
+    ],
+    ids=["reason-on-answer", "unknown-reason", "unknown-effort", "negative-calls"],
+)
+async def test_query_grounding_checks(app: FastAPI, account, overrides, constraint):
+    (owner,) = await owner_ids(app, account, 1)
+    async with app.state.session_factory() as session:
+        with pytest.raises(IntegrityError) as error:
+            await session.execute(insert(RAGQuery).values(query_row(owner, **overrides)))
+        assert constraint in str(error.value.orig)
+
+
+async def test_query_grounding_defaults_and_valid_reason(app: FastAPI, account):
+    (owner,) = await owner_ids(app, account, 1)
+    refused = query_row(
+        owner,
+        status="no_context",
+        no_context_reason="quote_not_found",
+        chat_calls=1,
+        finished_at=func.now(),
+    )
+    async with app.state.session_factory() as session:
+        await session.execute(insert(RAGQuery).values(refused))
+        await session.execute(insert(RAGQuery).values(query_row(owner)))
+        await session.commit()
+        efforts = await session.scalars(select(RAGQuery.reasoning_effort))
+        assert set(efforts) == {"none"}
+
+
+@pytest.mark.parametrize(("heading", "valid"), [(None, True), ("Pets > Dogs", True), ("", False)])
+async def test_chunk_heading_is_null_or_short_text(app: FastAPI, account, heading, valid):
+    (owner,) = await owner_ids(app, account, 1)
+    document_id = await add_document(app, owner)
+    statement = insert(RAGChunk).values(
+        document_id=document_id,
+        ordinal=0,
+        owner_id=owner,
+        content="text",
+        heading=heading,
+        embedding=vector(0),
+    )
+    async with app.state.session_factory() as session:
+        if valid:
+            await session.execute(statement)
+            await session.commit()
+            return
+        with pytest.raises(IntegrityError) as error:
+            await session.execute(statement)
+        assert "ck_rag_chunks_heading" in str(error.value.orig)
+
+
+async def test_chunk_heading_is_at_most_300_characters(app: FastAPI, account):
+    (owner,) = await owner_ids(app, account, 1)
+    document_id = await add_document(app, owner)
+    async with app.state.session_factory() as session:
+        with pytest.raises(IntegrityError) as error:
+            await session.execute(
+                insert(RAGChunk).values(
+                    document_id=document_id,
+                    ordinal=0,
+                    owner_id=owner,
+                    content="text",
+                    heading="h" * 301,
+                    embedding=vector(0),
+                )
+            )
+        assert "ck_rag_chunks_heading" in str(error.value.orig)

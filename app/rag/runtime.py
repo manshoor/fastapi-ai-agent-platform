@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
-from app.ai.provider import OpenAIAnswerer, OpenAIEmbedder
+from app.ai.provider import OpenAIAnswerer, OpenAIEmbedder, OpenAIReranker, OpenAIVerifier
 from app.rag.config import RAGSettings
 from app.telemetry import Telemetry
 
@@ -43,6 +43,8 @@ class RAGRuntime:
         # One HTTP client per process: the embedder owns it, the answerer borrows it.
         self.embedder = OpenAIEmbedder(settings, telemetry)
         self.answerer = OpenAIAnswerer(settings, telemetry, client=self.embedder.client)
+        self.reranker = OpenAIReranker(settings, telemetry, client=self.embedder.client)
+        self.verifier = OpenAIVerifier(settings, telemetry, client=self.embedder.client)
 
     @asynccontextmanager
     async def upload_slot(self, owner_id: UUID) -> AsyncIterator[None]:

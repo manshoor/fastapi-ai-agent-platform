@@ -196,6 +196,7 @@ services:
       RAG_ENABLED: "false"
       ASSISTANT_ENABLED: "false"
       ASSISTANT_DEMO_ENABLED: "false"
+      RAG_DIAGNOSTICS_ENABLED: "false"
       AI_PROVIDER_SIMULATOR_URL: http://provider:8080
       AI_OTLP_RECEIVER_URL: http://otlp:4318
       OPENAI_API_KEY: local-simulator-only-not-a-real-key

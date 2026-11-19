@@ -15,6 +15,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -305,6 +306,30 @@ class RAGDocument(Base):
     )
 
 
+# Why a query or turn ended without an answer; fixed codes only, never content.
+RAG_NO_CONTEXT_REASONS = (
+    "no_chunks",
+    "no_passages",
+    "no_claims",
+    "quote_too_short",
+    "quote_not_found",
+    "number_not_in_passage",
+    "rerank_empty",
+    "verifier_rejected",
+)
+CLAIM_FAILURES = (
+    "quote_too_short",
+    "quote_not_found",
+    "number_not_in_passage",
+    "tool_claim_ungrounded",
+)
+REASONING_EFFORTS = ("none", "low", "medium")
+
+
+def _sql_in(values: tuple[str, ...]) -> str:
+    return ",".join(f"'{value}'" for value in values)
+
+
 class RAGChunk(Base):
     __tablename__ = "rag_chunks"
 
@@ -313,6 +338,8 @@ class RAGChunk(Base):
     owner_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
     page: Mapped[int | None] = mapped_column(Integer)
     content: Mapped[str] = mapped_column(Text)
+    # Markdown heading path such as "Pets > Dogs"; null for text, PDF and older chunks.
+    heading: Mapped[str | None] = mapped_column(Text)
     embedding: Mapped[list[float]] = mapped_column(VECTOR(RAG_EMBEDDING_DIMENSIONS))
 
     __table_args__ = (
@@ -326,6 +353,10 @@ class RAGChunk(Base):
         CheckConstraint("page IS NULL OR page >= 1", name="ck_rag_chunks_page"),
         CheckConstraint("vector_norm(embedding) > 0", name="ck_rag_chunks_norm"),
         CheckConstraint("char_length(content) BETWEEN 1 AND 4000", name="ck_rag_chunks_content"),
+        CheckConstraint(
+            "heading IS NULL OR char_length(heading) BETWEEN 1 AND 300",
+            name="ck_rag_chunks_heading",
+        ),
         Index("ix_rag_chunks_owner_id", "owner_id"),
         Index(
             "ix_rag_chunks_embedding_hnsw",
@@ -393,6 +424,10 @@ class RAGQuery(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     provider_request_id: Mapped[str | None] = mapped_column(String(128))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    no_context_reason: Mapped[str | None] = mapped_column(String(32))
+    reasoning_effort: Mapped[str] = mapped_column(String(16), server_default="none")
+    # Completed chat calls; input_tokens and output_tokens are their sums.
+    chat_calls: Mapped[int | None] = mapped_column(SmallInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -417,6 +452,16 @@ class RAGQuery(Base):
             "AND (output_tokens IS NULL OR output_tokens >= 0)",
             name="ck_rag_queries_tokens",
         ),
+        CheckConstraint(
+            "no_context_reason IS NULL OR (status = 'no_context' "
+            f"AND no_context_reason IN ({_sql_in(RAG_NO_CONTEXT_REASONS)}))",
+            name="ck_rag_queries_no_context_reason",
+        ),
+        CheckConstraint(
+            f"reasoning_effort IN ({_sql_in(REASONING_EFFORTS)})",
+            name="ck_rag_queries_reasoning_effort",
+        ),
+        CheckConstraint("chat_calls IS NULL OR chat_calls >= 0", name="ck_rag_queries_chat_calls"),
         Index("ix_rag_queries_owner_created", "owner_id", "created_at"),
     )
 
@@ -607,6 +652,7 @@ class AssistantTurn(Base):
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     embedding_tokens: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(64))
+    claim_failure: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -628,6 +674,11 @@ class AssistantTurn(Base):
             "AND (output_tokens IS NULL OR output_tokens >= 0) "
             "AND (embedding_tokens IS NULL OR embedding_tokens >= 0)",
             name="ck_assistant_turns_counts",
+        ),
+        CheckConstraint(
+            "claim_failure IS NULL OR (status IN ('no_context','incomplete') "
+            f"AND claim_failure IN ({_sql_in(CLAIM_FAILURES)}))",
+            name="ck_assistant_turns_claim_failure",
         ),
         Index("ix_assistant_turns_user_created", "user_id", "created_at"),
     )

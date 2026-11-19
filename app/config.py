@@ -79,6 +79,8 @@ class Settings(DatabaseSettings):
     assistant_enabled: bool = False
     # Demo-only: lets any account create a demo residence for itself.
     assistant_demo_enabled: bool = False
+    # Eval-only: a hidden query route that also returns the passages sent to the model.
+    rag_diagnostics_enabled: bool = False
 
     @field_validator("jwt_secret")
     @classmethod

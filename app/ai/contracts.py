@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, AwareDatetime, Field, StringConstraints
+from pydantic import AfterValidator, AwareDatetime, Field, StringConstraints, model_validator
 
 from app.schemas import Description, StrictSchema, Title, reject_nul
 
@@ -33,18 +33,80 @@ Answer = Annotated[
 ]
 
 
-class GroundedAnswer(StrictSchema):
-    """Structured model output for a RAG answer. Empty citations mean "not in passages"."""
+Statement = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=480),
+    AfterValidator(reject_nul),
+]
+Quote = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=300),
+    AfterValidator(reject_nul),
+]
 
-    answer: Answer
-    citations: list[PassageLabel] = Field(max_length=8)
+
+class Claim(StrictSchema):
+    """One answer sentence, the passage it comes from, and a word-for-word quote from it."""
+
+    statement: Statement
+    citation: PassageLabel
+    quote: Quote
+
+
+class PassageRanking(StrictSchema):
+    """Rerank output: labels of the passages that help answer, most useful first."""
+
+    passages: list[PassageLabel] = Field(max_length=8)
+
+
+ClaimLabel = Annotated[str, StringConstraints(pattern=r"^C[1-8]$")]
+
+
+class ClaimVerdict(StrictSchema):
+    claim: ClaimLabel
+    supported: bool
+
+
+class ClaimVerdicts(StrictSchema):
+    """Verifier output: one verdict per claim label, each claim exactly once."""
+
+    verdicts: list[ClaimVerdict] = Field(max_length=8)
+
+
+class QuotedAnswer(StrictSchema):
+    """Structured model output for a RAG answer. No claims means "not in passages"."""
+
+    claims: list[Claim] = Field(max_length=8)
+
+
+# Where an assistant claim comes from: a search passage this turn, or a tool result.
+TOOL_SOURCE = "tool"
+ClaimSource = Annotated[str, StringConstraints(pattern=r"^(P[1-8]|tool)$")]
+AssistantQuote = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, max_length=300),
+    AfterValidator(reject_nul),
+]
+
+
+class AssistantClaim(StrictSchema):
+    """One reply sentence. A passage claim quotes its passage; a tool claim has no quote."""
+
+    statement: Statement
+    source: ClaimSource
+    quote: AssistantQuote
+
+    @model_validator(mode="after")
+    def _quote_fits_source(self) -> "AssistantClaim":
+        if (self.source == TOOL_SOURCE) != (self.quote == ""):
+            raise ValueError("A tool claim has no quote; a passage claim has one")
+        return self
 
 
 class AssistantReply(StrictSchema):
-    """Final assistant output. Citations are labels of passages returned by search this turn."""
+    """Final assistant output. No claims means the assistant could not answer."""
 
-    answer: Answer
-    citations: list[PassageLabel] = Field(max_length=8)
+    claims: list[AssistantClaim] = Field(max_length=8)
 
 
 class JudgeVerdict(StrictSchema):

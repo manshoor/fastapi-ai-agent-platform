@@ -77,3 +77,49 @@ def test_chunk_limit_and_blank_pages():
     with pytest.raises(ParseFailure) as error:
         chunk_document(blank, ContentType.PDF, settings())
     assert error.value.code is IngestError.NO_TEXT
+
+
+def _markdown(text: str, size: int = 200, overlap: int = 0):
+    parsed = ParsedDocument([(None, text)], None)
+    return chunk_document(
+        parsed, ContentType.MARKDOWN, settings(rag_chunk_size=size, rag_chunk_overlap=overlap)
+    )
+
+
+def test_markdown_chunks_carry_their_heading_path():
+    text = (
+        "# House rules\n\nIntro text.\n\n## Pets\n\n### Dogs\n\n"
+        + words(60, "dog")
+        + "\n\n## Waste\n\n"
+        + words(30, "bin")
+    )
+    chunks = _markdown(text)
+    by_word = {
+        word: next(chunk.heading for chunk in chunks if word in chunk.content)
+        for word in ("Intro", "dog59", "bin1")
+    }
+    assert by_word == {
+        "Intro": "House rules",
+        "dog59": "House rules > Pets > Dogs",
+        "bin1": "House rules > Waste",
+    }
+
+
+def test_headings_inside_code_fences_are_ignored():
+    text = "## Setup\n\n```\n# not a heading\n```\n\n" + words(80, "step")
+    assert {chunk.heading for chunk in _markdown(text)} == {"Setup"}
+
+
+def test_heading_path_is_capped_and_absent_outside_markdown():
+    text = "# " + "h" * 400 + "\n\nBody text here."
+    (chunk,) = _markdown(text, size=1200)
+    assert len(chunk.heading) == 300
+    plain = chunk_document(
+        ParsedDocument([(None, "# Not markdown\n\nBody.")], None), ContentType.TEXT, settings()
+    )
+    assert {chunk.heading for chunk in plain} == {None}
+
+
+def test_text_before_any_heading_has_no_path():
+    (chunk, *_) = _markdown("Preface words.\n\n# Later\n\n" + words(5))
+    assert chunk.heading is None

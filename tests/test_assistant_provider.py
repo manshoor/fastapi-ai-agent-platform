@@ -120,7 +120,9 @@ async def test_tool_call_wire_contract(simulator):
     assert request["parallel_tool_calls"] is False
     assert request["store"] is False and request["tool_choice"] == "auto"
     assert request["reasoning"] == {"effort": "none"}
-    assert request["text"]["format"]["schema"]["properties"]["citations"]
+    schema = request["text"]["format"]["schema"]
+    assert set(schema["required"]) == {"claims"}
+    assert set(schema["$defs"]["AssistantClaim"]["required"]) == {"statement", "source", "quote"}
 
 
 async def test_scripted_reply_and_unknown_tool_pass_through(simulator):
@@ -130,14 +132,22 @@ async def test_scripted_reply_and_unknown_tool_pass_through(simulator):
         script=[
             {"tool": "disarm_alarm", "arguments": {}},
             {"tool": "lock_door", "raw_arguments": "{not json"},
-            {"answer": "The door is locked.", "citations": ["P1"]},
+            {
+                "claims": [
+                    {"statement": "The door is locked.", "source": "tool", "quote": ""},
+                    {"statement": "Doors lock at night.", "source": "P1", "quote": "doors lock at"},
+                ]
+            },
         ],
     )
     # Unknown names and malformed arguments are the executor's to deny and audit.
     assert (await step(url)).call.name == "disarm_alarm"
     assert (await step(url)).call.arguments == "{not json"
     reply = (await step(url)).reply
-    assert reply.answer == "The door is locked." and reply.citations == ["P1"]
+    assert [(claim.source, claim.quote) for claim in reply.claims] == [
+        ("tool", ""),
+        ("P1", "doors lock at"),
+    ]
 
 
 def envelope(*items, status="completed") -> dict:

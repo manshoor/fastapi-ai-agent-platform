@@ -166,6 +166,7 @@ async def store_batch(
                         "ordinal": chunk.ordinal,
                         "page": chunk.page,
                         "content": chunk.content,
+                        "heading": chunk.heading,
                         "embedding": list(vector),
                     }
                     for chunk, vector in zip(chunks, vectors, strict=True)

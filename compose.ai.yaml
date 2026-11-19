@@ -189,6 +189,10 @@ services:
       # The resident assistant and its demo setup route run in the API process only.
       ASSISTANT_ENABLED: "true"
       ASSISTANT_DEMO_ENABLED: "true"
+      # Eval-only route for scripts/evaluate_rag.py: returns passages to their owner.
+      RAG_DIAGNOSTICS_ENABLED: "true"
+      # Room for rerank and the verifier as eval overrides: 20 s embedding + 3 x 30 s chat.
+      RAG_QUERY_DEADLINE_SECONDS: "115"
       # RAG queries embed the question and generate the answer from the API process.
       OPENAI_API_KEY: local-simulator-only-not-a-real-key
       OPENAI_BASE_URL: http://provider:8080/v1
