@@ -6,16 +6,17 @@
                        write tools: one transaction =
                          per-user lock -> limits -> guarded write (membership in WHERE)
                          -> audit row
-                    -> result JSON back to the model
+                    -> result JSON back to the model; a result that grounds a reply
+                       carries a server-written fact with the next label, T1..T8
 
 The model supplies only names and values. User, apartment and building come from
 `Resident`. Every time and window comes from the database clock.
 """
 
 import json
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
-from datetime import timedelta
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import UTC, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -28,6 +29,7 @@ from app.ai.processing import SessionFactory
 from app.ai.provider import MAX_PASSAGES, ToolCall
 from app.assistant.config import AssistantSettings
 from app.assistant.contracts import (
+    GROUNDING_RESULTS,
     UNKNOWN_TOOL,
     ActionResult,
     Decision,
@@ -48,6 +50,9 @@ _WRITE_LOCK_NAMESPACE = 0x41535457
 SEARCH_TOP_K = 4
 BOOKING_LIMIT = 10
 DEVICE_TOOLS = (ToolName.SET_THERMOSTAT, ToolName.LOCK_DOOR)
+# Labels T1..T8, as for passages: a turn makes at most eight model calls.
+MAX_FACTS = 8
+FACT_PREFIX = "T"
 
 
 @dataclass
@@ -62,6 +67,11 @@ class ToolContext:
     telemetry: Any = None
     # Passages already given to the model this turn; labels P1..P8 continue across searches.
     passages: list[dict] = field(default_factory=list)
+    # Facts of grounding tool results this turn, in label order: facts[0] is T1. A fact
+    # that a later result for the same device replaced is blank and grounds nothing.
+    facts: list[str] = field(default_factory=list)
+    # (tool, device) -> index of that device's current fact in `facts`.
+    _device_facts: dict[tuple[str, str], int] = field(default_factory=dict, init=False, repr=False)
     embedding_tokens: int = 0
 
 
@@ -70,13 +80,55 @@ class ToolOutcome:
     action: ActionResult
     # Sent back to the model as the function call output.
     output: dict
+    # The one sentence a reply may quote about this result. The server writes it
+    # from checked values only: a stored device name, a category, a number.
+    # Only a result in GROUNDING_RESULTS gets a label for it.
+    fact: str | None = None
 
 
 def _outcome(tool: str, decision: Decision, result: ResultCode, **extra) -> ToolOutcome:
     output = {"result": str(result), **extra.pop("output", {})}
+    fact = extra.pop("fact", None)
     return ToolOutcome(
-        action=ActionResult(tool=tool, decision=decision, result=result, **extra), output=output
+        action=ActionResult(tool=tool, decision=decision, result=result, **extra),
+        output=output,
+        fact=fact,
     )
+
+
+def _labelled(ctx: ToolContext, outcome: ToolOutcome) -> ToolOutcome:
+    """Give a grounding result's fact the next T label, in the output the model reads.
+
+    A later result of the same tool for the same device replaces the earlier fact: 21 °C
+    then 23 °C leaves only 23 °C citable. The old fact is blanked, never removed, so
+    labels already handed out keep their meaning. Other tools keep their facts: the door
+    stays locked while an unlock waits, and a ticket stays opened after a duplicate.
+    """
+    action = outcome.action
+    grounds = (action.decision, action.result) in GROUNDING_RESULTS
+    if outcome.fact is None or not grounds or len(ctx.facts) >= MAX_FACTS:
+        return outcome
+    if action.device is not None:
+        subject = (action.tool, action.device)
+        replaced = ctx._device_facts.get(subject)
+        if replaced is not None:
+            ctx.facts[replaced] = ""
+        ctx._device_facts[subject] = len(ctx.facts)
+    ctx.facts.append(outcome.fact)
+    label = f"{FACT_PREFIX}{len(ctx.facts)}"
+    return replace(outcome, output={**outcome.output, "label": label, "fact": outcome.fact})
+
+
+def _bookings_fact(rows: Sequence[Any]) -> str:
+    """Upcoming bookings in UTC, one clause each, in start order."""
+    clauses = []
+    for row in rows:
+        starts, ends = row.starts_at.astimezone(UTC), row.ends_at.astimezone(UTC)
+        end = f"{ends:%H:%M}" if ends.date() == starts.date() else f"{ends:%Y-%m-%d %H:%M}"
+        clauses.append(f"{row.amenity} on {starts:%Y-%m-%d} from {starts:%H:%M} to {end} UTC")
+    if not clauses:
+        return "No upcoming bookings."
+    return "Upcoming bookings: " + "; ".join(clauses) + "."
 
 
 def _audit(
@@ -217,6 +269,7 @@ async def list_bookings(ctx: ToolContext, args: NoArguments) -> ToolOutcome:
             .order_by(Booking.starts_at)
             .limit(BOOKING_LIMIT)
         )
+        rows = rows.all()
         bookings = [
             {
                 "amenity": row.amenity,
@@ -227,7 +280,13 @@ async def list_bookings(ctx: ToolContext, args: NoArguments) -> ToolOutcome:
         ]
         await session.execute(_audit(ctx, tool, Decision.ALLOWED, ResultCode.OK))
         await session.commit()
-    return _outcome(tool, Decision.ALLOWED, ResultCode.OK, output={"bookings": bookings})
+    return _outcome(
+        tool,
+        Decision.ALLOWED,
+        ResultCode.OK,
+        output={"bookings": bookings},
+        fact=_bookings_fact(rows),
+    )
 
 
 async def create_ticket(ctx: ToolContext, args: TicketArguments) -> ToolOutcome:
@@ -250,6 +309,7 @@ async def create_ticket(ctx: ToolContext, args: TicketArguments) -> ToolOutcome:
         )
         details = {"category": str(args.category)}
         if existing is not None:
+            minutes = settings.assistant_ticket_dedupe_seconds / 60
             await session.execute(
                 _audit(
                     ctx,
@@ -267,6 +327,8 @@ async def create_ticket(ctx: ToolContext, args: TicketArguments) -> ToolOutcome:
                 ResultCode.DUPLICATE,
                 ticket_id=existing,
                 output={"ticket_id": str(existing)},
+                fact=f"An open {args.category} ticket from the last {minutes:g} minutes "
+                "already exists.",
             )
         recent = await session.scalar(
             select(func.count())
@@ -300,6 +362,7 @@ async def create_ticket(ctx: ToolContext, args: TicketArguments) -> ToolOutcome:
         ResultCode.OK,
         ticket_id=ticket_id,
         output={"ticket_id": str(ticket_id)},
+        fact=f"Maintenance ticket opened in category {args.category}.",
     )
 
 
@@ -319,7 +382,13 @@ async def _device_limit_reached(session: AsyncSession, ctx: ToolContext) -> bool
 
 
 async def _set_device(
-    ctx: ToolContext, tool: ToolName, name: str, kind: str, values: dict, details: dict
+    ctx: ToolContext,
+    tool: ToolName,
+    name: str,
+    kind: str,
+    values: dict,
+    details: dict,
+    fact: str,
 ) -> ToolOutcome:
     resident = ctx.resident
     async with ctx.session_factory() as session:
@@ -344,7 +413,9 @@ async def _set_device(
             _audit(ctx, tool, Decision.ALLOWED, ResultCode.OK, details=details, device_id=device_id)
         )
         await session.commit()
-    return _outcome(tool, Decision.ALLOWED, ResultCode.OK, device=name, output={"device": name})
+    return _outcome(
+        tool, Decision.ALLOWED, ResultCode.OK, device=name, output={"device": name}, fact=fact
+    )
 
 
 async def set_thermostat(ctx: ToolContext, args: ThermostatArguments) -> ToolOutcome:
@@ -356,12 +427,19 @@ async def set_thermostat(ctx: ToolContext, args: ThermostatArguments) -> ToolOut
         "thermostat",
         {"target_celsius": celsius},
         {"celsius": celsius},
+        f"{args.device} target set to {celsius:g} °C.",
     )
 
 
 async def lock_door(ctx: ToolContext, args: DeviceArguments) -> ToolOutcome:
     return await _set_device(
-        ctx, ToolName.LOCK_DOOR, args.device, "door_lock", {"locked": True}, {}
+        ctx,
+        ToolName.LOCK_DOOR,
+        args.device,
+        "door_lock",
+        {"locked": True},
+        {},
+        f"{args.device} is locked.",
     )
 
 
@@ -439,9 +517,19 @@ async def unlock_door(ctx: ToolContext, args: DeviceArguments) -> ToolOutcome:
         )
         await session.commit()
     output = {"device": name}
+    fact = None
     if action_id is not None:
         output["status"] = "confirmation_required"
-    return _outcome(tool, decision, result, device=name, pending_action_id=action_id, output=output)
+        fact = f"Unlock request for {name} is waiting for your confirmation in the app."
+    return _outcome(
+        tool,
+        decision,
+        result,
+        device=name,
+        pending_action_id=action_id,
+        output=output,
+        fact=fact,
+    )
 
 
 @dataclass(frozen=True)
@@ -535,7 +623,7 @@ async def _execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     except ValidationError:
         await _audited(ctx, tool, Decision.DENIED, ResultCode.INVALID_ARGUMENTS)
         return _outcome(tool, Decision.DENIED, ResultCode.INVALID_ARGUMENTS)
-    return await spec.handler(ctx, args)
+    return _labelled(ctx, await spec.handler(ctx, args))
 
 
 def output_text(outcome: ToolOutcome) -> str:

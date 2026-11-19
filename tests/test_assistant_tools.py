@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from uuid import UUID, uuid4
 
 import httpx
@@ -108,7 +109,12 @@ async def test_set_thermostat_changes_only_that_device_and_audits_the_value(
     outcome = await execute(ctx, call("set_thermostat", device=LIVING_ROOM, celsius=22.5))
 
     assert (outcome.action.decision, outcome.action.result) == (Decision.ALLOWED, ResultCode.OK)
-    assert outcome.output == {"result": "ok", "device": LIVING_ROOM}
+    assert outcome.output == {
+        "result": "ok",
+        "device": LIVING_ROOM,
+        "label": "T1",
+        "fact": f"{LIVING_ROOM} target set to 22.5 °C.",
+    }
     assert float((await device(app, ctx, LIVING_ROOM)).target_celsius) == 22.5
     assert float((await device(app, ctx, "Bedroom thermostat")).target_celsius) == 19.5
     [row] = await audit(app, ctx)
@@ -276,6 +282,12 @@ async def test_ticket_is_deduplicated_and_limited(app: FastAPI, resident_context
     )
     assert second.action.result == ResultCode.OK
     assert third.action.result == ResultCode.LIMIT_EXCEEDED
+    assert [outcome.output.get("fact") for outcome in (first, retry, second, third)] == [
+        "Maintenance ticket opened in category plumbing.",
+        "An open plumbing ticket from the last 10 minutes already exists.",
+        "Maintenance ticket opened in category heating.",
+        None,
+    ]
     async with app.state.session_factory() as session:
         summaries = await session.scalars(select(Ticket.summary).order_by(Ticket.created_at))
         assert list(summaries) == ["Leaking tap", "Cold radiator"]
@@ -301,6 +313,8 @@ async def test_unlock_creates_a_pending_action_and_never_unlocks(app: FastAPI, r
         "result": "ok",
         "device": FRONT_DOOR,
         "status": "confirmation_required",
+        "label": "T1",
+        "fact": f"Unlock request for {FRONT_DOOR} is waiting for your confirmation in the app.",
     }
     assert again.action.result == ResultCode.ALREADY_PENDING
     assert again.action.pending_action_id == first.action.pending_action_id
@@ -337,6 +351,51 @@ async def test_list_bookings_returns_only_the_apartments_upcoming_bookings(resid
 
     assert outcome.action.result == ResultCode.OK
     assert [booking["amenity"] for booking in outcome.output["bookings"]] == ["Gym", "Party room"]
+
+
+# One booking clause; the end carries a date only when it falls on another day.
+BOOKING_CLAUSE = r"\d{4}-\d{2}-\d{2} from \d{2}:\d{2} to (?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2} UTC"
+
+
+async def test_grounding_results_get_fact_labels_in_order(resident_context):
+    ctx, _ = await resident_context()
+    warmer = await execute(ctx, call("set_thermostat", device=LIVING_ROOM, celsius=22.5))
+    missing = await execute(ctx, call("lock_door", device="Garage door"))
+    locked = await execute(ctx, call("lock_door", device=FRONT_DOOR))
+    bookings = await execute(ctx, call("list_bookings"))
+
+    # A denial gets no label, so no claim can cite it.
+    assert missing.action.decision == Decision.DENIED and "label" not in missing.output
+    labelled = [warmer.output, locked.output, bookings.output]
+    assert [output["label"] for output in labelled] == ["T1", "T2", "T3"]
+    assert ctx.facts == [output["fact"] for output in labelled]
+    assert locked.output["fact"] == f"{FRONT_DOOR} is locked."
+    assert re.fullmatch(
+        rf"Upcoming bookings: Gym on {BOOKING_CLAUSE}; Party room on {BOOKING_CLAUSE}\.",
+        bookings.output["fact"],
+    )
+
+
+async def test_later_result_for_a_device_blanks_its_earlier_fact(resident_context):
+    ctx, _ = await resident_context()
+    await execute(ctx, call("set_thermostat", device=LIVING_ROOM, celsius=21))
+    locked = await execute(ctx, call("lock_door", device=FRONT_DOOR))
+    pending = await execute(ctx, call("unlock_door", device=FRONT_DOOR))
+    opened = await execute(ctx, call("create_ticket", category="heating", summary="Cold"))
+    again = await execute(ctx, call("create_ticket", category="heating", summary="Still cold"))
+    warmer = await execute(ctx, call("set_thermostat", device=LIVING_ROOM, celsius=23))
+
+    # Labels never move. Only the replaced thermostat fact is blank: the door stays
+    # locked until the resident confirms, and the first ticket was still opened.
+    assert warmer.output["label"] == "T6"
+    assert ctx.facts == [
+        "",
+        locked.output["fact"],
+        pending.output["fact"],
+        opened.output["fact"],
+        again.output["fact"],
+        f"{LIVING_ROOM} target set to 23 °C.",
+    ]
 
 
 async def test_search_without_building_documents_makes_no_provider_call(

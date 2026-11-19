@@ -115,6 +115,8 @@ def embed_text(text: str, dimensions: int) -> list[float]:
 
 # Words of the first passage the synthetic claim quotes.
 QUOTE_WORDS = 8
+# Quoted from no tool fact: a final claim citing it grounds nothing.
+UNGROUNDED_QUOTE = "the request is done"
 
 
 def quoted_answer(request: dict, mode: str) -> dict:
@@ -243,7 +245,17 @@ def keyword_step(request: dict) -> dict:
                 quote = " ".join(first["text"].split()[:QUOTE_WORDS])
                 label = first.get("label", "P1")
                 return {"claims": [{"statement": quote, "source": label, "quote": quote}]}
-        return {"claims": [{"statement": "Done.", "source": "tool", "quote": ""}]}
+        # A labelled tool result: claim its server-written fact, quoting its first words.
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            label, fact = output.get("label"), output.get("fact")
+            if isinstance(label, str) and isinstance(fact, str):
+                quote = " ".join(fact.split()[:QUOTE_WORDS])
+                return {"claims": [{"statement": quote, "source": label, "quote": quote}]}
+        # Nothing labelled, such as a denial: a claim that no fact supports.
+        claim = {"statement": "Done.", "source": "T1", "quote": UNGROUNDED_QUOTE}
+        return {"claims": [claim]}
     message = str(context.get("message", "")).lower()
     resident = context.get("resident")
     devices = resident.get("devices", []) if isinstance(resident, dict) else []

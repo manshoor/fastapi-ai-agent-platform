@@ -1,4 +1,4 @@
-"""Server-side checks that every answer claim is quoted word for word from its passage.
+"""Server-side checks that every claim is quoted word for word from the text it cites.
 
     claim (statement, citation P<n>, quote)
       -> quote has at least 3 words                       else quote_too_short
@@ -8,7 +8,9 @@
 
 All-or-nothing: the first failed claim fails the whole answer, because dropping one
 claim can change the meaning of the rest (for example, by losing an exception).
-The passage text is exactly the text the model received. Pure functions only.
+The passage text is exactly the text the model received. The assistant checks its
+tool claims the same way, against the server-written fact of the cited tool result
+(`check_quote`). Pure functions only.
 """
 
 import re
@@ -90,24 +92,29 @@ def _numbers(text: str) -> set[str]:
     return numbers
 
 
+def check_quote(statement: str, quote: str, text: str) -> ClaimFailure | None:
+    """One claim against the one text it cites: a passage, or a tool fact."""
+    source = normalize(text)
+    quoted = _quote(quote)
+
+    # The quote must be a real, contiguous span of the cited text.
+    if len(quoted.split()) < MIN_QUOTE_WORDS:
+        return ClaimFailure.QUOTE_TOO_SHORT
+    if not _quoted_in(quoted, source):
+        return ClaimFailure.QUOTE_NOT_FOUND
+
+    # Numbers are where paraphrase goes wrong most: each must appear as written.
+    stated = {match.replace(" ", "") for match in _NUMBER.findall(normalize(statement))}
+    if not stated <= _numbers(source):
+        return ClaimFailure.NUMBER_NOT_IN_PASSAGE
+    return None
+
+
 def _check(claim: Claim, passages: Sequence[str]) -> ClaimFailure | None:
     index = int(claim.citation[1:]) - 1
     if not 0 <= index < len(passages):
         raise ValueError("Claim cites a passage that was not supplied")
-    passage = normalize(passages[index])
-    quote = _quote(claim.quote)
-
-    # The quote must be a real, contiguous span of the cited passage.
-    if len(quote.split()) < MIN_QUOTE_WORDS:
-        return ClaimFailure.QUOTE_TOO_SHORT
-    if not _quoted_in(quote, passage):
-        return ClaimFailure.QUOTE_NOT_FOUND
-
-    # Numbers are where paraphrase goes wrong most: each must appear as written.
-    stated = {match.replace(" ", "") for match in _NUMBER.findall(normalize(claim.statement))}
-    if not stated <= _numbers(passage):
-        return ClaimFailure.NUMBER_NOT_IN_PASSAGE
-    return None
+    return check_quote(claim.statement, claim.quote, passages[index])
 
 
 def check_claims(claims: Sequence[Claim], passages: Sequence[str]) -> ClaimFailure | None:

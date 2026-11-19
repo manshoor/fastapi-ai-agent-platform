@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AfterValidator, AwareDatetime, Field, StringConstraints, model_validator
+from pydantic import AfterValidator, AwareDatetime, Field, StringConstraints
 
 from app.schemas import Description, StrictSchema, Title, reject_nul
 
@@ -79,28 +79,22 @@ class QuotedAnswer(StrictSchema):
     claims: list[Claim] = Field(max_length=8)
 
 
-# Where an assistant claim comes from: a search passage this turn, or a tool result.
-TOOL_SOURCE = "tool"
-ClaimSource = Annotated[str, StringConstraints(pattern=r"^(P[1-8]|tool)$")]
+# Where an assistant claim comes from this turn: a search passage (P1-P8) or the
+# server-written fact of a tool result (T1-T8). The quote is copied from that text.
+ClaimSource = Annotated[str, StringConstraints(pattern=r"^[PT][1-8]$")]
 AssistantQuote = Annotated[
     str,
-    StringConstraints(strip_whitespace=True, max_length=300),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=300),
     AfterValidator(reject_nul),
 ]
 
 
 class AssistantClaim(StrictSchema):
-    """One reply sentence. A passage claim quotes its passage; a tool claim has no quote."""
+    """One reply sentence, quoting the passage or tool fact it names as its source."""
 
     statement: Statement
     source: ClaimSource
     quote: AssistantQuote
-
-    @model_validator(mode="after")
-    def _quote_fits_source(self) -> "AssistantClaim":
-        if (self.source == TOOL_SOURCE) != (self.quote == ""):
-            raise ValueError("A tool claim has no quote; a passage claim has one")
-        return self
 
 
 class AssistantReply(StrictSchema):

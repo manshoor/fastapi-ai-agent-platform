@@ -7,8 +7,12 @@
       -> claim checks -> usage row -> TurnResponse
 
     Claim checks (all-or-nothing, as for RAG queries):
-      passage claim -> quote and numbers checked against that passage's text
-      tool claim    -> needs a non-search tool result in GROUNDING_RESULTS
+      passage claim (P1..P8) -> quote and numbers checked against that passage's text;
+                                the reply shows the statement
+      tool claim (T1..T8)    -> quote checked against that tool result's server-written
+                                fact; the reply shows the fact, never the statement.
+                                A label never handed out, or a fact a later result for
+                                its device replaced, grounds nothing
       all verified  -> "answered"; no claims or a failed check -> "no_context",
                        or "incomplete" (claim_unverified) after a committed write
 
@@ -30,7 +34,7 @@ from langsmith import tracing_context
 from sqlalchemy import exists, func, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.ai.contracts import TOOL_SOURCE, AssistantClaim, Claim
+from app.ai.contracts import AssistantClaim
 from app.ai.processing import SessionFactory
 from app.ai.provider import ASSISTANT_PROMPT_VERSION, ProviderFailure
 from app.assistant.config import AssistantSettings
@@ -45,9 +49,9 @@ from app.assistant.contracts import (
 from app.assistant.graph import BUDGET_CODE, TurnRun, first_input, recursion_limit
 from app.assistant.residence import Resident
 from app.assistant.runtime import AssistantRuntime
-from app.assistant.tools import ToolContext
+from app.assistant.tools import FACT_PREFIX, ToolContext
 from app.models import AssistantTurn, Device, PendingAction
-from app.rag.verification import ClaimFailure, check_claims
+from app.rag.verification import ClaimFailure, check_quote
 from app.telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
@@ -218,15 +222,6 @@ def _committed(actions: list[ActionResult]) -> bool:
     )
 
 
-def _grounded_by_tools(actions: list[ActionResult]) -> bool:
-    # Search grounds an answer only through quoted passage claims.
-    return any(
-        action.tool != ToolName.SEARCH_DOCUMENTS
-        and (action.decision, action.result) in GROUNDING_RESULTS
-        for action in actions
-    )
-
-
 def _citations(run: TurnRun) -> list[Citation]:
     """One citation per passage the claims name, in claim order, with its quotes."""
     passages = run.context.passages
@@ -235,7 +230,7 @@ def _citations(run: TurnRun) -> list[Citation]:
     seen: set[str] = set()
     for claim in claims:
         label = claim.source
-        if label == TOOL_SOURCE or label in seen:
+        if label.startswith(FACT_PREFIX) or label in seen:
             continue
         index = int(label[1:]) - 1
         if index >= len(passages):
@@ -259,24 +254,47 @@ def _citations(run: TurnRun) -> list[Citation]:
 def _claim_failure(run: TurnRun) -> ClaimFailure | None:
     """The first claim that fails its check, in reply order, or None when all pass.
 
-    Passage claims are checked against the exact text the search tool handed out.
-    A tool claim is only as trusted as today's tool grounding: some non-search tool
-    result this turn must have succeeded.
+    Each claim is checked against the one text it cites: the exact passage text the
+    search tool handed out, or the fact a successful tool result carried. Passage
+    labels were validated by `_citations`; a tool label never given out fails.
     """
-    texts = [passage["document"].page_content for passage in run.context.passages]
-    tools_ground = _grounded_by_tools(run.actions)
+    passages = [passage["document"].page_content for passage in run.context.passages]
     for claim in run.reply.claims:
-        failure = _check(claim, texts, tools_ground)
+        failure = _check(claim, passages, run.context.facts)
         if failure is not None:
             return failure
     return None
 
 
-def _check(claim: AssistantClaim, texts: list[str], tools_ground: bool) -> ClaimFailure | None:
-    if claim.source == TOOL_SOURCE:
-        return None if tools_ground else ClaimFailure.TOOL_CLAIM_UNGROUNDED
-    passage_claim = Claim(statement=claim.statement, citation=claim.source, quote=claim.quote)
-    return check_claims([passage_claim], texts)
+def _check(claim: AssistantClaim, passages: list[str], facts: list[str]) -> ClaimFailure | None:
+    index = int(claim.source[1:]) - 1
+    if not claim.source.startswith(FACT_PREFIX):
+        return check_quote(claim.statement, claim.quote, passages[index])
+    if index >= len(facts) or not facts[index]:
+        return ClaimFailure.TOOL_CLAIM_UNGROUNDED
+    # The reply shows the fact, never the statement, so the statement is not checked.
+    # The quote still must come from the fact: it shows the model named the result it read.
+    return check_quote(statement="", quote=claim.quote, text=facts[index])
+
+
+def _answer(run: TurnRun) -> str:
+    """Passage claims as written; each cited tool fact once, as the server wrote it.
+
+    Every fact holds only checked values, so a reply cannot misstate a tool result:
+    "The front door is unlocked." citing T1 shows T1's "Front door is locked."
+    """
+    facts = run.context.facts
+    parts: list[str] = []
+    shown: set[str] = set()
+    for claim in run.reply.claims:
+        if not claim.source.startswith(FACT_PREFIX):
+            parts.append(claim.statement)
+            continue
+        if claim.source in shown:
+            continue
+        shown.add(claim.source)
+        parts.append(facts[int(claim.source[1:]) - 1])
+    return " ".join(parts)
 
 
 async def _pending_views(session_factory: SessionFactory, run: TurnRun) -> list[PendingActionView]:
@@ -362,11 +380,10 @@ async def _finish(
         status, answer, citations = "incomplete", INCOMPLETE_ANSWER, []
     elif run.reply.claims and failure is None:
         status = "answered"
-        answer = " ".join(claim.statement for claim in run.reply.claims)
+        answer = _answer(run)
     elif committed:
         # A reply that failed its checks never stands beside a committed write: report
-        # the write. Tool claims are trusted per turn, as before: any successful
-        # non-search tool grounds every tool claim.
+        # the write.
         status, answer, citations, code = "incomplete", INCOMPLETE_ANSWER, [], CLAIM_CODE
     else:
         status, answer, citations = "no_context", NO_CONTEXT_ANSWER, []

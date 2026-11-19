@@ -51,7 +51,9 @@ def resident(client: httpx.AsyncClient, account):
 
 async def hijacked(client, simulator, owner, *steps) -> dict:
     state, _ = simulator
-    state.script = [*steps, {"claims": [{"statement": "Done.", "source": "tool", "quote": ""}]}]
+    # The final claim quotes no tool fact, so a hijacked turn is never answered.
+    done = {"statement": "Done.", "source": "T1", "quote": "the request is done"}
+    state.script = [*steps, {"claims": [done]}]
     response = await client.post(
         URL, headers=owner["headers"], json={"message": "What are the house rules?"}
     )

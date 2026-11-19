@@ -29,11 +29,17 @@ from tests.support.assistant import SIMULATOR, add_ready_document, demo_residenc
 URL = "/api/v1/assistant/messages"
 TURN_LIMIT = 3
 SECRET = "private-message-7f3a"
+# No digits: every number in a statement must appear in the fact it cites.
+REPLY_SECRET = "private-reply-marker"
 RULE = "Quiet hours start at 22:00 and end at 07:00."
 
 
-def tool_reply(statement: str) -> dict:
-    return {"claims": [{"statement": statement, "source": "tool", "quote": ""}]}
+# Quoted from no tool fact: cited as T1, it grounds nothing.
+UNGROUNDED_QUOTE = "the request is done"
+
+
+def tool_reply(statement: str, quote: str = UNGROUNDED_QUOTE, source: str = "T1") -> dict:
+    return {"claims": [{"statement": statement, "source": source, "quote": quote}]}
 
 
 def passage_reply(statement: str, quote: str, source: str = "P1") -> dict:
@@ -110,7 +116,7 @@ async def test_tool_then_reply_is_answered_and_recorded_without_text(
             "tool": "set_thermostat",
             "arguments": {"device": "Living room thermostat", "celsius": 23},
         },
-        tool_reply(f"Set to 23 degrees {SECRET}"),
+        tool_reply(f"Set to 23 degrees {REPLY_SECRET}", "target set to 23"),
     )
     response = await send(client, owner)
 
@@ -133,7 +139,7 @@ async def test_tool_then_reply_is_answered_and_recorded_without_text(
     (row,) = await turns(app)
     assert (row.status, row.model_calls, row.tool_calls) == ("answered", 2, 1)
     assert (row.input_tokens, row.output_tokens, row.error_code) == (80, 40, None)
-    assert row.claim_failure is None and row.prompt_version == "assistant-v2"
+    assert row.claim_failure is None and row.prompt_version == "assistant-v3"
     assert row.model == "simulator-assistant" and row.finished_at is not None
     async with app.state.session_factory() as session:
         stored = [
@@ -141,6 +147,7 @@ async def test_tool_then_reply_is_answered_and_recorded_without_text(
             for item in [*(await turns(app)), *await session.scalars(select(AssistantToolCall))]
         ]
     assert SECRET not in json.dumps(stored)
+    assert REPLY_SECRET not in json.dumps(stored)
 
 
 async def test_the_model_sees_context_without_the_alarm(app: FastAPI, client, resident, simulator):
@@ -636,7 +643,7 @@ async def test_failed_pending_lookup_still_reports_the_unlock(
     script(
         simulator,
         {"tool": "unlock_door", "arguments": {"device": "Front door"}},
-        tool_reply("Confirm it in the app."),
+        tool_reply("Confirm it in the app.", "waiting for your confirmation"),
     )
     body = (await send(client, owner)).json()
 
@@ -693,6 +700,185 @@ async def test_misquoted_passage_claim_is_refused(
     assert (row.status, row.error_code, row.claim_failure) == ("no_context", None, failure)
 
 
+THERMOSTAT_21 = {
+    "tool": "set_thermostat",
+    "arguments": {"device": "Living room thermostat", "celsius": 21},
+}
+THERMOSTAT_23 = {
+    "tool": "set_thermostat",
+    "arguments": {"device": "Living room thermostat", "celsius": 23},
+}
+FACT_21 = "Living room thermostat target set to 21 °C."
+LOCK_FRONT = {"tool": "lock_door", "arguments": {"device": "Front door"}}
+
+
+@pytest.mark.parametrize(
+    ("claim", "status", "answer", "failure"),
+    [
+        (
+            {"statement": "It is set to 21 °C.", "source": "T1", "quote": "target set to 21 °C"},
+            "answered",
+            FACT_21,
+            None,
+        ),
+        (
+            {"statement": "It is set to 25 °C.", "source": "T1", "quote": "target set to 21 °C"},
+            "answered",
+            FACT_21,
+            None,
+        ),
+        (
+            {"statement": "It is set to 25 °C.", "source": "T1", "quote": "target set to 25 °C"},
+            "incomplete",
+            INCOMPLETE_ANSWER,
+            "quote_not_found",
+        ),
+        (
+            {"statement": "It is set to 21 °C.", "source": "T2", "quote": "target set to 21 °C"},
+            "incomplete",
+            INCOMPLETE_ANSWER,
+            "tool_claim_ungrounded",
+        ),
+    ],
+    ids=["matches-its-fact", "wrong-statement-not-shown", "invented-quote", "unknown-label"],
+)
+async def test_tool_claim_is_checked_against_its_own_result(
+    app: FastAPI, client, resident, simulator, claim, status, answer, failure
+):
+    owner = await resident()
+    script(simulator, THERMOSTAT_21, {"claims": [claim]})
+    body = (await send(client, owner)).json()
+
+    assert (body["status"], body["answer"]) == (status, answer)
+    assert await target(app, owner) == 21.0
+    (row,) = await turns(app)
+    assert row.claim_failure == failure
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        [{"statement": "The front door is unlocked.", "source": "T1", "quote": "Front door is"}],
+        [{"statement": "Balcony door is locked.", "source": "T1", "quote": "door is locked"}],
+        [
+            {"statement": "Locked.", "source": "T1", "quote": "Front door is locked"},
+            {"statement": "It is locked now.", "source": "T1", "quote": "door is locked"},
+        ],
+    ],
+    ids=["contradiction", "wrong-device", "same-label-twice"],
+)
+async def test_tool_claim_shows_its_fact_not_the_statement(
+    app: FastAPI, client, resident, simulator, claims
+):
+    """The server wrote the fact, so a reply cannot misstate the result it cites."""
+    owner = await resident()
+    script(simulator, LOCK_FRONT, {"claims": claims})
+    body = (await send(client, owner)).json()
+
+    assert (body["status"], body["answer"]) == ("answered", "Front door is locked.")
+
+
+@pytest.mark.parametrize(
+    ("source", "status", "answer", "failure"),
+    [
+        ("T1", "incomplete", INCOMPLETE_ANSWER, "tool_claim_ungrounded"),
+        ("T2", "answered", "Living room thermostat target set to 23 °C.", None),
+    ],
+    ids=["replaced-fact", "latest-fact"],
+)
+async def test_later_result_for_the_device_replaces_its_fact(
+    app: FastAPI, client, resident, simulator, source, status, answer, failure
+):
+    owner = await resident()
+    claim = {"statement": "It is set.", "source": source, "quote": "thermostat target set to"}
+    script(simulator, THERMOSTAT_21, THERMOSTAT_23, {"claims": [claim]})
+    body = (await send(client, owner)).json()
+
+    assert (body["status"], body["answer"]) == (status, answer)
+    assert await target(app, owner) == 23.0
+    (row,) = await turns(app)
+    assert row.claim_failure == failure
+
+
+async def test_retired_tool_source_no_longer_vouches_for_a_write(
+    app: FastAPI, client, resident, simulator
+):
+    """Before T labels, any successful tool grounded every "tool" claim: 25 °C after 21 °C."""
+    owner = await resident()
+    claim = {"statement": "It is set to 25 °C.", "source": "tool", "quote": ""}
+    script(simulator, THERMOSTAT_21, {"claims": [claim]})
+    body = (await send(client, owner)).json()
+
+    assert (body["status"], body["answer"]) == ("incomplete", INCOMPLETE_ANSWER)
+    (row,) = await turns(app)
+    assert (row.error_code, row.claim_failure) == ("provider_invalid_output", None)
+
+
+async def test_denied_tool_result_grounds_nothing(app: FastAPI, client, resident, simulator):
+    owner = await resident()
+    script(
+        simulator,
+        {"tool": "lock_door", "arguments": {"device": "Garage door"}},
+        tool_reply("The garage door is locked.", "Garage door is locked"),
+    )
+    body = (await send(client, owner)).json()
+
+    assert (body["status"], body["actions"][0]["decision"]) == ("no_context", "denied")
+    (row,) = await turns(app)
+    assert row.claim_failure == "tool_claim_ungrounded"
+
+
+async def test_grounding_result_hands_the_model_a_labelled_fact(
+    app: FastAPI, client, resident, simulator
+):
+    owner = await resident()
+    outputs = []
+    original = SIMULATOR.keyword_step
+
+    def spy(request):
+        outputs.append(SIMULATOR.agent_context(request)[1])
+        return original(request)
+
+    SIMULATOR.keyword_step = spy
+    try:
+        body = (await send(client, owner, "Set the living room thermostat to 22 degrees.")).json()
+    finally:
+        SIMULATOR.keyword_step = original
+
+    (output,) = outputs[-1]
+    assert (output["label"], output["fact"]) == (
+        "T1",
+        "Living room thermostat target set to 22 °C.",
+    )
+    assert body["status"] == "answered"
+
+
+async def test_passage_and_tool_claims_in_one_reply(app: FastAPI, client, resident, simulator):
+    owner = await resident()
+    building_id = UUID(owner["view"]["building"]["id"])
+    await add_ready_document(app, UUID(owner["id"]), "House rules", [RULE], building_id=building_id)
+    script(
+        simulator,
+        {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
+        THERMOSTAT_21,
+        {
+            "claims": [
+                {"statement": "Quiet starts at 22:00.", "source": "P1", "quote": "start at 22:00"},
+                {
+                    "statement": "It is set to 21 °C.",
+                    "source": "T1",
+                    "quote": "target set to 21 °C",
+                },
+            ]
+        },
+    )
+    body = (await send(client, owner)).json()
+
+    assert (body["status"], body["answer"]) == ("answered", f"Quiet starts at 22:00. {FACT_21}")
+    # Tool facts are not documents: only the passage is cited.
+    assert [citation["quotes"] for citation in body["citations"]] == [["start at 22:00"]]
+
+
 async def test_unverified_reply_after_a_write_is_incomplete(
     app: FastAPI, client, resident, simulator
 ):
@@ -739,10 +925,11 @@ async def test_empty_reply_after_a_write_is_incomplete(app: FastAPI, client, res
 @pytest.mark.parametrize(
     "claim",
     [
-        {"statement": "Done.", "source": "tool", "quote": "some quoted words"},
+        {"statement": "Done.", "source": "tool", "quote": ""},
+        {"statement": "Done.", "source": "T1", "quote": ""},
         {"statement": "Quiet hours start at 22:00.", "source": "P1", "quote": ""},
     ],
-    ids=["tool-claim-with-quote", "passage-claim-without-quote"],
+    ids=["retired-tool-source", "tool-claim-without-quote", "passage-claim-without-quote"],
 )
 async def test_claim_quote_must_fit_its_source(app: FastAPI, client, resident, simulator, claim):
     owner = await resident()
