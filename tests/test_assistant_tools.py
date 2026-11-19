@@ -17,7 +17,7 @@ from app.assistant.residence import load_resident
 from app.assistant.tools import ToolContext, execute
 from app.config import Settings
 from app.models import AssistantToolCall, AssistantTurn, Device, Membership, PendingAction, Ticket
-from tests.support.assistant import SIMULATOR, add_ready_document, demo_residence, serve
+from tests.support.assistant import SIMULATOR, TOTP_KEY, add_ready_document, demo_residence, serve
 
 LIVING_ROOM = "Living room thermostat"
 FRONT_DOOR = "Front door"
@@ -35,6 +35,7 @@ async def simulator():
 def settings(monkeypatch, simulator) -> Settings:
     monkeypatch.setenv("OPENAI_BASE_URL", simulator + "/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-never-external")
+    monkeypatch.setenv("ASSISTANT_TOTP_KEY", TOTP_KEY)
     return Settings(
         ai_enabled=True, rag_enabled=True, assistant_enabled=True, assistant_demo_enabled=True
     )

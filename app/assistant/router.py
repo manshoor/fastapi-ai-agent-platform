@@ -4,9 +4,19 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.assistant import step_up, totp
 from app.assistant.actions import confirm_action
 from app.assistant.config import AssistantSettings
-from app.assistant.contracts import ConfirmResponse, MessageRequest, ResidenceView, TurnResponse
+from app.assistant.contracts import (
+    CodeRequest,
+    ConfirmResponse,
+    MessageRequest,
+    PasswordRequest,
+    ResidenceView,
+    TotpEnrollment,
+    TotpStatus,
+    TurnResponse,
+)
 from app.assistant.residence import Resident, create_demo_residence, load_resident, residence_view
 from app.assistant.runtime import AssistantRuntime
 from app.assistant.turns import run_turn
@@ -73,18 +83,67 @@ async def create_demo(
 
 
 @router.post(
+    "/assistant/totp/enroll",
+    response_model=TotpEnrollment,
+    status_code=201,
+    responses={403: {}, 409: {}, 429: {}, 503: {}},
+)
+async def enroll_totp(
+    payload: PasswordRequest,
+    request: Request,
+    response: Response,
+    owner_id: Owner,
+    session: Session,
+) -> TotpEnrollment:
+    settings = _settings(request)
+    response.headers["Cache-Control"] = "no-store"
+    runtime: AssistantRuntime = request.app.state.assistant
+    email = await step_up.check_password(
+        session, request.app.state.passwords, request.app.state.settings, owner_id, payload.password
+    )
+    secret = await step_up.enroll(session, runtime.secret_box, owner_id)
+    return TotpEnrollment(
+        secret=totp.encode_secret(secret),
+        otpauth_uri=totp.provisioning_uri(secret, email, settings.assistant_totp_issuer),
+    )
+
+
+@router.post(
+    "/assistant/totp/activate",
+    response_model=TotpStatus,
+    responses={403: {}, 409: {}, 429: {}, 503: {}},
+)
+async def activate_totp(
+    payload: CodeRequest, request: Request, response: Response, owner_id: Owner, session: Session
+) -> TotpStatus:
+    settings = _settings(request)
+    response.headers["Cache-Control"] = "no-store"
+    runtime: AssistantRuntime = request.app.state.assistant
+    await step_up.activate(session, runtime.secret_box, settings, owner_id, payload.code)
+    return TotpStatus(enabled=True)
+
+
+@router.post(
     "/assistant/actions/{action_id}/confirm",
     response_model=ConfirmResponse,
-    responses={403: {}, 404: {}, 409: {}, 503: {}},
+    responses={403: {}, 404: {}, 409: {}, 429: {}, 503: {}},
 )
 async def confirm(
-    request: Request, response: Response, action_id: UUID, owner_id: Owner, session: Session
+    payload: CodeRequest,
+    request: Request,
+    response: Response,
+    action_id: UUID,
+    owner_id: Owner,
+    session: Session,
 ) -> ConfirmResponse:
-    _settings(request)
+    settings = _settings(request)
     response.headers["Cache-Control"] = "no-store"
+    runtime: AssistantRuntime = request.app.state.assistant
     telemetry = request.app.state.telemetry
     with telemetry.span("assistant.confirm", action_id=str(action_id)):
         resident = await _resident(session, owner_id)
+        # The code is spent and committed first: a 404 or 409 below cannot reuse it.
+        await step_up.verify(session, runtime.secret_box, settings, resident, payload.code)
         return await confirm_action(session, resident, action_id)
 
 

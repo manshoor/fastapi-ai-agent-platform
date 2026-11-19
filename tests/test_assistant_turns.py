@@ -24,7 +24,7 @@ from app.assistant.residence import load_resident
 from app.assistant.turns import INCOMPLETE_ANSWER, NO_CONTEXT_ANSWER, run_turn
 from app.config import Settings
 from app.models import AssistantToolCall, AssistantTurn, Device
-from tests.support.assistant import SIMULATOR, add_ready_document, demo_residence, serve
+from tests.support.assistant import SIMULATOR, TOTP_KEY, add_ready_document, demo_residence, serve
 
 URL = "/api/v1/assistant/messages"
 TURN_LIMIT = 3
@@ -59,6 +59,7 @@ def settings(monkeypatch, simulator) -> Settings:
     for name, value in {
         "OPENAI_BASE_URL": base_url + "/v1",
         "OPENAI_API_KEY": "synthetic-key-never-external",
+        "ASSISTANT_TOTP_KEY": TOTP_KEY,
         "AI_PROVIDER_TIMEOUT_SECONDS": 1,
         "AI_EMBEDDING_TIMEOUT_SECONDS": 1,
         "ASSISTANT_TURN_LIMIT": TURN_LIMIT,

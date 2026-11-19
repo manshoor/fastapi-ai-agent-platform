@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from app.ai.provider import OpenAIAgentModel
 from app.assistant.config import AssistantSettings
 from app.assistant.graph import build_graph
+from app.assistant.step_up import SecretBox
 from app.rag.runtime import RAGRuntime
 from app.telemetry import Telemetry
 
@@ -24,6 +25,8 @@ class AssistantRuntime:
         self.embedder = rag.embedder
         self.model = OpenAIAgentModel(settings, telemetry, client=rag.embedder.client)
         self.graph = build_graph(settings)
+        # Seals and opens authenticator secrets for unlock step-up.
+        self.secret_box = SecretBox.from_settings(settings)
 
     @asynccontextmanager
     async def turn_slot(self, user_id: UUID) -> AsyncIterator[None]:

@@ -10,6 +10,7 @@ the load automatically.
 """
 
 import argparse
+import base64
 import csv
 import json
 import os
@@ -159,6 +160,7 @@ def main() -> int:
         handle.write(
             f"BENCH_POSTGRES_PASSWORD={secrets.token_hex(24)}\n"
             f"BENCH_JWT_SECRET={secrets.token_hex(32)}\n"
+            f"BENCH_ASSISTANT_TOTP_KEY={base64.b64encode(secrets.token_bytes(32)).decode()}\n"
             f"BENCH_UID={os.getuid()}\nBENCH_GID={os.getgid()}\n"
             f"BENCH_ARTIFACTS='{output}'\n"
         )

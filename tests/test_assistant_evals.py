@@ -13,7 +13,7 @@ import pytest
 from fastapi import FastAPI
 
 from app.config import Settings
-from tests.support.assistant import SIMULATOR, add_ready_document, demo_residence, serve
+from tests.support.assistant import SIMULATOR, TOTP_KEY, add_ready_document, demo_residence, serve
 from tests.support.assistant_evals import CATEGORIES, CHECKS, load_cases, load_documents, score
 
 URL = "/api/v1/assistant/messages"
@@ -37,6 +37,7 @@ def settings(monkeypatch, simulator) -> Settings:
     _, base_url = simulator
     monkeypatch.setenv("OPENAI_BASE_URL", base_url + "/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-never-external")
+    monkeypatch.setenv("ASSISTANT_TOTP_KEY", TOTP_KEY)
     return Settings(
         ai_enabled=True, rag_enabled=True, assistant_enabled=True, assistant_demo_enabled=True
     )

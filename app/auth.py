@@ -14,6 +14,7 @@ from app.db import get_session
 from app.models import User
 from app.schemas import RegisterRequest, TokenResponse, UserResponse
 from app.security import PasswordService, create_access_token
+from app.throttle import FailureKind, add_failure, check_failures
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 Session = Annotated[AsyncSession, Depends(get_session)]
@@ -70,19 +71,34 @@ async def login(
         select(User.id, User.password_hash).where(User.email == str(credentials.email))
     )
     user = result.one_or_none()
+    settings: Settings = request.app.state.settings
+    if user is not None:
+        # 429 before Argon2 runs, so a throttled account costs no hashing. Unknown emails
+        # are never counted: nobody can fill the counter of an account that does not exist.
+        await check_failures(
+            session,
+            user.id,
+            FailureKind.PASSWORD,
+            settings.auth_password_failure_limit,
+            settings.auth_password_failure_window_seconds,
+        )
     # Neither the real nor the dummy verification holds an open transaction.
     await session.rollback()
 
     passwords: PasswordService = request.app.state.passwords
     password_hash = user.password_hash if user is not None else passwords.dummy_hash
     verified = await passwords.verify(credentials.password, password_hash)
+    if user is not None and not verified:
+        await add_failure(
+            session, user.id, FailureKind.PASSWORD, settings.auth_password_failure_window_seconds
+        )
+        await session.commit()
     if not verified or user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    settings: Settings = request.app.state.settings
     return TokenResponse(
         access_token=create_access_token(user.id, settings),
         token_type="bearer",

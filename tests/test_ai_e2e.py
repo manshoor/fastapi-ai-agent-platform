@@ -6,6 +6,7 @@ Never run this suite concurrently with the explicit live-HTTP smoke profile.
 """
 
 import asyncio
+import base64
 import json
 import os
 from pathlib import Path
@@ -384,20 +385,101 @@ def test_private_ai_environment_preserves_normal_credentials(tmp_path, monkeypat
     monkeypatch.chdir(tmp_path)
     normal = tmp_path / ".env"
     normal.write_bytes(b"unrelated-normal-credentials\n")
-    assert initialize(Path(".ai-local"), 8002)
+    assert initialize(Path(".ai-local"), 8002) == "created"
     private = tmp_path / ".ai-local"
     env = private / ".env"
     assert stat.S_IMODE(private.stat().st_mode) == 0o700
     assert stat.S_IMODE((private / "artifacts").stat().st_mode) == 0o700
     assert stat.S_IMODE(env.stat().st_mode) == 0o600
     before = env.read_bytes()
-    assert not initialize(Path(".ai-local"), 8002)
+    assert initialize(Path(".ai-local"), 8002) == "unchanged"
     assert env.read_bytes() == before
     assert normal.read_bytes() == b"unrelated-normal-credentials\n"
     values = dict(line.split("=", 1) for line in before.decode().splitlines() if "=" in line)
     assert len(values["AI_DB_PASSWORD"]) == 64
     assert len(values["AI_JWT_SECRET"]) == 96
     assert values["AI_DB_PASSWORD"] != values["AI_JWT_SECRET"]
+    assert len(base64.b64decode(values["AI_ASSISTANT_TOTP_KEY"], validate=True)) == 32
+
+
+@pytest.mark.parametrize("ending", ["\n", ""], ids=["newline", "no-newline"])
+def test_private_ai_environment_gains_only_a_missing_totp_key(tmp_path, monkeypatch, ending):
+    import runpy
+    import stat
+
+    initialize = runpy.run_path(str(ROOT / "scripts/init_ai_env.py"))["initialize"]
+    monkeypatch.chdir(tmp_path)
+    private = tmp_path / ".ai-local"
+    private.mkdir(mode=0o700)
+    env = private / ".env"
+    before = f"# made before step-up\nAI_DB_PASSWORD=kept\nAI_JWT_SECRET=kept{ending}".encode()
+    env.write_bytes(before)
+    env.chmod(0o600)
+
+    assert initialize(Path(".ai-local"), 8002) == "key_added"
+    after = env.read_bytes()
+    assert after.startswith(before)
+    added = after[len(before) :].decode()
+    assert added.startswith("AI_ASSISTANT_TOTP_KEY=" if ending else "\nAI_ASSISTANT_TOTP_KEY=")
+    assert added.endswith("\n") and added.count("\n") == (1 if ending else 2)
+    key = added.strip().split("=", 1)[1]
+    assert len(base64.b64decode(key, validate=True)) == 32
+    assert stat.S_IMODE(env.stat().st_mode) == 0o600
+
+    assert initialize(Path(".ai-local"), 8002) == "unchanged"
+    assert env.read_bytes() == after
+
+
+TOTP_KEY_LINE = "AI_ASSISTANT_TOTP_KEY=" + base64.b64encode(bytes(range(32))).decode()
+
+
+def _private_env(tmp_path, content: bytes) -> Path:
+    private = tmp_path / ".ai-local"
+    private.mkdir(mode=0o700)
+    env = private / ".env"
+    env.write_bytes(content)
+    env.chmod(0o600)
+    return env
+
+
+@pytest.mark.parametrize(
+    "line",
+    [f"export {TOTP_KEY_LINE}", f"  {TOTP_KEY_LINE}", TOTP_KEY_LINE.replace("=", '="', 1) + '"'],
+    ids=["export", "indented", "quoted"],
+)
+def test_private_ai_environment_keeps_a_totp_key_in_any_dotenv_form(tmp_path, monkeypatch, line):
+    import runpy
+
+    initialize = runpy.run_path(str(ROOT / "scripts/init_ai_env.py"))["initialize"]
+    monkeypatch.chdir(tmp_path)
+    env = _private_env(tmp_path, f"AI_DB_PASSWORD=kept\n{line}\n".encode())
+    before = env.read_bytes()
+
+    assert initialize(Path(".ai-local"), 8002) == "unchanged"
+    assert env.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"AI_ASSISTANT_TOTP_KEY=\n",
+        b"AI_ASSISTANT_TOTP_KEY=dGVzdA==\n",
+        f"{TOTP_KEY_LINE}\n{TOTP_KEY_LINE}\n".encode(),
+        b"AI_DB_PASSWORD=\xff\n",
+    ],
+    ids=["empty", "too-short", "twice", "not-utf8"],
+)
+def test_private_ai_environment_reports_a_totp_key_it_cannot_use(tmp_path, monkeypatch, content):
+    # Compose would fail or pick one key; rerunning must not claim "unchanged" or append.
+    import runpy
+
+    script = runpy.run_path(str(ROOT / "scripts/init_ai_env.py"))
+    monkeypatch.chdir(tmp_path)
+    env = _private_env(tmp_path, content)
+
+    with pytest.raises(script["EnvKeyError"]):
+        script["initialize"](Path(".ai-local"), 8002)
+    assert env.read_bytes() == content
 
 
 @pytest.mark.parametrize(

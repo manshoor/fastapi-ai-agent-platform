@@ -9,16 +9,19 @@ from fastapi import FastAPI
 from sqlalchemy import func, insert, update
 from sqlalchemy.exc import IntegrityError
 
+from app.assistant.contracts import ResultCode
 from app.models import (
     Apartment,
     AssistantToolCall,
     AssistantTurn,
+    AuthFailure,
     Booking,
     Building,
     Device,
     Membership,
     PendingAction,
     Ticket,
+    TotpCredential,
 )
 
 
@@ -325,3 +328,41 @@ async def test_claim_failure_names_a_refused_turn(app: FastAPI, account, values,
         await write(app, statement)
         return
     await rejected(app, statement, "ck_assistant_turns_claim_failure")
+
+
+async def test_every_result_code_fits_the_audit_check(app: FastAPI, account):
+    user = UUID((await account())["id"])
+    for code in ResultCode:
+        await write(
+            app,
+            insert(AssistantToolCall).values(
+                user_id=user,
+                source="confirmation",
+                tool="unlock_door",
+                decision="denied",
+                result_code=code,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("values", "constraint"),
+    [
+        ({"nonce": bytes(11)}, "ck_totp_credentials_nonce"),
+        ({"secret_ciphertext": bytes(16)}, "ck_totp_credentials_secret"),
+        ({"enabled_at": func.now()}, "ck_totp_credentials_enabled"),
+        ({"last_used_step": 1}, "ck_totp_credentials_enabled"),
+    ],
+    ids=["nonce", "short-secret", "enabled-without-step", "step-without-enabled"],
+)
+async def test_totp_credentials_reject_malformed_rows(app: FastAPI, account, values, constraint):
+    user = UUID((await account())["id"])
+    row = {"user_id": user, "nonce": bytes(12), "secret_ciphertext": bytes(36), **values}
+    await rejected(app, insert(TotpCredential).values(**row), constraint)
+
+
+async def test_auth_failures_hold_known_kinds_only(app: FastAPI, account):
+    user = UUID((await account())["id"])
+    await rejected(
+        app, insert(AuthFailure).values(user_id=user, kind="sms"), "ck_auth_failures_kind"
+    )
