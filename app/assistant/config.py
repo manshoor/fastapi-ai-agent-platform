@@ -12,7 +12,8 @@ class AssistantSettings(RAGSettings):
     # Turn admission.
     assistant_turn_limit: int = Field(default=10, ge=1, le=10_000)
     assistant_turn_window_seconds: float = Field(default=60, gt=0, le=86400)
-    assistant_concurrency: int = Field(default=4, ge=1, le=64)
+    # Turns hold no database connection while they wait on the provider.
+    assistant_concurrency: int = Field(default=64, ge=1, le=256)
     assistant_max_model_calls: int = Field(default=4, ge=2, le=8)
     assistant_turn_deadline_seconds: float = Field(default=120, gt=0, le=300)
 

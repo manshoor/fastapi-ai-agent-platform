@@ -2,16 +2,20 @@
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import timedelta
 from uuid import UUID
 
 import httpx
 import pytest
+from asgi_lifespan import LifespanManager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tracers.langchain import wait_for_all_tracers
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 import app.assistant.tools as tools
@@ -316,6 +320,8 @@ async def test_turn_limit_admits_exactly_n(app: FastAPI, client, resident, simul
     limited = await send(client, owner, "hello")
 
     assert limited.status_code == 429
+    # The window count refused it, not the running-turn lease.
+    assert limited.json()["detail"] == "Turn limit reached"
     assert int(limited.headers["retry-after"]) >= 1
     assert len(await turns(app)) == TURN_LIMIT
 
@@ -334,6 +340,154 @@ async def test_one_running_turn_per_user(app: FastAPI, client, resident, simulat
 
     assert second.status_code == 429
     assert len(await turns(app)) == 1
+
+
+@asynccontextmanager
+async def other_process(
+    monkeypatch, **env: object
+) -> AsyncIterator[tuple[FastAPI, httpx.AsyncClient]]:
+    """A second app instance with its own pool and in-memory state, as another API process."""
+    from app.main import create_app
+
+    for name, value in env.items():
+        monkeypatch.setenv(name, str(value))
+    other = create_app(
+        Settings(
+            ai_enabled=True, rag_enabled=True, assistant_enabled=True, assistant_demo_enabled=True
+        )
+    )
+    transport = httpx.ASGITransport(app=other)
+    async with (
+        LifespanManager(other),
+        httpx.AsyncClient(transport=transport, base_url="http://test") as other_client,
+    ):
+        yield other, other_client
+
+
+# A held provider call must outlast the test's checks, not the one-second test timeout.
+PATIENT = {"AI_PROVIDER_TIMEOUT_SECONDS": 10, "AI_LEASE_SECONDS": 20}
+
+
+async def wait_in_flight(simulator, count: int) -> None:
+    state, _ = simulator
+    async with asyncio.timeout(10):
+        while state.in_flight < count:
+            await asyncio.sleep(0.01)
+
+
+async def test_running_turn_blocks_the_user_in_another_process(
+    app: FastAPI, client, resident, simulator, monkeypatch
+):
+    """Each process has its own in-memory set; the admitted turn row decides across them."""
+    owner = await resident()
+    script(simulator, modes=["hold"])
+    state, _ = simulator
+    async with other_process(monkeypatch, **PATIENT) as (_, other_client):
+        first = asyncio.create_task(send(other_client, owner, "hello"))
+        await wait_in_flight(simulator, 1)
+        second = await send(client, owner, "hello")
+        state.release.set()
+        assert (await first).status_code == 200
+
+    assert second.status_code == 429
+    assert second.json()["detail"] == "A turn is already running"
+    assert int(second.headers["retry-after"]) >= 1
+    assert len(await turns(app)) == 1
+
+
+@pytest.mark.parametrize(
+    ("age_past_lease", "status_code", "detail"),
+    [(-5, 429, "A turn is already running"), (1, 200, None)],
+)
+async def test_admitted_turn_blocks_only_within_its_lease(
+    app: FastAPI, client, resident, simulator, age_past_lease, status_code, detail
+):
+    """A process that died mid-turn leaves an admitted row; past the lease it stops counting."""
+    owner = await resident()
+    lease = turns_module._running_lease(app.state.assistant_settings)
+    async with app.state.session_factory() as session:
+        session.add(
+            AssistantTurn(
+                user_id=UUID(owner["id"]),
+                model="m",
+                prompt_version="p",
+                created_at=func.clock_timestamp() - timedelta(seconds=lease + age_past_lease),
+            )
+        )
+        await session.commit()
+    response = await send(client, owner, "hello")
+
+    assert response.status_code == status_code
+    assert response.json().get("detail") == detail
+
+
+async def test_failed_turn_does_not_block_the_next(app: FastAPI, client, resident, simulator):
+    """A finished turn, failed or not, leaves no admitted row to hold the lease."""
+    owner = await resident()
+    script(simulator, modes=["server_error"])
+
+    assert (await send(client, owner, "hello")).status_code == 502
+    assert (await send(client, owner, "hello")).status_code == 200
+
+
+async def test_turns_hold_no_connection_while_the_provider_works(
+    resident, simulator, settings, monkeypatch
+):
+    """More turns than pool connections wait on the provider at once, holding none."""
+    owners = [await resident() for _ in range(settings.db_pool_size + 2)]
+    script(simulator, modes=["hold"] * len(owners))
+    state, _ = simulator
+    async with other_process(monkeypatch, **PATIENT) as (busy, busy_client):
+        sent = [asyncio.create_task(send(busy_client, owner, "hello")) for owner in owners]
+        await wait_in_flight(simulator, len(owners))
+        checked_out = busy.state.engine.pool.checkedout()
+        state.release.set()
+        responses = await asyncio.gather(*sent)
+
+    assert checked_out == 0
+    assert [response.status_code for response in responses] == [200] * len(owners)
+
+
+async def test_failure_after_the_admit_commit_releases_the_lease(
+    app: FastAPI, client, resident, simulator, monkeypatch
+):
+    """A reply lost after the admit commit must not leave a row that blocks its user."""
+    owner = await resident()
+    admit = turns_module._admit
+
+    async def lost_reply(*args, **kwargs):
+        await admit(*args, **kwargs)
+        raise PoolTimeoutError("synthetic lost reply")
+
+    monkeypatch.setattr(turns_module, "_admit", lost_reply)
+    response = await send(client, owner, "hello")
+    monkeypatch.setattr(turns_module, "_admit", admit)
+
+    assert response.status_code == 503
+    (row,) = await turns(app)
+    assert (row.status, row.error_code) == ("failed", "database_unavailable")
+    assert (await send(client, owner, "hello")).status_code == 200
+
+
+async def test_admission_time_counts_against_the_turn_deadline(resident, simulator, monkeypatch):
+    """The deadline starts before admission, so a turn always ends inside its lease."""
+    owner = await resident()
+    admit = turns_module._admit
+
+    async def slow_admit(*args, **kwargs):
+        await asyncio.sleep(3)
+        return await admit(*args, **kwargs)
+
+    monkeypatch.setattr(turns_module, "_admit", slow_admit)
+    # 3.5 s: the shortest deadline the one-second test timeouts allow. After a 3 s admission
+    # less than one provider timeout is left, so no model call may start.
+    async with other_process(monkeypatch, ASSISTANT_TURN_DEADLINE_SECONDS=3.5) as (short, other):
+        response = await send(other, owner, "hello")
+        async with short.state.session_factory() as session:
+            row = await session.scalar(select(AssistantTurn))
+
+    assert response.status_code == 504
+    assert (row.status, row.error_code, row.model_calls) == ("failed", "turn_budget", 0)
 
 
 async def test_cancelled_turn_is_recorded(app: FastAPI, resident, simulator):

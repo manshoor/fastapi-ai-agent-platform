@@ -27,7 +27,8 @@ class AssistantRuntime:
 
     @asynccontextmanager
     async def turn_slot(self, user_id: UUID) -> AsyncIterator[None]:
-        # One running turn per user, and never queue: shed load at once.
+        # Never queue: shed load at once. This set only catches a second turn in the
+        # same process early; the admitted turn row decides across processes.
         if user_id in self._running:
             raise HTTPException(429, "A turn is already running", headers={"Retry-After": "1"})
         if self._slots.locked():

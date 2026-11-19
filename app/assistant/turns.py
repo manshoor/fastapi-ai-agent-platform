@@ -1,7 +1,7 @@
 """One assistant turn: admit, run the agent graph, ground the reply, record usage.
 
-    turn slot (one per user, bounded per process)
-      -> admit: per-user lock, window count, turn row
+    turn slot (bounded per process; quick same-process duplicate check)
+      -> admit: per-user lock, running-turn lease, window count, turn row
       -> resident context (devices) read, transaction released
       -> graph under deadline backstop, LangSmith tracing off
       -> claim checks -> usage row -> TurnResponse
@@ -27,12 +27,13 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from langsmith import tracing_context
-from sqlalchemy import func, select, text, update
+from sqlalchemy import exists, func, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.ai.contracts import TOOL_SOURCE, AssistantClaim, Claim
 from app.ai.processing import SessionFactory
 from app.ai.provider import ASSISTANT_PROMPT_VERSION, ProviderFailure
+from app.assistant.config import AssistantSettings
 from app.assistant.contracts import (
     GROUNDING_RESULTS,
     ActionResult,
@@ -56,6 +57,9 @@ SNIPPET_CHARACTERS = 300
 # The graph's own budget fires first; this bounds a stuck dependency, with room for one
 # write (pool checkout plus a few statements at the two-second statement timeout).
 BACKSTOP_SECONDS = 15
+# Room after the backstop for the final usage write. An admitted row older than
+# the lease belongs to a process that died mid-turn and no longer blocks its user.
+RUNNING_TURN_GRACE_SECONDS = 15
 NO_CONTEXT_ANSWER = "I could not find that in your building's documents."
 INCOMPLETE_ANSWER = "I could not finish. The completed steps are listed."
 WRITE_TOOLS = frozenset(
@@ -80,22 +84,44 @@ def _http_error(code: str) -> HTTPException:
     return HTTPException(502, "Assistant provider failed")
 
 
-async def _admit(session_factory: SessionFactory, runtime: AssistantRuntime, user_id: UUID):
+def _running_lease(settings: AssistantSettings) -> float:
+    return settings.assistant_turn_deadline_seconds + BACKSTOP_SECONDS + RUNNING_TURN_GRACE_SECONDS
+
+
+async def _admit(
+    session_factory: SessionFactory, runtime: AssistantRuntime, user_id: UUID, turn_id: UUID
+) -> None:
     settings = runtime.settings
+    # statement_timestamp() is stable, so the (user_id, created_at) index can bound the
+    # range; the volatile clock_timestamp() would leave it a filter over every user row.
+    now = func.statement_timestamp()
     async with session_factory() as session:
         async with session.begin():
             await session.execute(
                 text("SELECT pg_advisory_xact_lock(:namespace, hashtext(:user))"),
                 {"namespace": _TURN_LOCK_NAMESPACE, "user": str(user_id)},
             )
+            # One running turn per user across processes: under the lock, an admitted
+            # row inside its lease is a turn still running somewhere.
+            running = await session.scalar(
+                select(
+                    exists().where(
+                        AssistantTurn.user_id == user_id,
+                        AssistantTurn.status == "admitted",
+                        AssistantTurn.created_at
+                        > now - timedelta(seconds=_running_lease(settings)),
+                    )
+                )
+            )
+            if running:
+                raise HTTPException(429, "A turn is already running", headers={"Retry-After": "1"})
             recent = await session.scalar(
                 select(func.count())
                 .select_from(AssistantTurn)
                 .where(
                     AssistantTurn.user_id == user_id,
                     AssistantTurn.created_at
-                    > func.clock_timestamp()
-                    - timedelta(seconds=settings.assistant_turn_window_seconds),
+                    > now - timedelta(seconds=settings.assistant_turn_window_seconds),
                 )
             )
             if recent >= settings.assistant_turn_limit:
@@ -103,7 +129,6 @@ async def _admit(session_factory: SessionFactory, runtime: AssistantRuntime, use
                 raise HTTPException(
                     429, "Turn limit reached", headers={"Retry-After": str(retry_after)}
                 )
-            turn_id = uuid4()
             session.add(
                 AssistantTurn(
                     id=turn_id,
@@ -113,7 +138,6 @@ async def _admit(session_factory: SessionFactory, runtime: AssistantRuntime, use
                     created_at=func.clock_timestamp(),
                 )
             )
-    return turn_id
 
 
 async def _resident_context(session_factory: SessionFactory, resident: Resident) -> dict:
@@ -292,9 +316,7 @@ async def _run_graph(runtime: AssistantRuntime, run: TurnRun) -> None:
         "recursion_limit": recursion_limit(settings),
     }
     try:
-        async with asyncio.timeout(
-            settings.assistant_turn_deadline_seconds + BACKSTOP_SECONDS
-        ) as scope:
+        async with asyncio.timeout(run.remaining() + BACKSTOP_SECONDS) as scope:
             with tracing_context(enabled=False):
                 await runtime.graph.ainvoke({"route": "model"}, config=config)
     except TimeoutError:
@@ -362,18 +384,47 @@ async def run_turn(
 ) -> TurnResponse:
     settings = runtime.settings
     async with runtime.turn_slot(resident.user_id):
-        turn_id = await _admit(session_factory, runtime, resident.user_id)
+        # The deadline starts before admission, so a turn always ends inside its lease
+        # however long admission waited for the pool or the per-user lock.
+        started = time.monotonic()
+        turn_id = uuid4()
+        await _admit_turn(session_factory, runtime, resident.user_id, turn_id)
         with runtime.telemetry.span(
             "assistant.turn",
             turn_id=str(turn_id),
             model=settings.ai_model,
             prompt_version=ASSISTANT_PROMPT_VERSION,
         ):
-            started = time.monotonic()
             try:
-                return await _turn(session_factory, runtime, resident, message, turn_id)
+                return await _turn(session_factory, runtime, resident, message, turn_id, started)
             finally:
                 runtime.telemetry.observe("assistant.turn.duration", time.monotonic() - started)
+
+
+def _failure_code(exc: BaseException) -> str:
+    # Database outages include builtin connect timeouts; anything else is a bug.
+    if isinstance(exc, asyncio.CancelledError):
+        return CANCELLED_CODE
+    if isinstance(exc, (SQLAlchemyError, OSError, TimeoutError)):
+        return DATABASE_CODE
+    return "internal_error"
+
+
+async def _admit_turn(
+    session_factory: SessionFactory, runtime: AssistantRuntime, user_id: UUID, turn_id: UUID
+) -> None:
+    """Admit the turn; if admission fails, never leave its row holding the lease."""
+    try:
+        await _admit(session_factory, runtime, user_id, turn_id)
+    except HTTPException:
+        raise
+    except (Exception, asyncio.CancelledError) as exc:
+        # The insert may have committed although its reply was lost. Finishing the row
+        # is a no-op when it never landed.
+        await _record(
+            runtime.telemetry, session_factory, turn_id, "failed", None, _failure_code(exc)
+        )
+        raise
 
 
 async def _turn(
@@ -382,6 +433,7 @@ async def _turn(
     resident: Resident,
     message: str,
     turn_id: UUID,
+    started: float,
 ) -> TurnResponse:
     settings = runtime.settings
     run: TurnRun | None = None
@@ -397,7 +449,7 @@ async def _turn(
                 telemetry=runtime.telemetry,
             ),
             model=runtime.model,
-            deadline=time.monotonic() + settings.assistant_turn_deadline_seconds,
+            deadline=started + settings.assistant_turn_deadline_seconds,
             items=[first_input(context, message)],
         )
         return await _finish(session_factory, runtime, turn_id, run)
@@ -408,8 +460,7 @@ async def _turn(
         raise
     except Exception as exc:
         # Database outages (including builtin connect timeouts) and programming errors.
-        database = isinstance(exc, (SQLAlchemyError, OSError, TimeoutError))
-        code = DATABASE_CODE if database else "internal_error"
+        code = _failure_code(exc)
         # Type only: exception text may carry content.
         logger.error("Assistant turn failure exception=%s", type(exc).__name__)
         if run is not None and _committed(run.actions):

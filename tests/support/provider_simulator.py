@@ -25,6 +25,8 @@ MODES = frozenset(
         "invalid",
         "incomplete",
         "timeout",
+        # Wait until the test sets `release`, then answer as success.
+        "hold",
         "rate_limit",
         "server_error",
         # RAG answers: no claims, a quote absent from the passage, a number absent from it.
@@ -317,6 +319,8 @@ class SimulatorState:
     in_flight: int = 0
     counts: Counter = field(default_factory=Counter)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Opens every "hold" call; tests set it once their checks ran.
+    release: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 async def bounded_json(request: Request, limit: int = 65536) -> dict | None:
@@ -411,6 +415,8 @@ def create_app() -> FastAPI:
     async def fail(mode: str) -> Response | None:
         if mode == "timeout":
             await asyncio.sleep(state.delay_seconds)
+        if mode == "hold":
+            await state.release.wait()
         if mode == "rate_limit":
             return JSONResponse(
                 {
