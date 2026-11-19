@@ -31,6 +31,10 @@ MODES = frozenset(
         "wrong_number",
         # Rerank: keep no passage.
         "unranked",
+        # Verifier: reject the first claim.
+        "unsupported",
+        # A reasoning item precedes the message, as with a reasoning effort above none.
+        "reasoning",
     }
 )
 SUGGESTION = {"title": "Clear synthetic title", "description": "A clear synthetic description."}
@@ -100,6 +104,23 @@ def _schema_properties(request: dict) -> dict:
 
 def wants_claims(request: dict) -> bool:
     return "claims" in _schema_properties(request)
+
+
+def wants_claim_verdicts(request: dict) -> bool:
+    return "verdicts" in _schema_properties(request)
+
+
+def claim_verdicts(request: dict, mode: str) -> dict:
+    """Support every claim label in the request; "unsupported" rejects the first."""
+    try:
+        claims = json.loads(request.get("input", "")).get("claims", [])
+    except (ValueError, AttributeError):
+        claims = []
+    labels = [item.get("label") for item in claims if isinstance(item, dict)]
+    verdicts = [{"claim": label, "supported": True} for label in labels if isinstance(label, str)]
+    if mode == "unsupported" and verdicts:
+        verdicts[0]["supported"] = False
+    return {"verdicts": verdicts}
 
 
 def wants_ranking(request: dict) -> bool:
@@ -471,6 +492,8 @@ def create_app() -> FastAPI:
                 return await agent_response(value, mode)
             if wants_verdict(value):
                 output = {"grounded": True, "answers_question": True}
+            elif wants_claim_verdicts(value):
+                output = claim_verdicts(value, mode)
             elif wants_claims(value):
                 output = quoted_answer(value, mode)
             elif wants_ranking(value):
@@ -504,13 +527,18 @@ def create_app() -> FastAPI:
                     if mode == "incomplete"
                     else None,
                     "output": [
+                        *(
+                            [{"id": f"rs_sim_{uuid4().hex}", "type": "reasoning", "summary": []}]
+                            if mode == "reasoning"
+                            else []
+                        ),
                         {
                             "id": f"msg_sim_{uuid4().hex}",
                             "type": "message",
                             "status": "completed",
                             "role": "assistant",
                             "content": content,
-                        }
+                        },
                     ],
                     "usage": {
                         "input_tokens": 25,

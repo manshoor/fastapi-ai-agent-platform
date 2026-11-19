@@ -22,6 +22,7 @@ from app.ai.provider import (
     OpenAIEmbedder,
     OpenAIReranker,
     OpenAIRewriter,
+    OpenAIVerifier,
     Passage,
     ProviderFailure,
 )
@@ -530,3 +531,79 @@ async def test_section_reaches_the_answer_prompt(simulator):
         await answerer.aclose()
     (_, wire) = captured[0]
     assert json.loads(wire["input"])["passages"][0]["section"] == "A > B"
+
+
+async def test_verifier_wire_contract_and_verdicts(simulator):
+    url, _, captured = simulator
+    verifier = OpenAIVerifier(settings_for(url))
+    try:
+        result = await verifier.verify("How fast?", [("It runs fast.", PASSAGES[0].text)])
+    finally:
+        await verifier.aclose()
+    (_, wire) = captured[0]
+    assert json.loads(wire["input"]) == {
+        "question": "How fast?",
+        "claims": [{"label": "C1", "statement": "It runs fast.", "passage": PASSAGES[0].text}],
+    }
+    assert set(wire["text"]["format"]["schema"]["required"]) == {"verdicts"}
+    assert result.supported == (True,)
+
+
+@pytest.mark.parametrize(
+    "verdicts",
+    [
+        [{"claim": "C1", "supported": True}],
+        [{"claim": "C1", "supported": True}, {"claim": "C1", "supported": False}],
+        [{"claim": "C1", "supported": True}, {"claim": "C3", "supported": True}],
+    ],
+    ids=["missing", "duplicate", "unknown"],
+)
+async def test_verifier_rejects_invalid_verdicts(simulator, verdicts):
+    url, app, _ = simulator
+
+    async def malformed(request: Request):
+        return JSONResponse(answer_body({"verdicts": verdicts}))
+
+    replace_route(app, "/v1/responses", malformed)
+    verifier = OpenAIVerifier(settings_for(url))
+    claims = [("One.", PASSAGES[0].text), ("Two.", PASSAGES[1].text)]
+    try:
+        with pytest.raises(ProviderFailure) as error:
+            await verifier.verify("Question?", claims)
+    finally:
+        await verifier.aclose()
+    assert error.value.code == "provider_invalid_output"
+
+
+@pytest.mark.parametrize(
+    ("effort", "code"),
+    [("none", "provider_invalid_output"), ("low", None)],
+    ids=["no-effort-rejects", "effort-accepts"],
+)
+async def test_reasoning_items_need_an_effort(simulator, effort, code):
+    url, _, captured = simulator
+    await configure(url, "reasoning")
+    answerer = OpenAIAnswerer(settings_for(url))
+    try:
+        if code is None:
+            result = await answerer.answer("How fast?", PASSAGES, effort=effort)
+            assert result.citations == (0,)
+        else:
+            with pytest.raises(ProviderFailure) as error:
+                await answerer.answer("How fast?", PASSAGES, effort=effort)
+            assert error.value.code == code
+    finally:
+        await answerer.aclose()
+    (_, wire) = captured[-1]
+    assert wire["reasoning"] == {"effort": effort}
+
+
+async def test_unknown_effort_never_sends(simulator):
+    url, _, captured = simulator
+    answerer = OpenAIAnswerer(settings_for(url))
+    try:
+        with pytest.raises(ValueError):
+            await answerer.answer("How fast?", PASSAGES, effort="high")
+    finally:
+        await answerer.aclose()
+    assert captured == []

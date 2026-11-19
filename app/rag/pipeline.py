@@ -4,9 +4,11 @@
       no  -> no_context, reason no_chunks (no provider call)
       yes -> LCEL chain: retriever (embed question + owner KNN)
           -> relevance margin -> optional LLM rerank (empty -> no_context, rerank_empty)
-          -> neighbor windows (same owner scope) -> passages -> claims
+          -> neighbor windows (same owner scope) -> passages -> claims (effort setting)
           -> no claims                    -> no_context, reason no_claims
           -> any claim fails its check    -> no_context, reason = that check
+          -> optional verifier call       -> any claim unsupported: no_context,
+                                             reason verifier_rejected
           -> all claims verified          -> answered, citations with their quotes
           -> usage row (summed chat usage, reason, effort) -> 200
 
@@ -38,9 +40,18 @@ from app.ai.provider import (
     Passage,
     ProviderFailure,
     Ranking,
+    Verification,
 )
 from app.models import RAGQuery
-from app.rag.config import RERANK_LLM, RAGSettings, RerankMode, query_deadline_floor
+from app.rag.config import (
+    RERANK_LLM,
+    VERIFIER_ON,
+    RAGSettings,
+    ReasoningEffort,
+    RerankMode,
+    VerifierMode,
+    query_deadline_floor,
+)
 from app.rag.contracts import (
     Citation,
     DiagnosticClaim,
@@ -48,6 +59,7 @@ from app.rag.contracts import (
     DiagnosticsRequest,
     DiagnosticsResponse,
     DiagnosticUsage,
+    DiagnosticVerdict,
     QueryRequest,
     QueryResponse,
 )
@@ -65,13 +77,12 @@ _TIMEOUT_CODES = frozenset({"provider_timeout"})
 DEADLINE_CODE = "query_deadline"
 DATABASE_CODE = "database_unavailable"
 CANCELLED_CODE = "query_cancelled"
-# The answer call runs without reasoning until the effort setting exists.
-_REASONING_EFFORT = "none"
 # No-context reasons decided here; claim check reasons come from app.rag.verification.
 NO_CHUNKS = "no_chunks"
 NO_PASSAGES = "no_passages"
 NO_CLAIMS = "no_claims"
 RERANK_EMPTY = "rerank_empty"
+VERIFIER_REJECTED = "verifier_rejected"
 # Rerank reads up to twice the requested passages, within the prompt's label range.
 MAX_CANDIDATES = 8
 # Diagnostics: a claim that passed, or one after the first failure (never checked).
@@ -86,6 +97,8 @@ class _Options:
     neighbor_chunks: int
     relevance_margin: float | None
     rerank: RerankMode
+    reasoning_effort: ReasoningEffort
+    verifier: VerifierMode
 
     def candidates(self, top_k: int) -> int:
         return min(MAX_CANDIDATES, 2 * top_k) if self.rerank == RERANK_LLM else top_k
@@ -97,6 +110,8 @@ def _options(settings: RAGSettings, request: QueryRequest) -> _Options:
         neighbor_chunks=settings.rag_neighbor_chunks,
         relevance_margin=settings.rag_relevance_margin,
         rerank=settings.rag_rerank,
+        reasoning_effort=settings.rag_answer_reasoning_effort,
+        verifier=settings.rag_verifier,
     )
     if overrides is None:
         return options
@@ -104,6 +119,8 @@ def _options(settings: RAGSettings, request: QueryRequest) -> _Options:
         neighbor_chunks=_pick(overrides.neighbor_chunks, options.neighbor_chunks),
         relevance_margin=_pick(overrides.relevance_margin, options.relevance_margin),
         rerank=_pick(overrides.rerank, options.rerank),
+        reasoning_effort=_pick(overrides.reasoning_effort, options.reasoning_effort),
+        verifier=_pick(overrides.verifier, options.verifier),
     )
 
 
@@ -121,6 +138,8 @@ class _Outcome:
     # The passages sent to the model, in label order (P1 first).
     documents: tuple[Document, ...] = ()
     no_context_reason: str | None = None
+    # Verifier result per claim, in claim order; None when the verifier did not run.
+    verdicts: tuple[bool, ...] | None = None
 
 
 def _add(total: int | None, tokens: int | None) -> int | None:
@@ -142,10 +161,11 @@ class _Usage:
     input_tokens: int | None = None
     output_tokens: int | None = None
     chat_calls: int = 0
+    reasoning_effort: str = "none"
     response_model: str | None = None
     request_id: str | None = None
 
-    def add(self, generation: AnswerGeneration | Ranking) -> None:
+    def add(self, generation: AnswerGeneration | Ranking | Verification) -> None:
         self.chat_calls += 1
         self.input_tokens = _add(self.input_tokens, generation.input_tokens)
         self.output_tokens = _add(self.output_tokens, generation.output_tokens)
@@ -220,7 +240,7 @@ async def _record(
         "chat_calls": usage.chat_calls,
         "response_model": usage.response_model,
         "provider_request_id": usage.request_id,
-        "reasoning_effort": _REASONING_EFFORT,
+        "reasoning_effort": usage.reasoning_effort,
         "no_context_reason": no_context_reason,
         "error_code": error_code,
         "finished_at": func.clock_timestamp(),
@@ -304,7 +324,9 @@ def _build_chain(
                 )
         documents = await retriever.expand(documents, options.neighbor_chunks)
         passages = [_passage(document) for document in documents]
-        generation = await runtime.answerer.answer(inputs["question"], passages)
+        generation = await runtime.answerer.answer(
+            inputs["question"], passages, effort=options.reasoning_effort
+        )
         usage.add(generation)
         sent = tuple(documents)
 
@@ -324,6 +346,29 @@ def _build_chain(
                 sent,
                 no_context_reason=str(failure),
             )
+
+        # The paid verifier runs only on answers that passed the code checks. It fails
+        # closed: a failed call is a 5xx, and any unsupported claim refuses the answer.
+        verdicts = None
+        if options.verifier == VERIFIER_ON:
+            pairs = [
+                (claim.statement, passages[int(claim.citation[1:]) - 1].text)
+                for claim in generation.claims
+            ]
+            verification = await runtime.verifier.verify(inputs["question"], pairs)
+            usage.add(verification)
+            verdicts = verification.supported
+            if not all(verdicts):
+                return _Outcome(
+                    "no_context",
+                    NO_CONTEXT_ANSWER,
+                    [],
+                    len(documents),
+                    generation,
+                    sent,
+                    no_context_reason=VERIFIER_REJECTED,
+                    verdicts=verdicts,
+                )
         return _Outcome(
             "answered",
             generation.answer,
@@ -331,6 +376,7 @@ def _build_chain(
             len(documents),
             generation,
             sent,
+            verdicts=verdicts,
         )
 
     return RunnableParallel(documents=retriever, question=RunnablePassthrough()) | RunnableLambda(
@@ -375,7 +421,7 @@ async def diagnose_query(
     """
     options = _options(runtime.settings, request)
     if runtime.settings.rag_query_deadline_seconds <= query_deadline_floor(
-        runtime.settings, options.rerank
+        runtime.settings, options.rerank, options.verifier
     ):
         raise HTTPException(422, "Overrides do not fit the query deadline")
     result = await _run_query(
@@ -403,15 +449,24 @@ async def diagnose_query(
         no_context_reason=outcome.no_context_reason,
         passages=passages,
         claims=_diagnostic_claims(outcome),
-        verdicts=None,
+        verdicts=_diagnostic_verdicts(outcome),
         usage=DiagnosticUsage(
             embedding_tokens=usage.embedding_tokens,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             chat_calls=usage.chat_calls,
-            reasoning_effort=_REASONING_EFFORT,
+            reasoning_effort=usage.reasoning_effort,
         ),
     )
+
+
+def _diagnostic_verdicts(outcome: _Outcome) -> list[DiagnosticVerdict] | None:
+    if outcome.verdicts is None:
+        return None
+    return [
+        DiagnosticVerdict(claim=f"C{number}", supported=supported)
+        for number, supported in enumerate(outcome.verdicts, start=1)
+    ]
 
 
 def _diagnostic_claims(outcome: _Outcome) -> list[DiagnosticClaim] | None:
@@ -461,7 +516,7 @@ async def _run_query(
                 telemetry=telemetry,
             )
 
-            usage = _Usage()
+            usage = _Usage(reasoning_effort=options.reasoning_effort)
 
             # Every exit after admission closes the usage row, paid or not.
             async def fail(code: str) -> None:

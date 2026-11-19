@@ -715,3 +715,103 @@ async def test_rerank_override_must_fit_the_deadline(app, client, account, setti
     )
     assert response.status_code == 422
     assert await query_rows(app) == []
+
+
+# Reasoning effort and the claim verifier (answer checks for /rag/query only).
+
+
+async def test_verifier_supports_the_answer(app, client, account, settings, simulator, monkeypatch):
+    state, _ = simulator
+    settings.rag_diagnostics_enabled = True
+    room_for_rerank(app, monkeypatch)
+    owner = await account()
+    await add_ready_document(app, UUID(owner["id"]), "Pump manual", PUMP)
+
+    body = await diagnose(client, owner, overrides={"verifier": "on"})
+
+    assert body["status"] == "answered"
+    assert body["verdicts"] == [{"claim": "C1", "supported": True}]
+    # Embedding, answer, verifier.
+    assert (state.calls, body["usage"]["chat_calls"]) == (3, 2)
+    (row,) = await query_rows(app)
+    assert (row.chat_calls, row.input_tokens, row.output_tokens) == (2, 50, 30)
+
+
+async def test_verifier_rejection_is_no_context(
+    app, client, account, settings, simulator, monkeypatch
+):
+    state, _ = simulator
+    settings.rag_diagnostics_enabled = True
+    room_for_rerank(app, monkeypatch)
+    state.modes = ["success", "success", "unsupported"]
+    owner = await account()
+    await add_ready_document(app, UUID(owner["id"]), "Pump manual", PUMP)
+
+    body = await diagnose(client, owner, overrides={"verifier": "on"})
+
+    assert (body["status"], body["answer"], body["citations"]) == (
+        "no_context",
+        NO_CONTEXT_ANSWER,
+        [],
+    )
+    assert body["no_context_reason"] == "verifier_rejected"
+    assert body["verdicts"] == [{"claim": "C1", "supported": False}]
+    (row,) = await query_rows(app)
+    assert (row.no_context_reason, row.chat_calls) == ("verifier_rejected", 2)
+
+
+async def test_verifier_failure_keeps_the_answer_tokens(
+    app, client, account, settings, simulator, monkeypatch
+):
+    state, _ = simulator
+    settings.rag_diagnostics_enabled = True
+    room_for_rerank(app, monkeypatch)
+    state.modes = ["success", "success", "invalid"]
+    owner = await account()
+    await add_ready_document(app, UUID(owner["id"]), "Pump manual", PUMP)
+
+    response = await client.post(
+        DIAGNOSTICS,
+        headers=owner["headers"],
+        json={"question": QUESTION, "overrides": {"verifier": "on"}},
+    )
+
+    # Fails closed; the billed answer call is still recorded.
+    assert response.status_code == 502
+    (row,) = await query_rows(app)
+    assert (row.status, row.error_code) == ("failed", "provider_invalid_output")
+    assert (row.chat_calls, row.input_tokens, row.output_tokens) == (1, 25, 15)
+
+
+async def test_reasoning_effort_is_sent_and_recorded(app, client, account, settings, simulator):
+    state, _ = simulator
+    settings.rag_diagnostics_enabled = True
+    state.modes = ["success", "reasoning"]
+    owner = await account()
+    await add_ready_document(app, UUID(owner["id"]), "Pump manual", PUMP)
+
+    body = await diagnose(client, owner, overrides={"reasoning_effort": "low"})
+
+    assert (body["status"], body["usage"]["reasoning_effort"]) == ("answered", "low")
+    (row,) = await query_rows(app)
+    assert row.reasoning_effort == "low"
+
+
+async def test_verifier_override_must_fit_the_deadline(app, client, account, settings, monkeypatch):
+    settings.rag_diagnostics_enabled = True
+    runtime = app.state.rag
+    provider = runtime.settings.ai_provider_timeout_seconds
+    one_call = runtime.settings.ai_embedding_timeout_seconds + provider
+    monkeypatch.setattr(
+        runtime,
+        "settings",
+        runtime.settings.model_copy(update={"rag_query_deadline_seconds": one_call + provider / 2}),
+    )
+    owner = await account()
+    response = await client.post(
+        DIAGNOSTICS,
+        headers=owner["headers"],
+        json={"question": QUESTION, "overrides": {"verifier": "on"}},
+    )
+    assert response.status_code == 422
+    assert await query_rows(app) == []

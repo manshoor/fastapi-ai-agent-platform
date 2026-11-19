@@ -101,6 +101,8 @@ class DiagnosticOverrides(StrictSchema):
     neighbor_chunks: int | None = Field(default=None, ge=0, le=2, strict=True)
     relevance_margin: float | None = Field(default=None, gt=0, le=2)
     rerank: Literal["off", "llm"] | None = None
+    reasoning_effort: Literal["none", "low", "medium"] | None = None
+    verifier: Literal["off", "on"] | None = None
 
 
 class DiagnosticsRequest(QueryRequest):

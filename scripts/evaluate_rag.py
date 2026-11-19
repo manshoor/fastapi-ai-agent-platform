@@ -21,6 +21,7 @@ Example (isolated AI stack on 8002, after explicit authorization):
 
 Compare answer-context settings in one run (each --config is a name and its overrides):
   ... --config base --config wide=neighbor_chunks:2 --config ranked=rerank:llm
+  ... --config checked=verifier:on --config thinking=reasoning_effort:low
 
 Exit 0 when every run passes, 1 for failed runs, 2 for invalid configuration, failed
 judge controls or failed setup. Prints only case IDs, check names, rates and fixed
@@ -59,19 +60,26 @@ RETRY_LIMIT = 30
 DEFAULT_RETRY_SECONDS = 5
 MAX_RETRY_SECONDS = 120
 RERANK_MODES = frozenset({"off", "llm"})
+REASONING_EFFORTS = frozenset({"none", "low", "medium"})
+VERIFIER_MODES = frozenset({"off", "on"})
 
 
-def _rerank(value: str) -> str:
-    if value not in RERANK_MODES:
-        raise ValueError("Unknown rerank mode")
-    return value
+def _one_of(values: frozenset[str]) -> Callable[[str], str]:
+    def parse(value: str) -> str:
+        if value not in values:
+            raise ValueError("Unknown override value")
+        return value
+
+    return parse
 
 
 # Server settings a configuration may override (the diagnostics route's `overrides`).
 OVERRIDES: dict[str, Callable[[str], object]] = {
     "neighbor_chunks": int,
     "relevance_margin": float,
-    "rerank": _rerank,
+    "rerank": _one_of(RERANK_MODES),
+    "reasoning_effort": _one_of(REASONING_EFFORTS),
+    "verifier": _one_of(VERIFIER_MODES),
 }
 _NAME = re.compile(r"[a-z0-9-]{1,32}\Z")
 

@@ -59,6 +59,20 @@ class PassageRanking(StrictSchema):
     passages: list[PassageLabel] = Field(max_length=8)
 
 
+ClaimLabel = Annotated[str, StringConstraints(pattern=r"^C[1-8]$")]
+
+
+class ClaimVerdict(StrictSchema):
+    claim: ClaimLabel
+    supported: bool
+
+
+class ClaimVerdicts(StrictSchema):
+    """Verifier output: one verdict per claim label, each claim exactly once."""
+
+    verdicts: list[ClaimVerdict] = Field(max_length=8)
+
+
 class QuotedAnswer(StrictSchema):
     """Structured model output for a RAG answer. No claims means "not in passages"."""
 
