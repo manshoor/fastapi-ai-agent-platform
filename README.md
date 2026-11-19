@@ -408,7 +408,8 @@ upload --> API: auth -> bounded multipart read -> rag_documents(pending) + rag_o
                  dispatcher --> Kafka rag.document-ingest.requested.v1 --> rag-worker
                  rag-worker: lease -> parse (PDF in a sandboxed child process) -> chunk -> embed -> rag_chunks -> ready
 query  --> API: auth -> query slot -> admit (rate limit) -> embed question -> owner-scoped pgvector KNN
-                 -> grounded answer -> citations checked against the passages -> 200
+                 -> neighbor windows (+ optional rerank) -> claims, each with a quote
+                 -> server checks every quote and number (+ optional verifier) -> 200
 ```
 
 Start and smoke the local stack (simulator only, no paid calls):
@@ -431,7 +432,7 @@ All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
 | `GET /api/v1/rag/documents` | 200 | Owner's documents, newest first. |
 | `GET /api/v1/rag/documents/{id}` | 200 | Status, chunk and page counts, error code, timestamps. Never the content. |
 | `DELETE /api/v1/rag/documents/{id}` | 204 | Removes the document, its chunks, outbox rows **and its idempotency record**: the same key can then create a new document. |
-| `POST /api/v1/rag/query` | 200 | JSON `question` (1–2,000 chars), `top_k` (1–8, default 4), optional `document_ids` (1–20). Returns `status` (`answered`/`no_context`), `answer`, `citations[{document_id,title,ordinal,page,snippet}]`. |
+| `POST /api/v1/rag/query` | 200 | JSON `question` (1–2,000 chars), `top_k` (1–8, default 4), optional `document_ids` (1–20). Returns `status` (`answered`/`no_context`), `answer`, `citations[{document_id,title,ordinal,page,snippet,quotes}]`. `quotes` are the checked, word-for-word spans the answer relies on. |
 
 Upload errors: 401 before any body byte is read; 400 malformed multipart or disconnect; 408 slow body; 409 key reused with other content; 413 too large; 415 wrong type; 422 bad title, empty file, invalid UTF-8, NUL, or bad PDF header; 429 owner quota or another upload by the same owner in progress; 503 disabled, busy, or global backlog full.
 
@@ -440,7 +441,7 @@ Query errors: 429 owner rate limit (`Retry-After`); 503 disabled, busy, or provi
 ### RAG rules and limits
 
 - Every SQL statement on documents, chunks and queries filters by owner. A composite foreign key stops a chunk from belonging to another owner's document.
-- No question with zero searchable chunks reaches the provider. An answer that cites no supplied passage becomes `no_context` with fixed text, so uncited model text is never shown.
+- No question with zero searchable chunks reaches the provider. The model returns claims, not free text; an answer whose claims fail any check becomes `no_context` with fixed text, so unchecked model text is never shown (see below).
 - No database transaction spans provider, Kafka, or child-process I/O. Each provider call is one attempt; the worker owns embedding retries (at most three attempts). Answers are never replayed.
 - Worker writes are fenced by status, attempt, lease token, lease generation, and database-clock expiry. A document deleted mid-ingestion stops the worker without writes.
 - Uploaded bytes are deleted when ingestion ends (`ready` or `failed`). Chunk text stays until the owner deletes the document. `rag_queries` keeps usage metadata only, never question or answer text.
@@ -450,6 +451,51 @@ Query errors: 429 owner rate limit (`Retry-After`); 503 disabled, busy, or provi
 Defaults: text 1 MiB; PDF 5 MiB, 300 pages, 30 s, 1 GiB; 1,000,000 extracted characters; chunks of 1,200 characters with 200 overlap, at most 1,200 per document; 64 chunks per embedding request. 50 documents and 5 unsettled per owner; 100 unsettled globally; one upload per owner and 4 uploads and 4 queries per API process; 10 queries per 60 s per owner. Embeddings use `text-embedding-3-small` (1,536 dimensions) in pgvector 0.8.7 with an HNSW cosine index. Pools: API 10 + dispatcher 2 + worker 4 + rag-worker 4 = 20 of PostgreSQL's 100.
 
 With `compose.ai.live.yaml`, the rag-worker pays for document embeddings and the API pays for question embeddings and answers. The same paid-use authorisation applies.
+
+### Answer grounding
+
+Retrieval can find the right passage while the model still misreads it. So the answer is built only from claims the server can check (prompt `rag-answer-v2`):
+
+```
+model -> claims[{statement, citation P<n>, quote}]   (no claims -> no_context: no_claims)
+  each claim: quote has >= 3 words                   else quote_too_short
+              normalized quote is in the cited
+              passage, on word edges                 else quote_not_found
+              every number in the statement is
+              in the cited passage                   else number_not_in_passage
+  RAG_VERIFIER=on: a second model grades each claim  else verifier_rejected
+answer = statements joined; citations = cited passages with their quotes
+```
+
+- **All or nothing.** One failed claim refuses the whole answer, because dropping a claim can change the meaning of the rest. The reason goes to `rag_queries.no_context_reason` and the `outcome` tag of `rag.queries`, never to the response.
+- **Context.** Markdown chunks carry their heading path (`Pets > Dogs`, in the prompt only, not embedded). Each passage is widened to its neighbor chunks on the same page, with the overlap removed; quotes are checked against exactly that text.
+- **Usage.** `input_tokens` and `output_tokens` are totals over every chat call of the query; `chat_calls` counts them and `reasoning_effort` records the effort. A call that fails has unknown tokens and is not counted; earlier billed calls still are.
+- **Known false refusals.** Scripts without spaces (Chinese, Japanese, Thai), PDF words split by a line-break hyphen, and numbers the model writes as words.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `RAG_NEIGHBOR_CHUNKS` | `1` | Neighbor chunks on each side of a hit (0–2). No extra call; input tokens grow up to 3×. |
+| `RAG_RELEVANCE_MARGIN` | unset | Drops hits farther than the best distance plus this margin. |
+| `RAG_RERANK` | `off` | `llm`: one more paid call ranks `min(8, 2 × top_k)` candidates; an empty ranking gives `rerank_empty`. |
+| `RAG_ANSWER_REASONING_EFFORT` | `none` | `low` or `medium` for the answer call only. |
+| `RAG_VERIFIER` | `off` | `on`: one more paid call; any unsupported claim gives `verifier_rejected`. A failed verifier call fails the query (fails closed). |
+
+`RAG_QUERY_DEADLINE_SECONDS` (default 60, at most 120) must exceed the embedding timeout plus one provider timeout per chat call; rerank and the verifier each add one. With the default 20 s and 30 s timeouts that is 80 s for one of them and 110 s for both. Startup fails otherwise. `compose.ai.yaml` sets 115 s so the eval can try either.
+
+### RAG evaluation
+
+`POST /api/v1/rag/query/diagnostics` is an eval-only route. It is 404 (before authentication) and hidden from the schema unless `RAG_DIAGNOSTICS_ENABLED=true`, which only `compose.ai.yaml` sets. It runs the normal query (same owner scope, rate limit and usage row) and also returns, to the owner only, the passages sent to the model, each claim with its check result, verifier verdicts, the refusal reason and usage. It takes optional `overrides`: `neighbor_chunks`, `relevance_margin`, `rerank`, `reasoning_effort`, `verifier`. An override set that does not fit the deadline is 422.
+
+`tests/evals/rag_v1.jsonl` holds 32 golden cases over the five documents in `tests/evals/rag_documents/` (single fact, numeric, condition, multi-passage, heading, split across chunks, distractor, not covered, injection). Each case is scored on retrieval, citations, status, facts and forbidden strings, so a wrong answer after a correct retrieval is counted on its own (`wrong_given_hit`). CI checks the data and the scorer only; the simulator cannot judge answers.
+
+Live, paid, after explicit authorisation, against the AI stack started with `compose.ai.live.yaml`:
+
+```bash
+uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --repeat 3 --config base --config checked=verifier:on --output artifacts/rag-eval.json
+uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --judge --judge-model MODEL
+```
+
+`--judge` first runs six judge controls with known verdicts and exits 2 if the judge gets one wrong. The script accepts loopback destinations only (not ports 8000 or 8001) and prints case IDs, check names, rates and fixed codes; `--output` saves scores without text, mode 0600. Against the simulator it exits 1 by design: it only checks the wiring.
 
 ## Resident assistant (tool-using agent)
 
@@ -487,7 +533,7 @@ All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
 | `POST /api/v1/residence/demo` | 201: a demo building, apartment `1A`, two thermostats, two door locks, an alarm, two bookings; the caller becomes resident and manager | 404 when the demo flag is off (before authentication); 409 already a resident |
 | `POST /api/v1/rag/documents?building_id=` | As for RAG uploads; the document belongs to the building | 404 unless the caller manages that building |
 
-`status` is `answered` (valid citations, or a successful non-search tool result), `no_context` (fixed text: nothing grounded the answer), or `incomplete` (fixed text: the turn stopped after committing a change; `actions` lists what happened). `actions[]` items are `{tool, decision, result, device, ticket_id, pending_action_id}`, built by the server from tool results, never from model text.
+The final reply is claims, checked like RAG answers (prompt `assistant-v2`): each passage claim needs a quote from a passage handed out this turn, and a `tool` claim needs a successful non-search tool result. `citations[]` items carry `quotes`. `status` is `answered` (every claim checked), `no_context` (fixed text: nothing grounded the answer, or a claim failed with nothing committed), or `incomplete` (fixed text: the turn stopped after committing a change, including a failed claim after a write, `error_code` `claim_unverified`; `actions` lists what happened). The failed check is stored in `assistant_turns.claim_failure`. `actions[]` items are `{tool, decision, result, device, ticket_id, pending_action_id}`, built by the server from tool results, never from model text.
 
 ### Tools and rules
 
