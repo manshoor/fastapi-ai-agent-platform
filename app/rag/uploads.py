@@ -14,6 +14,7 @@ from starlette.requests import ClientDisconnect
 
 from app.rag.config import RAGSettings
 from app.rag.contracts import SUFFIXES, ContentType, UploadTitle
+from app.rag.extract import docx_archive_ok
 
 
 class UploadForm(Enum):
@@ -55,10 +56,11 @@ async def _read_file(file: UploadFile, settings: RAGSettings) -> tuple[ContentTy
     suffix = PurePosixPath(file.filename or "").suffix.lower()
     content_type = SUFFIXES.get(suffix)
     if content_type is None:
-        raise HTTPException(415, "Upload a .txt, .md or .pdf file")
+        raise HTTPException(415, "Upload a .txt, .md, .pdf, .docx or .html file")
+    # Binary formats share the PDF ceiling; HTML is text.
     limit = (
         settings.rag_pdf_max_bytes
-        if content_type is ContentType.PDF
+        if content_type in (ContentType.PDF, ContentType.DOCX)
         else settings.rag_text_max_bytes
     )
     data = await file.read(limit + 1)
@@ -68,6 +70,10 @@ async def _read_file(file: UploadFile, settings: RAGSettings) -> tuple[ContentTy
         raise _invalid("file")
     if content_type is ContentType.PDF:
         if not data.startswith(_PDF_MAGIC):
+            raise _invalid("file")
+    elif content_type is ContentType.DOCX:
+        # A Word body in a bounded ZIP; nothing is inflated here (zip-bomb bound).
+        if not await asyncio.to_thread(docx_archive_ok, data):
             raise _invalid("file")
     else:
         _check_text(data)

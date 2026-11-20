@@ -21,6 +21,14 @@ class ContentType(StrEnum):
     TEXT = "text/plain"
     MARKDOWN = "text/markdown"
     PDF = "application/pdf"
+    DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    HTML = "text/html"
+
+
+# Parsed in the sandboxed child; text and Markdown are decoded in the worker.
+CHILD_FORMATS = {ContentType.PDF: "pdf", ContentType.DOCX: "docx", ContentType.HTML: "html"}
+# Formats whose "#" heading lines become each chunk's heading path.
+HEADED_TYPES = frozenset({ContentType.MARKDOWN, ContentType.DOCX, ContentType.HTML})
 
 
 class IngestError(StrEnum):
@@ -30,6 +38,9 @@ class IngestError(StrEnum):
     PDF_PARSE_FAILED = "pdf_parse_failed"
     PDF_PARSE_TIMEOUT = "pdf_parse_timeout"
     PDF_PAGE_LIMIT = "pdf_page_limit"
+    DOCX_PARSE_FAILED = "docx_parse_failed"
+    HTML_PARSE_FAILED = "html_parse_failed"
+    PARSE_TIMEOUT = "parse_timeout"
     TEXT_LIMIT = "text_limit"
     NO_TEXT = "no_text"
     CHUNK_LIMIT = "chunk_limit"
@@ -44,6 +55,9 @@ SUFFIXES = {
     ".md": ContentType.MARKDOWN,
     ".markdown": ContentType.MARKDOWN,
     ".pdf": ContentType.PDF,
+    ".docx": ContentType.DOCX,
+    ".html": ContentType.HTML,
+    ".htm": ContentType.HTML,
 }
 
 

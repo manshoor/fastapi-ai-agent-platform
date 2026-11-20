@@ -191,7 +191,7 @@ async def test_owner_quotas_hold_under_concurrent_uploads(
 @pytest.mark.parametrize(
     ("name", "data", "status"),
     [
-        ("notes.html", b"<p>hi</p>", 415),
+        ("notes.exe", b"MZ", 415),
         ("notes", b"no suffix", 415),
         ("notes.md", b"x" * (TEXT_LIMIT + 1), 413),
         ("report.pdf", b"%PDF-" + b"x" * PDF_LIMIT, 413),
@@ -200,7 +200,7 @@ async def test_owner_quotas_hold_under_concurrent_uploads(
         ("notes.txt", SECRET.encode() + b"\x00", 422),
         ("report.pdf", SECRET.encode(), 422),
     ],
-    ids=["html", "no-suffix", "text-size", "pdf-size", "empty", "utf8", "nul", "pdf-header"],
+    ids=["exe", "no-suffix", "text-size", "pdf-size", "empty", "utf8", "nul", "pdf-header"],
 )
 async def test_invalid_files_are_rejected_without_echo(
     app: FastAPI, client: httpx.AsyncClient, account, name, data, status

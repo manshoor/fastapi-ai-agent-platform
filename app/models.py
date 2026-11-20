@@ -199,6 +199,13 @@ class AIOutbox(Base):
 #   chunk_count, page_count describe the active version
 #   status deleted  a tombstone: no chunks, no source, 404 to every reader
 RAG_SOURCE_KINDS = ("upload", "connector")
+RAG_CONTENT_TYPES = (
+    "text/plain",
+    "text/markdown",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "text/html",
+)
 
 
 def _sql_in(values: tuple[str, ...]) -> str:
@@ -217,7 +224,7 @@ class RAGDocument(Base):
         PostgreSQLUUID(as_uuid=True), ForeignKey("buildings.id", ondelete="CASCADE")
     )
     title: Mapped[str] = mapped_column(String(200))
-    content_type: Mapped[str] = mapped_column(String(32))
+    content_type: Mapped[str] = mapped_column(String(128))
     size_bytes: Mapped[int] = mapped_column(Integer)
     content_sha256: Mapped[str] = mapped_column(String(64))
     # Deferred: list/get/claim queries never load the upload bytes by accident.
@@ -283,7 +290,7 @@ class RAGDocument(Base):
             name="ck_rag_documents_update_key",
         ),
         CheckConstraint(
-            "content_type IN ('text/plain','text/markdown','application/pdf')",
+            f"content_type IN ({_sql_in(RAG_CONTENT_TYPES)})",
             name="ck_rag_documents_content_type",
         ),
         CheckConstraint(

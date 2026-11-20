@@ -1,6 +1,6 @@
-"""Turn uploaded bytes into page texts. PDFs are parsed in a limited child process.
+"""Turn uploaded bytes into page texts. PDF, Word and HTML parse in a limited child.
 
-worker --stdin bytes--> python -I -m app.rag.pdf_extract --stdout JSON--> worker
+worker --stdin bytes--> python -I -m app.rag.extract <format> --stdout JSON--> worker
          scrubbed env, own session, wall-clock timeout, killed on timeout/cancel
 """
 
@@ -15,7 +15,7 @@ import sys
 from dataclasses import dataclass
 
 from app.rag.config import RAGSettings
-from app.rag.contracts import ContentType, IngestError
+from app.rag.contracts import CHILD_FORMATS, ContentType, IngestError
 
 _UTF8_BOM = b"\xef\xbb\xbf"
 # Only what the interpreter needs; no database, provider, or telemetry settings.
@@ -27,8 +27,17 @@ _CHILD_CODES = {
         IngestError.PDF_PARSE_FAILED,
         IngestError.PDF_PAGE_LIMIT,
         IngestError.TEXT_LIMIT,
+        IngestError.DOCX_PARSE_FAILED,
+        IngestError.HTML_PARSE_FAILED,
     )
 }
+# Each format's own failure and timeout codes; PDF keeps its original ones.
+_FAILED = {
+    ContentType.PDF: IngestError.PDF_PARSE_FAILED,
+    ContentType.DOCX: IngestError.DOCX_PARSE_FAILED,
+    ContentType.HTML: IngestError.HTML_PARSE_FAILED,
+}
+_TIMEOUT = {ContentType.PDF: IngestError.PDF_PARSE_TIMEOUT}
 # ensure_ascii JSON spends up to 12 bytes on one character (a non-BMP surrogate pair)
 # and up to 4 bytes of framing per page.
 _OUTPUT_FACTOR = 12
@@ -36,13 +45,13 @@ _PAGE_FRAMING = 4
 _OUTPUT_SLACK = 1024
 _READ_BYTES = 65536
 # The child exits with this code when it cannot set its limits. Kept in step with
-# app.rag.pdf_extract, which never imports application modules.
+# app.rag.extract, which never imports application modules.
 SANDBOX_UNAVAILABLE_EXIT = 3
 logger = logging.getLogger(__name__)
 
 
 class SandboxUnavailable(RuntimeError):
-    """The worker cannot parse PDFs safely. Not a property of the document."""
+    """The worker cannot parse documents safely. Not a property of the document."""
 
 
 class ParseFailure(Exception):
@@ -68,20 +77,29 @@ def _kill(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _run_child(data: bytes, settings: RAGSettings) -> dict:
+def _max_input(content_type: ContentType, settings: RAGSettings) -> int:
+    # Word files share the PDF ceiling; HTML shares the text ceiling.
+    if content_type is ContentType.HTML:
+        return settings.rag_text_max_bytes
+    return settings.rag_pdf_max_bytes
+
+
+async def _run_child(data: bytes, content_type: ContentType, settings: RAGSettings) -> dict:
     cpu_seconds = math.ceil(settings.rag_pdf_timeout_seconds) + 1
+    failed = _FAILED[content_type]
     arguments = [
+        CHILD_FORMATS[content_type],
         str(settings.rag_pdf_max_pages),
         str(settings.rag_max_characters),
         str(settings.rag_pdf_memory_bytes),
         str(cpu_seconds),
-        str(settings.rag_pdf_max_bytes),
+        str(_max_input(content_type, settings)),
     ]
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-I",
         "-m",
-        "app.rag.pdf_extract",
+        "app.rag.extract",
         *arguments,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
@@ -101,20 +119,20 @@ async def _run_child(data: bytes, settings: RAGSettings) -> dict:
             )
             await process.wait()
     except TimeoutError:
-        raise ParseFailure(IngestError.PDF_PARSE_TIMEOUT) from None
+        raise ParseFailure(_TIMEOUT.get(content_type, IngestError.PARSE_TIMEOUT)) from None
     finally:
         if process.returncode is None:
             _kill(process)
             await process.wait()
     if process.returncode == SANDBOX_UNAVAILABLE_EXIT:
-        logger.error("RAG PDF sandbox limits could not be set")
-        raise SandboxUnavailable("PDF sandbox limits could not be set")
+        logger.error("RAG parse sandbox limits could not be set")
+        raise SandboxUnavailable("Parse sandbox limits could not be set")
     if process.returncode != 0 or stdout is None:
-        raise ParseFailure(IngestError.PDF_PARSE_FAILED)
+        raise ParseFailure(failed)
     try:
         result = json.loads(stdout)
     except ValueError:
-        raise ParseFailure(IngestError.PDF_PARSE_FAILED) from None
+        raise ParseFailure(failed) from None
     return result if isinstance(result, dict) else {}
 
 
@@ -148,21 +166,28 @@ def _valid_text(text: object) -> bool:
     return True
 
 
-async def _parse_pdf(data: bytes, settings: RAGSettings) -> ParsedDocument:
-    result = await _run_child(data, settings)
+async def _parse_in_child(
+    data: bytes, content_type: ContentType, settings: RAGSettings
+) -> ParsedDocument:
+    failed = _FAILED[content_type]
+    result = await _run_child(data, content_type, settings)
     error = result.get("error")
     if error is not None:
         # The child may only report its own codes; anything else is a parse failure.
         code = _CHILD_CODES.get(error) if isinstance(error, str) else None
-        raise ParseFailure(code or IngestError.PDF_PARSE_FAILED)
+        raise ParseFailure(code or failed)
     pages = result.get("pages")
+    # Word and HTML come back as one unnumbered page.
+    paged = content_type is ContentType.PDF
     if (
         not isinstance(pages, list)
-        or len(pages) > settings.rag_pdf_max_pages
+        or len(pages) > (settings.rag_pdf_max_pages if paged else 1)
         or not all(_valid_text(text) for text in pages)
         or sum(len(text) for text in pages) > settings.rag_max_characters
     ):
-        raise ParseFailure(IngestError.PDF_PARSE_FAILED)
+        raise ParseFailure(failed)
+    if not paged:
+        return ParsedDocument(pages=[(None, text) for text in pages], page_count=None)
     return ParsedDocument(
         pages=[(number, text) for number, text in enumerate(pages, start=1)],
         page_count=len(pages),
@@ -180,8 +205,8 @@ def _parse_text(data: bytes, settings: RAGSettings) -> ParsedDocument:
 async def parse_document(
     data: bytes, content_type: ContentType, settings: RAGSettings
 ) -> ParsedDocument:
-    if content_type is ContentType.PDF:
-        parsed = await _parse_pdf(data, settings)
+    if content_type in CHILD_FORMATS:
+        parsed = await _parse_in_child(data, content_type, settings)
     else:
         parsed = _parse_text(data, settings)
     if not any(text.strip() for _, text in parsed.pages):

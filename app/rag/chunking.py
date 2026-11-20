@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 
 from app.rag.config import RAGSettings
-from app.rag.contracts import ContentType, IngestError
+from app.rag.contracts import HEADED_TYPES, ContentType, IngestError
 from app.rag.parsing import ParsedDocument, ParseFailure
 
 HEADING_CHARACTERS = 300
@@ -58,8 +58,9 @@ def _path(headings: list[tuple[int, int, str]], start: int) -> str | None:
 
 def _splitter(content_type: ContentType, settings: RAGSettings) -> RecursiveCharacterTextSplitter:
     size, overlap = settings.rag_chunk_size, settings.rag_chunk_overlap
-    if content_type is ContentType.MARKDOWN:
+    if content_type in HEADED_TYPES:
         # Prefers heading, code-fence and paragraph boundaries before plain text breaks.
+        # Word and HTML arrive from the child with "#" headings, so they split the same.
         return RecursiveCharacterTextSplitter.from_language(
             Language.MARKDOWN, chunk_size=size, chunk_overlap=overlap
         )
@@ -71,7 +72,7 @@ def chunk_document(
 ) -> list[Chunk]:
     """Chunk each page separately, so every chunk cites exactly one page."""
     splitter = _splitter(content_type, settings)
-    markdown = content_type is ContentType.MARKDOWN
+    markdown = content_type in HEADED_TYPES
     chunks: list[Chunk] = []
     for page, text in parsed.pages:
         headings = _headings(text) if markdown else []
