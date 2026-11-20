@@ -1,5 +1,5 @@
 # Standalone only: never merge with compose.yaml, compose.bench.yaml, or compose.test.yaml.
-# docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d api worker rag-worker dispatcher
+# docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d api worker rag-worker dispatcher rag-dispatcher-sqs rag-worker-sqs
 name: fastapi-ai-local
 
 x-build: &build
@@ -35,6 +35,9 @@ x-processing-environment: &processing-environment
   RAG_ENABLED: "true"
   KAFKA_RAG_EVENT_TOPIC: rag.document-events.v1
   KAFKA_RAG_DEAD_LETTER_TOPIC: rag.document-events.dead-letter.v1
+  # Every document event goes to Kafka and to the local SQS (ElasticMQ), never real AWS.
+  RAG_EVENT_SINKS: kafka,sqs
+  RAG_SQS_ENDPOINT: http://sqs:9324
   OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
   OTEL_EXPORTER_OTLP_TIMEOUT: "3"
   OTEL_BSP_SCHEDULE_DELAY: "200"
@@ -272,6 +275,56 @@ services:
         condition: service_completed_successfully
       topic-init:
         condition: service_completed_successfully
+      provider:
+        condition: service_healthy
+      collector-ready:
+        condition: service_completed_successfully
+    logging: *logging
+
+  # Local SQS (ElasticMQ, FIFO). No host port; reached only on the internal network.
+  sqs:
+    image: softwaremill/elasticmq-native:1.6.14
+    volumes:
+      - ./docker/sqs/elasticmq.conf:/opt/elasticmq.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9324/?Action=ListQueues"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    logging: *logging
+
+  # Publishes the SQS deliveries; a Kafka outage cannot stop it (separate process).
+  rag-dispatcher-sqs:
+    build: *build
+    environment:
+      <<: *processing-environment
+      DB_POOL_SIZE: "2"
+    command: ["python", "-m", "app.rag.sinks"]
+    stop_grace_period: 30s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      sqs:
+        condition: service_healthy
+      collector-ready:
+        condition: service_completed_successfully
+    logging: *logging
+
+  rag-worker-sqs:
+    build: *build
+    environment:
+      <<: *processing-environment
+      OPENAI_API_KEY: local-simulator-only-not-a-real-key
+      OPENAI_BASE_URL: http://provider:8080/v1
+    command: ["python", "-m", "app.rag.sqs_worker"]
+    stop_grace_period: 50s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      sqs:
+        condition: service_healthy
       provider:
         condition: service_healthy
       collector-ready:

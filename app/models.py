@@ -452,13 +452,9 @@ class RAGOutbox(Base):
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
-    lease_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
-    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    last_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    publish_attempts: Mapped[int] = mapped_column(Integer, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    # Publish state is per sink, in rag_outbox_deliveries (filled by an insert trigger).
     __table_args__ = (
         UniqueConstraint(
             "document_id",
@@ -472,12 +468,63 @@ class RAGOutbox(Base):
         ),
         CheckConstraint("attempt BETWEEN 1 AND 3", name="ck_rag_outbox_attempt"),
         CheckConstraint("version >= 1", name="ck_rag_outbox_version"),
+        Index("ix_rag_outbox_document_id", "document_id"),
+    )
+
+
+RAG_EVENT_SINKS = ("kafka", "sqs")
+
+
+class RAGEventSink(Base):
+    """A registered sink: every new outbox row gets a delivery row for it."""
+
+    __tablename__ = "rag_event_sinks"
+
+    sink: Mapped[str] = mapped_column(String(8), primary_key=True)
+    registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(f"sink IN ({_sql_in(RAG_EVENT_SINKS)})", name="ck_rag_event_sinks_sink"),
+    )
+
+
+class RAGOutboxDelivery(Base):
+    """One event in one sink: its lease, publish attempts and published state."""
+
+    __tablename__ = "rag_outbox_deliveries"
+
+    outbox_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("rag_outbox.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    sink: Mapped[str] = mapped_column(String(8), primary_key=True)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    lease_token: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    publish_attempts: Mapped[int] = mapped_column(Integer, server_default="0")
+
+    __table_args__ = (
+        CheckConstraint(
+            f"sink IN ({_sql_in(RAG_EVENT_SINKS)})", name="ck_rag_outbox_deliveries_sink"
+        ),
+        CheckConstraint(
+            "(lease_token IS NULL) = (lease_expires_at IS NULL)",
+            name="ck_rag_outbox_deliveries_lease",
+        ),
+        CheckConstraint("publish_attempts >= 0", name="ck_rag_outbox_deliveries_attempts"),
         Index(
-            "ix_rag_outbox_due",
+            "ix_rag_outbox_deliveries_due",
+            "sink",
             "available_at",
             postgresql_where=text("published_at IS NULL"),
         ),
-        Index("ix_rag_outbox_document_id", "document_id"),
     )
 
 

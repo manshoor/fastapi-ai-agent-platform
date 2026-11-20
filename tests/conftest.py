@@ -40,6 +40,8 @@ async def app(settings: Settings) -> AsyncIterator[FastAPI]:
                     "ai_outbox, ai_jobs, items, users CASCADE"
                 )
             )
+            # Sink registrations outlive truncation: back to the migration's Kafka only.
+            await connection.execute(text("DELETE FROM rag_event_sinks WHERE sink <> 'kafka'"))
         await application.state.redis.flushdb()
         yield application
 

@@ -1,6 +1,8 @@
 """RAG document-event outbox and Kafka record handling. Mirrors app/ai/kafka.py.
 
 created, updated and deleted rows go to the events topic; dead letters to its DLQ.
+Each sink (Kafka here, SQS in app/rag/sinks.py) claims and acknowledges its own
+rag_outbox_deliveries row, so one sink down never holds back the other.
 """
 
 import asyncio
@@ -25,15 +27,16 @@ from app.ai.kafka import (
     extract_trace_headers,
 )
 from app.ai.processing import HandleResult, SessionFactory
-from app.models import RAGDocument, RAGOutbox
+from app.models import RAGDocument, RAGOutbox, RAGOutboxDelivery
 from app.rag.config import RAGSettings
-from app.rag.contracts import DocumentEvent, DocumentEventType, ingest_kind
+from app.rag.contracts import DocumentEvent, DocumentEventType, EventSink, ingest_kind
 from app.rag.ingestion import Embedder, process_ingest
 from app.telemetry import Telemetry
 
 
 @dataclass(frozen=True)
 class OutboxLease:
+    sink: EventSink
     event_id: UUID
     document_id: UUID
     version: int
@@ -45,6 +48,8 @@ class OutboxLease:
     status: str
     error_code: str | None
     trace_context: dict[str, str]
+    # This sink's publish count for the event, the current claim included.
+    publish_attempts: int = 1
 
 
 async def _send(
@@ -62,84 +67,92 @@ async def _send(
 
 
 async def claim_outbox(
-    *, session_factory: SessionFactory, settings: RAGSettings
+    *,
+    session_factory: SessionFactory,
+    settings: RAGSettings,
+    sink: EventSink = EventSink.KAFKA,
+    lease_seconds: float = KAFKA_IO_TIMEOUT + KAFKA_CLOSE_TIMEOUT,
 ) -> OutboxLease | None:
+    """Lease this sink's next due delivery. Only this sink's row is locked."""
+    now_ = func.clock_timestamp()
     async with session_factory() as session:
         async with session.begin():
             row = (
                 await session.execute(
-                    select(RAGOutbox, RAGDocument)
+                    select(RAGOutboxDelivery, RAGOutbox, RAGDocument)
+                    .join(RAGOutbox, RAGOutbox.id == RAGOutboxDelivery.outbox_id)
                     .join(RAGDocument, RAGDocument.id == RAGOutbox.document_id)
                     .where(
-                        RAGOutbox.available_at <= func.clock_timestamp(),
+                        RAGOutboxDelivery.sink == str(sink),
+                        RAGOutboxDelivery.available_at <= now_,
                         or_(
-                            RAGOutbox.lease_token.is_(None),
-                            RAGOutbox.lease_expires_at <= func.clock_timestamp(),
+                            RAGOutboxDelivery.lease_token.is_(None),
+                            RAGOutboxDelivery.lease_expires_at <= now_,
                         ),
                         or_(
-                            RAGOutbox.published_at.is_(None),
+                            RAGOutboxDelivery.published_at.is_(None),
                             # Redispatch an ingest event whose consumer may have lost it.
                             (RAGOutbox.event_kind.in_(("created", "updated")))
                             & (RAGDocument.status == "pending")
                             & (RAGDocument.version == RAGOutbox.version)
                             & (RAGDocument.attempt == RAGOutbox.attempt)
-                            & (RAGDocument.next_attempt_at <= func.clock_timestamp())
-                            & (RAGDocument.deadline_at > func.clock_timestamp())
+                            & (RAGDocument.next_attempt_at <= now_)
+                            & (RAGDocument.deadline_at > now_)
                             & (
-                                RAGOutbox.last_published_at
-                                <= func.clock_timestamp()
-                                - timedelta(seconds=settings.ai_redispatch_seconds)
+                                RAGOutboxDelivery.last_published_at
+                                <= now_ - timedelta(seconds=settings.ai_redispatch_seconds)
                             ),
                         ),
                     )
-                    .order_by(RAGOutbox.available_at, RAGOutbox.id)
+                    .order_by(RAGOutboxDelivery.available_at, RAGOutboxDelivery.outbox_id)
                     .limit(1)
-                    .with_for_update(of=RAGOutbox, skip_locked=True)
+                    .with_for_update(of=RAGOutboxDelivery, skip_locked=True)
                 )
             ).one_or_none()
             if row is None:
                 return None
-            outbox, document = row
+            delivery, outbox, document = row
             now = await session.scalar(select(func.clock_timestamp()))
-            outbox.lease_token = uuid4()
-            outbox.lease_expires_at = now + timedelta(
-                seconds=max(settings.ai_lease_seconds, KAFKA_IO_TIMEOUT + KAFKA_CLOSE_TIMEOUT)
+            delivery.lease_token = uuid4()
+            delivery.lease_expires_at = now + timedelta(
+                seconds=max(settings.ai_lease_seconds, lease_seconds)
             )
-            outbox.publish_attempts += 1
-            outbox.published_at = None
+            delivery.publish_attempts += 1
+            delivery.published_at = None
             lease = OutboxLease(
+                sink=sink,
                 event_id=outbox.id,
                 document_id=document.id,
                 version=outbox.version,
                 attempt=outbox.attempt,
                 kind=outbox.event_kind,
                 source_kind=document.source_kind,
-                token=outbox.lease_token,
+                token=delivery.lease_token,
                 created_at=outbox.created_at,
                 # A dead letter is a failed version: with an older version still
                 # served, its code is in update_error_code.
                 status="failed" if outbox.event_kind == "dead_letter" else document.status,
                 error_code=document.error_code or document.update_error_code,
                 trace_context=dict(document.trace_context),
+                publish_attempts=delivery.publish_attempts,
             )
         return lease
 
 
 def _outbox_fence(lease: OutboxLease):
     return (
-        RAGOutbox.id == lease.event_id,
-        RAGOutbox.document_id == lease.document_id,
-        RAGOutbox.attempt == lease.attempt,
-        RAGOutbox.lease_token == lease.token,
-        RAGOutbox.lease_expires_at > func.clock_timestamp(),
-        RAGOutbox.published_at.is_(None),
+        RAGOutboxDelivery.outbox_id == lease.event_id,
+        RAGOutboxDelivery.sink == str(lease.sink),
+        RAGOutboxDelivery.lease_token == lease.token,
+        RAGOutboxDelivery.lease_expires_at > func.clock_timestamp(),
+        RAGOutboxDelivery.published_at.is_(None),
     )
 
 
 async def acknowledge_outbox(*, session_factory: SessionFactory, lease: OutboxLease) -> bool:
     async with session_factory() as session:
         result = await session.execute(
-            update(RAGOutbox)
+            update(RAGOutboxDelivery)
             .where(*_outbox_fence(lease))
             .values(
                 published_at=func.clock_timestamp(),
@@ -152,10 +165,10 @@ async def acknowledge_outbox(*, session_factory: SessionFactory, lease: OutboxLe
         return result.rowcount == 1
 
 
-async def _defer_publication(*, session_factory: SessionFactory, lease: OutboxLease) -> None:
+async def defer_publication(*, session_factory: SessionFactory, lease: OutboxLease) -> None:
     async with session_factory() as session:
         await session.execute(
-            update(RAGOutbox)
+            update(RAGOutboxDelivery)
             .where(*_outbox_fence(lease))
             .values(
                 lease_token=None,
@@ -166,7 +179,7 @@ async def _defer_publication(*, session_factory: SessionFactory, lease: OutboxLe
         await session.commit()
 
 
-def _payload(lease: OutboxLease) -> bytes:
+def event_payload(lease: OutboxLease) -> bytes:
     # A dead letter reports the version's ingest event type plus its outcome.
     kind = ingest_kind(lease.version) if lease.kind == "dead_letter" else lease.kind
     event = DocumentEvent(
@@ -227,14 +240,14 @@ async def dispatch_once(
                     await _send(
                         producer,
                         topic,
-                        value=_payload(lease),
+                        value=event_payload(lease),
                         key=str(lease.document_id).encode(),
                         telemetry=telemetry,
                     )
         except (KafkaError, TimeoutError):
             if telemetry is not None:
                 telemetry.increment("ai.publish", outcome="failed", topic=topic)
-            await _defer_publication(session_factory=session_factory, lease=lease)
+            await defer_publication(session_factory=session_factory, lease=lease)
             # Fail the dispatcher closed so it disposes the producer (see app/ai/kafka.py).
             raise
         if await acknowledge_outbox(session_factory=session_factory, lease=lease):

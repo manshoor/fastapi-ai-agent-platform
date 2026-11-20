@@ -132,6 +132,8 @@ _TAGS = frozenset(
         "operation",
         "event_type",
         "topic",
+        "sink",
+        "queue",
         "gen_ai.system",
         "gen_ai.operation.name",
         "gen_ai.request.model",
@@ -160,6 +162,7 @@ def _attributes(attrs, *, metric=False):
             "provider",
             "operation",
             "topic",
+            "sink",
             "partition",
         }:
             continue

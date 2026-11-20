@@ -180,6 +180,13 @@ class DiagnosticsResponse(QueryResponse):
     usage: DiagnosticUsage
 
 
+class EventSink(StrEnum):
+    """Where outbox events are published; each has its own rag_outbox_deliveries row."""
+
+    KAFKA = "kafka"
+    SQS = "sqs"
+
+
 class DocumentEventType(StrEnum):
     CREATED = "doc.created"
     UPDATED = "doc.updated"

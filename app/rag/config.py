@@ -1,6 +1,7 @@
-from typing import Literal
+from typing import Annotated, Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field, model_validator
+from pydantic import Field, StringConstraints, model_validator
 
 from app.ai.config import AISettings
 from app.models import RAG_EMBEDDING_DIMENSIONS
@@ -14,6 +15,11 @@ ReasoningEffort = Literal["none", "low", "medium"]
 # on: one paid call judges every verified claim against its passage before answering.
 VerifierMode = Literal["off", "on"]
 VERIFIER_ON = "on"
+# Event sinks: Kafka always (it carries recovery's redispatch); SQS optionally beside it.
+EventSinks = Annotated[str, StringConstraints(pattern=r"^kafka(,sqs)?$|^sqs,kafka$")]
+SQS_SINK = "sqs"
+# FIFO queue names: per-document order and deduplication by event id.
+FIFOQueue = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,75}\.fifo$")]
 
 
 class RAGSettings(AISettings):
@@ -78,6 +84,16 @@ class RAGSettings(AISettings):
     kafka_rag_dead_letter_topic: str = "rag.document-events.dead-letter.v1"
     kafka_rag_group_id: str = "rag-ingest-worker-v1"
 
+    # Event sinks. With sqs, RAG_SQS_ENDPOINT is required: nothing falls back to real AWS.
+    rag_event_sinks: EventSinks = "kafka"
+    rag_sqs_endpoint: str | None = None
+    rag_sqs_region: str = Field(default="us-east-1", pattern=r"^[a-z]{2}-[a-z]+-\d$")
+    rag_sqs_queue: FIFOQueue = "rag-document-events.fifo"
+    rag_sqs_dead_letter_queue: FIFOQueue = "rag-document-events-dlq.fifo"
+    # Above the document lease; the SQS worker extends it while a message is handled.
+    rag_sqs_visibility_seconds: int = Field(default=180, ge=30, le=43_200)
+    rag_sqs_wait_seconds: int = Field(default=10, ge=1, le=20)
+
     @model_validator(mode="after")
     def validate_rag(self) -> "RAGSettings":
         if not self.rag_enabled:
@@ -93,6 +109,8 @@ class RAGSettings(AISettings):
         first_renewal = self.rag_pdf_timeout_seconds + self.ai_embedding_timeout_seconds
         if self.rag_lease_seconds <= first_renewal + 5:
             raise ValueError("RAG_LEASE_SECONDS must exceed parse + embedding timeouts by 5s")
+        if SQS_SINK in self.event_sinks:
+            self._validate_sqs()
         floor = query_deadline_floor(self, self.rag_rerank, self.rag_verifier)
         if self.rag_query_deadline_seconds <= floor:
             raise ValueError(
@@ -101,6 +119,19 @@ class RAGSettings(AISettings):
                 "and RAG_VERIFIER=on)"
             )
         return self
+
+    def _validate_sqs(self) -> None:
+        endpoint = urlsplit(self.rag_sqs_endpoint or "")
+        if endpoint.scheme not in {"http", "https"} or not endpoint.hostname:
+            raise ValueError("The sqs sink requires RAG_SQS_ENDPOINT (an http or https URL)")
+        if endpoint.username is not None or endpoint.password is not None:
+            raise ValueError("RAG_SQS_ENDPOINT must carry no credentials")
+        if self.rag_sqs_visibility_seconds <= self.rag_lease_seconds:
+            raise ValueError("RAG_SQS_VISIBILITY_SECONDS must exceed RAG_LEASE_SECONDS")
+
+    @property
+    def event_sinks(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(self.rag_event_sinks.split(",")))
 
     @property
     def rag_upload_ceiling_bytes(self) -> int:
