@@ -42,6 +42,11 @@ DOCX_BODY = "word/document.xml"
 # OCR: pages with less extracted text than this are scanned images.
 OCR_MIN_CHARACTERS = 20
 OCR_DPI = 200
+# Longest rendered side in pixels, whatever the page box claims: about 5 MB of gray.
+OCR_MAX_SIDE = 2200
+# Each OCR tool gets this share of the child's address-space limit. One tool runs at a
+# time, so the tree stays under 1.25 times RAG_PDF_MEMORY_BYTES.
+OCR_MEMORY_SHARE = 4
 # The OCR tools get no inherited settings; one thread keeps CPU use predictable.
 _OCR_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "OMP_THREAD_LIMIT": "1"}
 
@@ -88,7 +93,10 @@ def docx_archive_ok(data: bytes) -> bool:
 class OCRBudget:
     """Pages and wall-clock time left for OCR; the parse deadline is not extended."""
 
-    def __init__(self, max_pages: int, page_seconds: float, total_seconds: float) -> None:
+    def __init__(
+        self, max_pages: int, page_seconds: float, total_seconds: float, tool_memory: int
+    ) -> None:
+        self.tool_memory = tool_memory
         self.pages_left = max_pages
         self.page_seconds = page_seconds
         self.deadline = time.monotonic() + total_seconds
@@ -105,13 +113,19 @@ class OCRBudget:
         return min(self.page_seconds, remaining)
 
 
-def _ocr_page(data: bytes, number: int, seconds: float) -> str:
+def _ocr_page(data: bytes, number: int, seconds: float, tool_memory: int) -> str:
     """Render one page and read it. Pipes only: the child may not write files."""
+
+    def bounded() -> None:
+        # Runs in the tool before exec: its own, smaller address-space limit.
+        _limit(resource.RLIMIT_AS, tool_memory)
+
     started = time.monotonic()
     rendered = subprocess.run(
-        ["pdftoppm", "-r", str(OCR_DPI), "-gray", "-singlefile",
-         "-f", str(number), "-l", str(number), "fd://0"],
+        ["pdftoppm", "-r", str(OCR_DPI), "-scale-to", str(OCR_MAX_SIDE), "-gray",
+         "-singlefile", "-f", str(number), "-l", str(number), "fd://0"],
         input=data, capture_output=True, timeout=seconds, env=_OCR_ENV, check=False,
+        preexec_fn=bounded,
     )  # fmt: skip
     if rendered.returncode != 0 or not rendered.stdout:
         return ""
@@ -121,6 +135,7 @@ def _ocr_page(data: bytes, number: int, seconds: float) -> str:
     read = subprocess.run(
         ["tesseract", "stdin", "stdout", "-l", "eng"],
         input=rendered.stdout, capture_output=True, timeout=left, env=_OCR_ENV, check=False,
+        preexec_fn=bounded,
     )  # fmt: skip
     if read.returncode != 0:
         return ""
@@ -135,7 +150,7 @@ def _page_text(page, data: bytes, number: int, budget: OCRBudget | None) -> str:
     if seconds is None:
         return text
     try:
-        read = _ocr_page(data, number, seconds)
+        read = _ocr_page(data, number, seconds, budget.tool_memory)
     except (subprocess.TimeoutExpired, OSError):
         # A slow or missing tool skips the page; the rest of the document still counts.
         budget.truncated = True
@@ -310,7 +325,7 @@ def main(argv: list[str]) -> int:
     ocr_pages = int(argv[6])
     ocr_page_seconds, ocr_total_seconds = map(float, argv[7:9])
     budget = (
-        OCRBudget(ocr_pages, ocr_page_seconds, ocr_total_seconds)
+        OCRBudget(ocr_pages, ocr_page_seconds, ocr_total_seconds, memory_bytes // OCR_MEMORY_SHARE)
         if kind == "pdf" and ocr_pages > 0
         else None
     )

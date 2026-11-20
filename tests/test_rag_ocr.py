@@ -59,3 +59,19 @@ async def test_page_timeout_skips_the_page():
             scanned_pdf([SCAN]), ContentType.PDF, parse_settings(rag_ocr_page_seconds=0.001)
         )
     assert error.value.code is IngestError.NO_TEXT
+
+
+def test_render_is_bounded_whatever_the_page_box():
+    """A huge page box renders at most OCR_MAX_SIDE pixels on its longest side."""
+    import subprocess
+
+    from app.rag.extract import OCR_DPI, OCR_MAX_SIDE
+
+    huge = text_pdf(["x"]).replace(b"/MediaBox [0 0 612 792]", b"/MediaBox [0 0 14400 14400]")
+    pgm = subprocess.run(
+        ["pdftoppm", "-r", str(OCR_DPI), "-scale-to", str(OCR_MAX_SIDE), "-gray",
+         "-singlefile", "fd://0"],
+        input=huge, capture_output=True, check=True, timeout=30,
+    ).stdout  # fmt: skip
+    width, height = map(int, pgm.split(b"\n", 2)[1].split())
+    assert max(width, height) == OCR_MAX_SIDE
