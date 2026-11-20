@@ -496,7 +496,7 @@ Query errors: 429 owner rate limit (`Retry-After`); 503 disabled, busy, or provi
 
 Defaults: text and HTML 1 MiB; PDF and Word 5 MiB; PDF 300 pages, 30 s, 1 GiB; 1,000,000 extracted characters; chunks of 1,200 characters with 200 overlap, at most 1,200 per document; 64 chunks per embedding request. 50 documents and 5 unsettled per owner; 100 unsettled globally; one upload per owner and 4 uploads and 4 queries per API process; 10 queries per 60 s per owner. Embeddings use `text-embedding-3-small` (1,536 dimensions) in pgvector 0.8.7 with an HNSW cosine index. Pools: API 10 + dispatcher 2 + worker 4 + rag-worker 4 + rag-dispatcher-sqs 2 + rag-worker-sqs 4 + connector-sync 2 = 28 of PostgreSQL's 100.
 
-With `compose.ai.live.yaml`, the rag-worker pays for document embeddings and the API pays for question embeddings and answers. The same paid-use authorisation applies.
+With `compose.ai.live.yaml`, `rag-worker` and `rag-worker-sqs` pay for document embeddings (either may claim a document first) and the API pays for question embeddings and answers. The same paid-use authorisation applies.
 
 ### Document events and sinks
 

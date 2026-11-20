@@ -366,6 +366,9 @@ services:
       POSTGRES_PASSWORD: local-fake-source-only
     volumes:
       - ./docker/connectors/source-db-init.sql:/docker-entrypoint-initdb.d/10-notices.sql:ro
+    # Fake data only: in memory, reseeded each start, no volume left behind.
+    tmpfs:
+      - /var/lib/postgresql
     networks: [connector_sources]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U source_admin -d notices"]
