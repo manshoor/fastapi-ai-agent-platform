@@ -3,7 +3,9 @@
 Reads document bytes on stdin and writes one JSON object on stdout:
     {"pages": ["page 1 text", ...]}  or  {"error": "<fixed code>"}
 
-    pdf   pypdf, one entry per page
+    pdf   pypdf, one entry per page; a page with under 20 characters is rendered
+          (pdftoppm, 200 DPI, gray) and read with tesseract, through pipes only.
+          {"pages": [...], "ocr_pages": n, "ocr_truncated": bool}
     docx  python-docx, one entry: paragraphs and table rows in order, headings as "#"
     html  lxml.html, one entry: script/style/noscript/template and comments dropped,
           headings as "#", table rows as "a | b"
@@ -16,7 +18,9 @@ imports application modules: the upload route imports `docx_archive_ok` from her
 import io
 import json
 import resource
+import subprocess
 import sys
+import time
 import zipfile
 
 # Fixed codes shared with app.rag.contracts.IngestError; duplicated so this child
@@ -34,6 +38,12 @@ SANDBOX_UNAVAILABLE_EXIT = 3
 DOCX_MAX_ENTRIES = 1000
 DOCX_MAX_UNCOMPRESSED = 50 * 1024 * 1024
 DOCX_BODY = "word/document.xml"
+
+# OCR: pages with less extracted text than this are scanned images.
+OCR_MIN_CHARACTERS = 20
+OCR_DPI = 200
+# The OCR tools get no inherited settings; one thread keeps CPU use predictable.
+_OCR_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "OMP_THREAD_LIMIT": "1"}
 
 _HTML_DROPPED = ("script", "style", "noscript", "template")
 _HTML_HEADINGS = {f"h{level}": level for level in range(1, 7)}
@@ -75,7 +85,66 @@ def docx_archive_ok(data: bytes) -> bool:
     return any(entry.filename == DOCX_BODY for entry in entries)
 
 
-def _pdf(data: bytes, max_pages: int, max_characters: int) -> dict:
+class OCRBudget:
+    """Pages and wall-clock time left for OCR; the parse deadline is not extended."""
+
+    def __init__(self, max_pages: int, page_seconds: float, total_seconds: float) -> None:
+        self.pages_left = max_pages
+        self.page_seconds = page_seconds
+        self.deadline = time.monotonic() + total_seconds
+        self.read = 0
+        self.truncated = False
+
+    def page_timeout(self) -> float | None:
+        """Seconds for the next page, or None when the page or time budget is spent."""
+        remaining = self.deadline - time.monotonic()
+        if self.pages_left <= 0 or remaining <= 0:
+            self.truncated = True
+            return None
+        self.pages_left -= 1
+        return min(self.page_seconds, remaining)
+
+
+def _ocr_page(data: bytes, number: int, seconds: float) -> str:
+    """Render one page and read it. Pipes only: the child may not write files."""
+    started = time.monotonic()
+    rendered = subprocess.run(
+        ["pdftoppm", "-r", str(OCR_DPI), "-gray", "-singlefile",
+         "-f", str(number), "-l", str(number), "fd://0"],
+        input=data, capture_output=True, timeout=seconds, env=_OCR_ENV, check=False,
+    )  # fmt: skip
+    if rendered.returncode != 0 or not rendered.stdout:
+        return ""
+    left = seconds - (time.monotonic() - started)
+    if left <= 0:
+        raise subprocess.TimeoutExpired("tesseract", seconds)
+    read = subprocess.run(
+        ["tesseract", "stdin", "stdout", "-l", "eng"],
+        input=rendered.stdout, capture_output=True, timeout=left, env=_OCR_ENV, check=False,
+    )  # fmt: skip
+    if read.returncode != 0:
+        return ""
+    return _clean(read.stdout.decode("utf-8", "replace"))
+
+
+def _page_text(page, data: bytes, number: int, budget: OCRBudget | None) -> str:
+    text = _clean(page.extract_text() or "")
+    if budget is None or len(text.strip()) >= OCR_MIN_CHARACTERS:
+        return text
+    seconds = budget.page_timeout()
+    if seconds is None:
+        return text
+    try:
+        read = _ocr_page(data, number, seconds)
+    except (subprocess.TimeoutExpired, OSError):
+        # A slow or missing tool skips the page; the rest of the document still counts.
+        budget.truncated = True
+        return text
+    budget.read += 1
+    return read if len(read.strip()) > len(text.strip()) else text
+
+
+def _pdf(data: bytes, max_pages: int, max_characters: int, budget: OCRBudget | None) -> dict:
     from pypdf import PdfReader
 
     try:
@@ -86,16 +155,18 @@ def _pdf(data: bytes, max_pages: int, max_characters: int) -> dict:
             return {"error": PAGE_LIMIT}
         pages = []
         total = 0
-        for page in reader.pages:
-            text = _clean(page.extract_text() or "")
+        for number, page in enumerate(reader.pages, start=1):
+            text = _page_text(page, data, number, budget)
             total += len(text)
             if total > max_characters:
                 return {"error": TEXT_LIMIT}
             pages.append(text)
-        return {"pages": pages}
     except Exception:
         # Never report parser messages: they can quote document content.
         return {"error": PDF_PARSE_FAILED}
+    if budget is None:
+        return {"pages": pages}
+    return {"pages": pages, "ocr_pages": budget.read, "ocr_truncated": budget.truncated}
 
 
 def _docx_heading(style_name: str) -> int | None:
@@ -220,9 +291,11 @@ def _html(data: bytes, max_characters: int) -> dict:
     return {"pages": [text]}
 
 
-def extract(kind: str, data: bytes, max_pages: int, max_characters: int) -> dict:
+def extract(
+    kind: str, data: bytes, max_pages: int, max_characters: int, budget: OCRBudget | None = None
+) -> dict:
     if kind == "pdf":
-        return _pdf(data, max_pages, max_characters)
+        return _pdf(data, max_pages, max_characters, budget)
     if kind == "docx":
         return _docx(data, max_characters)
     if kind == "html":
@@ -232,7 +305,15 @@ def extract(kind: str, data: bytes, max_pages: int, max_characters: int) -> dict
 
 def main(argv: list[str]) -> int:
     kind = argv[0]
-    max_pages, max_characters, memory_bytes, cpu_seconds, max_input = map(int, argv[1:])
+    max_pages, max_characters, memory_bytes, cpu_seconds, max_input = map(int, argv[1:6])
+    # OCR: page cap (0 = off), seconds per page, seconds for all OCR together.
+    ocr_pages = int(argv[6])
+    ocr_page_seconds, ocr_total_seconds = map(float, argv[7:9])
+    budget = (
+        OCRBudget(ocr_pages, ocr_page_seconds, ocr_total_seconds)
+        if kind == "pdf" and ocr_pages > 0
+        else None
+    )
     try:
         _limit(resource.RLIMIT_AS, memory_bytes)
         _limit(resource.RLIMIT_CPU, cpu_seconds)
@@ -247,7 +328,7 @@ def main(argv: list[str]) -> int:
         result = {"error": failed}
     else:
         try:
-            result = extract(kind, data, max_pages, max_characters)
+            result = extract(kind, data, max_pages, max_characters, budget)
         except MemoryError:
             result = {"error": failed}
     sys.stdout.write(json.dumps(result, ensure_ascii=True))

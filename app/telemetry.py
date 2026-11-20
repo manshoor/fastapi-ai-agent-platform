@@ -107,6 +107,8 @@ _NUMBERS = frozenset(
         "gen_ai.usage.output_tokens",
         "chunk_count",
         "page_count",
+        "ocr_pages",
+        "ocr_truncated",
         "retrieved_count",
         "top_k",
         "model_calls",

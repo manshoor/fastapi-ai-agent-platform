@@ -31,6 +31,11 @@ class RAGSettings(AISettings):
     rag_pdf_max_pages: int = Field(default=300, ge=1, le=2000)
     rag_pdf_timeout_seconds: float = Field(default=30, gt=0, le=300)
     rag_pdf_memory_bytes: int = Field(default=1024 * MIB, ge=64 * MIB)
+    # OCR of PDF pages with almost no text. It runs inside RAG_PDF_TIMEOUT_SECONDS:
+    # pages past the cap or the deadline stay unread and the parse records truncation.
+    rag_ocr_enabled: bool = True
+    rag_ocr_max_pages: int = Field(default=25, ge=1, le=300)
+    rag_ocr_page_seconds: float = Field(default=20, gt=0, le=120)
     rag_max_characters: int = Field(default=1_000_000, ge=1, le=10_000_000)
     rag_chunk_size: int = Field(default=1200, ge=100, le=4000)
     rag_chunk_overlap: int = Field(default=200, ge=0, le=1000)

@@ -550,7 +550,12 @@ async def _ingest_claimed(
             # Lost the fence: deleted, recovered, or reclaimed. Nothing else to write.
             return HandleResult.HANDLED
         if telemetry is not None:
-            telemetry.annotate(chunk_count=len(chunks), page_count=parsed.page_count)
+            telemetry.annotate(
+                chunk_count=len(chunks),
+                page_count=parsed.page_count,
+                ocr_pages=parsed.ocr_pages,
+                ocr_truncated=int(parsed.ocr_truncated),
+            )
         committed = await finish_ready(
             session_factory=session_factory,
             lease=lease,

@@ -44,6 +44,8 @@ _OUTPUT_FACTOR = 12
 _PAGE_FRAMING = 4
 _OUTPUT_SLACK = 1024
 _READ_BYTES = 65536
+# OCR stops this long before the parse deadline, leaving time to report its pages.
+_OCR_MARGIN_SECONDS = 2
 # The child exits with this code when it cannot set its limits. Kept in step with
 # app.rag.extract, which never imports application modules.
 SANDBOX_UNAVAILABLE_EXIT = 3
@@ -67,6 +69,9 @@ class ParsedDocument:
     # (page number or None for plain text, text) in reading order.
     pages: list[tuple[int | None, str]]
     page_count: int | None
+    # Scanned pages read with OCR, and whether the page cap or deadline left some unread.
+    ocr_pages: int = 0
+    ocr_truncated: bool = False
 
 
 def _kill(process: asyncio.subprocess.Process) -> None:
@@ -94,6 +99,9 @@ async def _run_child(data: bytes, content_type: ContentType, settings: RAGSettin
         str(settings.rag_pdf_memory_bytes),
         str(cpu_seconds),
         str(_max_input(content_type, settings)),
+        str(settings.rag_ocr_max_pages if settings.rag_ocr_enabled else 0),
+        str(settings.rag_ocr_page_seconds),
+        str(max(0.0, settings.rag_pdf_timeout_seconds - _OCR_MARGIN_SECONDS)),
     ]
     process = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -188,9 +196,15 @@ async def _parse_in_child(
         raise ParseFailure(failed)
     if not paged:
         return ParsedDocument(pages=[(None, text) for text in pages], page_count=None)
+    ocr_pages = result.get("ocr_pages", 0)
+    ocr_truncated = result.get("ocr_truncated", False)
+    if not isinstance(ocr_pages, int) or not isinstance(ocr_truncated, bool):
+        raise ParseFailure(failed)
     return ParsedDocument(
         pages=[(number, text) for number, text in enumerate(pages, start=1)],
         page_count=len(pages),
+        ocr_pages=ocr_pages,
+        ocr_truncated=ocr_truncated,
     )
 
 
