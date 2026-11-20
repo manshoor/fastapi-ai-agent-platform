@@ -2,7 +2,7 @@
 
 A local, runnable API with built-in accounts, PostgreSQL persistence, async SQLAlchemy, and Redis detail caching with **at most five seconds of cache staleness** under the assumptions below. An opt-in, isolated [durable item-rewrite stack](#durable-item-rewriting) adds Apache Kafka, an async OpenAI worker, and local OpenTelemetry verification. Python 3.13, uv, Docker Compose, and a reproducible Locust harness are included. The requested 15,000–30,000 concurrent-user target is **not verified capacity**.
 
-> **Local development/measurement only.** PostgreSQL is deliberately pinned to the user-selected prerelease `postgres:19rc1-bookworm`. Accept its prerelease risks; do not treat this stack as a production deployment. HTTP binds to loopback, not TLS. There is no production reverse proxy, rate limiter, abuse protection, or deployment automation.
+> **Local development/measurement only.** PostgreSQL is deliberately pinned to the user-selected prerelease `postgres:19rc1-bookworm`. Accept its prerelease risks; do not treat this stack as a production deployment. HTTP binds to loopback. The optional [TLS edge](#optional-tls-edge) adds local TLS and per-address request limits; it is not a production reverse proxy or abuse protection. There is no deployment automation.
 
 ## Start the stack
 
@@ -65,7 +65,7 @@ unset TOKEN PASSWORD
 | Method and path | Success | Contract |
 | --- | --- | --- |
 | `POST /api/v1/auth/register` | 201 | JSON `email`, `password`; returns user metadata. |
-| `POST /api/v1/auth/login` | 200 | Form `username`, `password`; returns `access_token`, `token_type="bearer"`, `expires_in`. |
+| `POST /api/v1/auth/login` | 200 | Form `username`, `password`; returns `access_token`, `token_type="bearer"`, `expires_in`. 429 after repeated wrong passwords for one account. |
 | `POST /api/v1/items` | 201 | JSON `title`, optional `description` (default `""`). |
 | `GET /api/v1/items/{item_id}` | 200 | Owner-scoped detail; may use cache. |
 | `GET /api/v1/items?limit=50&cursor=...` | 200 | Owner-scoped `{ "items": [...], "next_cursor": ... }`; DB-only. |
@@ -82,14 +82,15 @@ All item routes require `Authorization: Bearer <access_token>`. Ownership comes 
 - PATCH must supply at least one field. Omitted fields remain unchanged; explicit null and `{}` are invalid. Overlapping concurrent updates use the last committed value, with no version/precondition API.
 - Pagination limit is 1–100 (default 50), ordered by immutable `(created_at DESC, id DESC)`, not `updated_at`. Pass `next_cursor` back unchanged and URL-encode it; final/empty pages return null. Cursors are canonical URL-safe unpadded base64 of `[timezone-aware timestamp, canonical UUID]`, at most 512 encoded characters. Invalid cursors return 422. They are not credentials and never remove the owner filter. There is no OFFSET or total-count query.
 - Validation failures return 422 with sanitized error details. Request bodies larger than **32 KiB**, including chunked bodies, return 413.
-- Duplicate normalized email: `409 {"detail":"Email already registered"}`. Wrong password/unknown email: identical `401 {"detail":"Invalid credentials"}`. Missing, malformed, expired, or invalid bearer token: `401 {"detail":"Invalid authentication credentials"}`. Every 401 includes `WWW-Authenticate: Bearer`.
+- Duplicate normalized email: `409 {"detail":"Email already registered"}`. Wrong password/unknown email: identical `401 {"detail":"Invalid credentials"}`, until the failure limit below. Missing, malformed, expired, or invalid bearer token: `401 {"detail":"Invalid authentication credentials"}`. Every 401 includes `WWW-Authenticate: Bearer`.
+- After `AUTH_PASSWORD_FAILURE_LIMIT` (10) wrong passwords for one existing account within `AUTH_PASSWORD_FAILURE_WINDOW_SECONDS` (900), login returns `429 {"detail":"Too many failed attempts"}` before Argon2 runs, with `Retry-After` until the oldest counted failure leaves the window. Assistant authenticator enrollment shares this counter. Unknown emails record nothing and never get 429, so, like registration's 409, the 429 shows that an account exists.
 - Known transient database failures, pool exhaustion, or hash admission exhaustion return `503 {"detail":"Service temporarily unavailable"}` with `Retry-After: 1`; programming/unexpected integrity errors remain 500. Writes are **not automatically retried**: a lost response does not prove a mutation failed to commit.
 
 ### Authentication and local security boundary
 
 JWTs use HS256 with a generated secret decoded from hex (at least 32 bytes), a fixed algorithm allowlist, canonical UUID subject, and required/verified `sub`, `iat`, `exp`, `iss`, and `aud` claims. Default lifetime is 900 seconds. Authorization is stateless: valid tokens resolve an owner UUID without an account lookup, including on cache hits. There are **no account deletion/disable, password-change, logout/revocation, or refresh-token endpoints**; issued tokens remain valid until expiry. Do not infer revocation from clearing a browser token.
 
-Registration/login have bounded password-hashing work, not public-service abuse controls. Keep the loopback binding. The optional remote benchmark below uses authenticated SSH forwarding; it does not turn this into a production TLS deployment. Treat `.env` and CSV bearer fixtures as secrets, never publish them or paste them into reports.
+Registration/login have bounded password-hashing work and the per-account login failure limit above, not public-service abuse controls. Trade-offs: anyone who knows an account's email can block its password logins for one window. The count runs before Argon2 without a lock, because no transaction may span hashing, so parallel wrong guesses can pass the limit by the attempts already admitted to hashing when it is reached (per process: the 2 running plus those its 100 ms queue admits). Keep the loopback binding. The optional remote benchmark below uses authenticated SSH forwarding; it does not turn this into a production TLS deployment. Treat `.env` and CSV bearer fixtures as secrets, never publish them or paste them into reports.
 
 ## Configuration and resource bounds
 
@@ -106,6 +107,7 @@ Normal Compose configures database/user `app`, database host `db`, and Redis dat
 | `CACHE_TTL_MS` | 5,000; accepted range 1–5,000. |
 | `AUTH_TOKEN_TTL_SECONDS` | 900; accepted range 1–86,400. |
 | `AUTH_HASH_CONCURRENCY` / `AUTH_HASH_QUEUE_TIMEOUT_SECONDS` | 2 hashing workers/process; 100 ms admission wait. Cancellation does not free an occupied permit before hashing ends. |
+| `AUTH_PASSWORD_FAILURE_LIMIT` / `AUTH_PASSWORD_FAILURE_WINDOW_SECONDS` | 10 wrong passwords per account per 900 s, then 429; accepted ranges 1–1,000 and up to 86,400 s. |
 | `JWT_ISSUER` / `JWT_AUDIENCE` | `fastapi-crud` / `fastapi-crud-api`. |
 
 Each process owns its engine/Redis pool; each request gets its own session. Cache hits do not acquire a database connection. PostgreSQL allows 100 connections: budget **replicas × API workers × 10**, retaining **at least 20** connections for migrations, tools, and other non-API work. More virtual users do not mean more database connections. Do not scale workers past that budget or treat this as autoscaling guidance.
@@ -117,6 +119,39 @@ Only successful owner-scoped detail reads are cached, using `item:v1:{owner_uuid
 On a miss, the service reads Redis **TIME before the database SELECT**, computes an absolute deadline at that time plus `CACHE_TTL_MS`, and fills using **SET PXAT**, not a fresh relative TTL. Thus a reader paused before a concurrent mutation cannot resume after invalidation and grant the old row a new five-second lifetime. If TIME fails, that read does not populate the cache.
 
 The maximum five-second staleness guarantee applies to **new cache reads after a mutation**, assumes a normally advancing Redis clock, and does not bound delivery of responses already in flight. Concurrent reads do not promise immediate read-your-writes. Clock rollback or restoring old Redis snapshots is outside the contract; persistence is disabled intentionally.
+
+## Optional TLS edge
+
+`compose.edge.yaml` is an overlay for `compose.yaml` or `compose.ai.yaml`; list it last. nginx 1.30.7 serves `https://127.0.0.1:${EDGE_PORT:-8443}`, and the API's plain HTTP port is no longer published. Default stacks, tests and benchmarks do not use it.
+
+```bash
+uv run --locked python scripts/init_edge_tls.py
+docker compose -f compose.yaml -f compose.edge.yaml up --build -d --wait api edge
+curl --fail --cacert .edge-local/ca.crt https://localhost:8443/health/ready
+uv run --locked python scripts/smoke_edge.py --plain-port 8000 --project pythonfastapi
+```
+
+`--project` names the Compose project whose edge log the smoke reads; the normal stack's is the checkout directory's name in lowercase (see `docker compose ls`). For the AI stack, start it with `docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml -f compose.edge.yaml up --build -d --wait api edge` and run the smoke with its defaults (plain port 8002, project `fastapi-ai-local`). To return to plain HTTP, remove the edge with the same files (`... rm -sf edge`), then run `up -d --wait api` without the overlay; the `<project>_edge_ingress` network stays until you remove it.
+
+- **Certificates.** `init_edge_tls.py` creates `.edge-local/` (0700) with `ca.crt`, `server.crt` (localhost, 127.0.0.1 and ::1; 397 days) and `server.key` (P-256, 0600). The CA key is never written, and the CA's name constraints allow only localhost (and names under it), 127.0.0.1 and ::1. Pass `ca.crt` to clients explicitly (`curl --cacert`, httpx `verify`). Existing files are kept; unsafe paths and partial sets are refused. To renew, delete `.edge-local/` and rerun. `.edge-*/` is excluded from git and the Docker build context.
+- **TLS and headers.** TLS 1.2 and 1.3 only, no session tickets, no version in `Server`. Every response gets `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `X-Frame-Options: DENY`; `/api/` responses also get `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. No HSTS: on localhost it would force HTTPS on every local site.
+- **Sizes and timeouts.** Bodies over 32 KiB get 413 (uploads: 6 MiB). The whole header must arrive within 10 s, and a body may pause at most 10 s between reads (uploads: 30 s). nginx waits up to 30 s for the API's response, or 150 s for assistant messages and RAG queries, then answers 504. These values are fixed in `docker/edge/nginx.conf`: when you raise `ASSISTANT_TURN_DEADLINE_SECONDS`, `RAG_QUERY_DEADLINE_SECONDS`, `RAG_PDF_MAX_BYTES` or `RAG_TEXT_MAX_BYTES`, raise the matching `proxy_read_timeout` or `client_max_body_size` too.
+- **Blocked routes.** `/api/v1/rag/query/diagnostics` and `/api/v1/residence/demo` get 404 at the edge.
+- **Edge replies.** Replies nginx makes without the API (limits, sizes, blocked routes, 502, 504) have JSON bodies and carry `X-Edge-Reply: 1`.
+- **Client addresses.** nginx replaces any `X-Forwarded-For` with the address it sees; the API trusts no forwarded header. Through Docker's port proxy all host clients may arrive from one gateway address, and then the per-address limits act as global caps: on the development Mac nginx saw every host client as 192.168.160.1. Behind a trusted load balancer, per-client limits need a config edit: `set_real_ip_from <balancer range>;` and `real_ip_header X-Forwarded-For;`.
+- **Logs.** The access log keeps address, time, method, path, status, bytes, duration and the API's status; never headers or query strings. The error log keeps only critical lines, because nginx writes the request line, Host and Referer into each one.
+- **Container.** Read-only root, tmpfs buffers, `no-new-privileges`, and only the CHOWN, SETUID, SETGID and DAC_OVERRIDE capabilities (the last reads the 0600 key). On Linux the host can still reach the API container's bridge address; the overlay removes the published port, not that route.
+
+Request limits per client address (429 past rate plus burst), plus 20 open connections per address:
+
+| Zone | Paths | Rate, burst |
+| --- | --- | --- |
+| `auth` | `/api/v1/auth/`, `/api/v1/assistant/totp/` | 10/min, 10 |
+| `assistant` | `/api/v1/assistant/messages`, `/api/v1/assistant/actions/{id}/confirm` | 20/min, 10 |
+| `rag` | POSTs under `/api/v1/rag/`; status reads do not count | 30/min, 10 |
+| `api` | `/api/v1/rag/` and every path not listed above | 20/s, 40 |
+
+`smoke_edge.py` sends no credentials. It checks TLS versions and names (TLS 1.1 refused), that the plain port is closed, the headers, an edge 413, the two edge 404s and a login burst that reaches 429, then reports the address nginx saw. The burst uses up the `auth` zone for about a minute.
 
 ## Tests, smoke, and outage exercises
 
@@ -174,9 +209,9 @@ uv run --locked python scripts/smoke_ai.py
 
 The default stack uses a **local provider simulator**, not OpenAI or a paid model. The smoke creates real accounts/items, submits through HTTP, waits for Kafka/worker completion, verifies ownership and no auto-apply, then explicitly PATCHes the suggestion. It prints no bearer tokens or content. Port 8002 must be free; normal port 8000 and benchmark port 8001 are rejected by the AI initializer/smoke.
 
-The initializer creates a separate `.ai-local/.env` with random credentials and mode `0600`, plus private `0700` directories. Existing credentials are preserved; unsafe ownership, modes, links, and normal/escaping paths are rejected rather than repaired. `.ai-*/` is excluded from version control and Docker build context. Settings read process environment only, never dotenv implicitly.
+The initializer creates a separate `.ai-local/.env` with random credentials and mode `0600`, plus private `0700` directories. Existing credentials are preserved; unsafe ownership, modes, links, and normal/escaping paths are rejected rather than repaired. For an existing file it appends only a missing `AI_ASSISTANT_TOTP_KEY` (the assistant's authenticator sealing key) and leaves every other line alone; an empty, malformed or repeated key is reported, not repaired. Until the key exists, `compose.ai.yaml` commands stop with an error naming the initializer. `.ai-*/` is excluded from version control and Docker build context. Settings read process environment only, never dotenv implicitly.
 
-`compose.ai.yaml` is standalone: **never merge it with normal, benchmark, or QA Compose**. It uses database `app_ai`, Redis DB 2, and project-owned PostgreSQL/Kafka volumes. Only the API publishes `127.0.0.1:8002`; dependencies and simulator/telemetry control endpoints have no host ports. An API-only ingress network enables loopback publication; all dependency traffic stays on the internal network. The local image uses the test target to include simulators and operational scripts. This remains a development deployment, not production TLS, abuse protection, or Kafka HA.
+`compose.ai.yaml` is standalone: **never merge it with normal, benchmark, or QA Compose**; the [TLS edge](#optional-tls-edge) overlay is the only file layered on it. It uses database `app_ai`, Redis DB 2, and project-owned PostgreSQL/Kafka volumes. Only the API publishes `127.0.0.1:8002` (with the edge overlay, only the edge publishes, on 8443); dependencies and simulator/telemetry control endpoints have no host ports. An API-only ingress network enables loopback publication; all dependency traffic stays on the internal network. The local image uses the test target to include simulators and operational scripts. This remains a development deployment, not production TLS, abuse protection, or Kafka HA.
 
 Stop only this stack, retaining its volumes:
 
@@ -504,18 +539,24 @@ A resident asks one question or request per turn. A LangGraph agent answers from
 ```
 POST /api/v1/assistant/messages
   JWT -> resident (membership -> apartment, building) -> 403 if none
-  -> one running turn per user, bounded per process -> admit (rate limit, turn row)
+  -> at most 64 turns per process -> admit: per-user lock, one running turn per user
+     across processes, rate limit, turn row
   -> LangGraph:  model --tool call--> tools --> model ... --reply--> END
                    at most 4 model calls; a call starts only if its timeout fits the 120 s budget
                  tools: allowlist -> validate arguments -> server checks
                         -> one transaction: write + audit row
   -> grounding rule -> usage row -> 200
 
-POST /api/v1/assistant/actions/{id}/confirm
-  JWT -> one transaction: own live pending unlock -> still a resident -> unlock -> audit -> 200
+POST /api/v1/assistant/totp/enroll {password}   -> 201 secret + otpauth URI
+POST /api/v1/assistant/totp/activate {code}     -> 200 enabled
+
+POST /api/v1/assistant/actions/{id}/confirm {code}
+  JWT -> resident -> step-up: lock authenticator row -> failure count -> code for a
+         step after the last spent one -> step spent, committed
+  -> one transaction: own live pending unlock -> still a resident -> unlock -> audit -> 200
 ```
 
-Smoke it against the simulator (no paid calls), with the AI stack above running:
+Smoke it against the simulator (no paid calls), with the AI stack above running. It enrolls an authenticator and confirms unlocks with real codes:
 
 ```bash
 uv run --locked python scripts/smoke_assistant.py
@@ -528,7 +569,9 @@ All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
 | Route | Success | Errors |
 | --- | --- | --- |
 | `POST /api/v1/assistant/messages` with `{message}` (1–2,000 chars, no NUL) | 200 `{turn_id, status, answer, citations[], actions[], pending_actions[]}` | 403 no residence; 422; 429 turn limit or a turn already running (`Retry-After`); 503 disabled, busy, or provider rate-limited with nothing committed; 502/504 provider failure, timeout or budget with nothing committed |
-| `POST /api/v1/assistant/actions/{id}/confirm` | 200 `{id, action, status: "confirmed", device: {name, locked}}` | 403 no residence; 404 foreign or missing; 409 expired or already decided; 503 disabled |
+| `POST /api/v1/assistant/totp/enroll` with `{password}` | 201 `{secret, otpauth_uri}`: a base32 secret for an authenticator app; replaces one not yet activated | 403 wrong password (counts toward the login limit); 409 already enabled; 422; 429 password limit (`Retry-After`); 503 disabled or hashing busy |
+| `POST /api/v1/assistant/totp/activate` with `{code}` (6 digits) | 200 `{enabled: true}` | 403 wrong code; 409 not enrolled or already enabled; 422; 429 code limit (`Retry-After`); 503 disabled |
+| `POST /api/v1/assistant/actions/{id}/confirm` with `{code}` (6 digits) | 200 `{id, action, status: "confirmed", device: {name, locked}}` | 403 no residence, authenticator not enabled, or wrong code; 404 foreign or missing; 409 expired or already decided; 422 missing or malformed code; 429 code limit (`Retry-After`); 503 disabled. The code is checked before the action, so 404 and 409 need a valid code |
 | `GET /api/v1/residence` | 200 building, apartment, devices, upcoming bookings, newest tickets, live pending unlocks | 403; 503 |
 | `POST /api/v1/residence/demo` | 201: a demo building, apartment `1A`, two thermostats, two door locks, an alarm, two bookings; the caller becomes resident and manager | 404 when the demo flag is off (before authentication); 409 already a resident |
 | `POST /api/v1/rag/documents?building_id=` | As for RAG uploads; the document belongs to the building | 404 unless the caller manages that building |
@@ -548,10 +591,21 @@ The final reply is claims, checked like RAG answers (prompt `assistant-v3`): eac
 
 - **Identity from the server.** The model supplies only tool names and values. User, apartment and building come from the caller's token and membership. Extra arguments are rejected.
 - **Checked, audited writes.** Each write runs in one transaction: per-user lock, membership share lock, limit count on the database clock, a write guarded by apartment, device name and kind, and an `assistant_tool_calls` audit row. Unknown tool names are audited as `unknown`.
-- **Only the resident confirms.** No tool can confirm an unlock. The alarm exists but no tool can reach it, and the model never sees it.
+- **Only the resident confirms, with a code.** No tool can confirm an unlock, and confirm needs an authenticator code ([Unlock step-up](#unlock-step-up)). The alarm exists but no tool can reach it, and the model never sees it.
 - **Untrusted text.** The message, tool results and passages are data, never instructions. A hijacked model can at worst create an unconfirmed unlock request.
 - **No content stored or traced.** Turns and audit rows hold counts, IDs and fixed codes; ticket summaries live only in `tickets`. The graph runs with LangSmith tracing disabled; spans `assistant.turn` (Langfuse `agent`) and `assistant.tool` (Langfuse and LangSmith `tool`) carry IDs and counts only.
-- Defaults: 10 turns per 60 s per user, one running turn per user, 4 turns per API process.
+- Defaults: 10 turns per 60 s per user. One running turn per user across all API processes: another gets 429 `A turn is already running` (`Retry-After: 1`). A turn's lease ends with the turn, or 30 s after its deadline if its process died. At most 64 running turns per API process (`ASSISTANT_CONCURRENCY`, up to 256), then 503 at once; turns hold no database connection while they wait on the provider.
+
+### Unlock step-up
+
+Enroll once with the account password, add the returned secret (or `otpauth_uri`) to an authenticator app, and activate it with a first code. Each unlock confirm then sends a current code.
+
+- Codes follow RFC 6238: SHA-1, 6 digits, 30 s steps, one step of clock drift either way. A code must match a step later than the last one spent, on the database clock, so each code works once.
+- Every check locks the user's authenticator row, so parallel guesses cannot pass the failure count together and one code cannot confirm twice. At `ASSISTANT_TOTP_FAILURE_LIMIT` (5) wrong codes in `ASSISTANT_TOTP_FAILURE_WINDOW_SECONDS` (900), activate and confirm return 429 without checking the code. A replayed code counts as a wrong one. At that rate a guesser succeeds with about 0.14% chance per day.
+- A matching code is spent and committed before the action is claimed, so a 404 or 409 after the match cannot reuse it.
+- A confirm without an enabled authenticator, or with a wrong code, writes a `denied` audit row (`step_up_required`, `step_up_failed`) with no action or device id: the action is not yet proven to be the caller's. `step_up_required` denials are not counted as failures; the edge's `assistant` zone limits their rate.
+- Secrets are sealed with AES-256-GCM under `ASSISTANT_TOTP_KEY` (32 bytes as base64, required when the assistant is on), with the user id as associated data, so a row copied to another user does not open. Secrets, codes and passwords are never logged, traced or stored in plain text. `compose.ai.yaml` reads the key from `AI_ASSISTANT_TOTP_KEY`, `compose.ai.test.yaml` sets a test-only key, and the benchmark runner generates `BENCH_ASSISTANT_TOTP_KEY` per run.
+- Not included: reset, disable and recovery codes. A lost authenticator blocks that user's unlock confirms until an operator deletes their `totp_credentials` row; a lost or changed `ASSISTANT_TOTP_KEY` does this for every enrolled user (500 `Authenticator unavailable`). Downgrading migration 0006 drops all enrollments and failure counts, and refuses while step-up audit rows exist.
 
 ### Assistant evaluations
 
@@ -566,6 +620,34 @@ uv run --locked python scripts/evaluate_assistant.py --allow-paid-requests --jud
 ```
 
 `--judge` adds an LLM judge (needs `OPENAI_API_KEY`) that checks whether answers that cite passages are grounded in those snippets and answer the question. Answers grounded only in tool results are scored by the rubric alone. The script accepts loopback destinations only and prints case IDs, failed check names and fixed codes.
+
+### Assistant load benchmark
+
+```bash
+uv run --locked python scripts/benchmark_assistant.py
+uv run --locked python scripts/benchmark_assistant.py --scenario 200
+```
+
+Run the second only after reviewing the first and authorising it. The runner uses only `compose.assistant.bench.yaml`: a fresh `fastapi-bench-assistant-<tier>-<run-id>` project, random private credentials and TOTP key, no database or Redis host ports, and one API process with AI, RAG and the assistant on at `127.0.0.1:8006`. Port 8006 must be free. The provider is the simulator with 800–1,500 ms response and 100–200 ms embedding latency: turn times mostly measure that simulated latency, and no run reaches a paid API.
+
+`scripts/seed_assistant_load.py` adds one resident per user, in buildings of up to 50 apartments, with the demo devices, bookings and one ready building document per building. `tests/load/assistant_locustfile.py` gives each user its own resident and 8–15 s think time, with task weights of 50 document questions, 15 bookings, 15 `GET /residence`, 10 thermostat changes and 10 door locks. A turn passes only with 200 and status `answered`; 429 and 503 are failures. Unlocks are left out: they need a code and allow 3 per hour.
+
+| Tier | Users | Ramp | Duration | Gate |
+| --- | --- | --- | --- | --- |
+| `smoke` (default) | 20 | 5/s | 120 s | zero failures; turn p95 ≤ 5 s; residence p95 ≤ 500 ms |
+| `200` | 200 | 10/s | 300 s | failures ≤ 1%; turn p95 ≤ 6 s |
+
+Artifacts stay in the printed mode-0700 `artifacts/<project>/`: `run.json`, `setup.log`, `seed.log`, `containers.jsonl`, `locust.log`, Locust CSVs, `resources.jsonl`, `api.log` and `turns.csv` (turns by status, error and claim failure). `.env` and `residents.csv` hold real secrets and tokens (mode 0600). The runner also prints how many API log lines point at pool pressure or failed turns. Afterwards, including on failure, it runs `down` without `-v` on its own project: its containers and network go, its database volume and artifacts stay. (The CRUD runner below still uses `stop` and keeps its network.) It never starts a higher tier.
+
+Recorded on the development laptop (Locust, the Docker VM and the target share it). Measured requests include `GET /residence`; answered turns count the whole run, warmup included.
+
+| Run | Measured window | Measured requests / failures | Turn p95 / p99 | Turns answered | Peak API CPU |
+| --- | --- | --- | --- | --- | --- |
+| 20 users, 4 turns per process (before) | 89.9 s | 138 / 27 (503 capacity busy) | 2.8 / 3.0 s | 121 | 21% |
+| 20 users, 64 turns per process | 89.8 s | 132 / 0 | 2.9 / 3.0 s | 150 | 21% |
+| 200 users, 64 turns per process | 254.9 s | 3,757 / 0 | 2.9 / 3.0 s | 3,695 | 38% |
+
+Turn latency is mostly two simulated model calls of 0.8–1.5 s each, plus one embedding for questions. Peak CPU is the highest 5 s `docker stats` sample, as a share of one core. No run logged database request failures, failed turns or timeouts. These runs show that one API process serves 200 simulated residents without 503s; they say nothing about a real provider's latency, rate limits or cost.
 
 ## Isolated 20-user benchmark smoke
 
@@ -763,3 +845,5 @@ Final local observations (generator and target on the **same laptop**):
 | Four distributed workers | 20 VUs / 90 s | 59.93 s | 348 / 0 | 11 / 12 ms |
 
 Recorded final CSV prefixes are `artifacts/local-final` and `artifacts/distributed-final` (fixture `artifacts/load-final.csv`); the repeatable example above uses `load-smoke.csv` and `smoke`. These small runs prove local workflow/harness operation only. **No million-row seed, 15,000-user tier, or 30,000-user tier was executed.** No production capacity, availability SLO, or authentication throughput claim follows from these observations.
+
+Assistant hardening pass (`feature/assistant-hardening`): **1,058 passing main-suite tests (63 skipped) and 1,121 passing AI-suite tests**; Ruff and `alembic check` clean; the Alembic round trip passed, and the 0006 downgrade refuses while step-up audit rows exist. `scripts/smoke_assistant.py` (step-up flow) and `scripts/smoke_edge.py` passed against the isolated AI QA stack; the edge with the normal and AI-local stacks was checked with `docker compose config` only. The live assistant eval passed 21/21 before the step-up change and has not rerun since. The CRUD `benchmark_smoke.py` still passes (335 measured requests, 0 failures, p95 13 ms, p99 14 ms); assistant benchmark results are in [Assistant load benchmark](#assistant-load-benchmark).

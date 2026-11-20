@@ -2,8 +2,8 @@
 
 The provider is the local simulator with provider-like latency; no run reaches a paid
 API. Private results, credentials and the database volume are kept for review. Only this
-benchmark's containers are stopped afterwards, including on failure. Nothing escalates
-the load automatically.
+benchmark's containers and network are removed afterwards, including on failure. Nothing
+escalates the load automatically.
 
     seed residents -> Locust on the host -> API :8006 -> db, redis, provider simulator
                                          -> evidence: turn statuses, failures, API log
@@ -381,11 +381,14 @@ def main() -> int:
             try:
                 collect_evidence()
             finally:
+                # down frees this run's network: Docker has few address pools. Without -v the
+                # database volume stays for review.
                 print(
-                    "Stopping only this benchmark's containers; preserving results and volume.",
+                    "Removing only this benchmark's containers and network; "
+                    "preserving results and volume.",
                     flush=True,
                 )
-                run([*compose, "stop"], log="setup.log")
+                run([*compose, "down"], log="setup.log")
 
 
 if __name__ == "__main__":
