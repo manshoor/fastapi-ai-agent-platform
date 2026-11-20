@@ -11,3 +11,4 @@ artifacts
 .git
 .ai-*/
 .langfuse-*/
+.edge-*/

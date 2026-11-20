@@ -13,11 +13,15 @@ import pytest
 from fastapi import FastAPI
 
 from app.config import Settings
-from tests.support.assistant import SIMULATOR, add_ready_document, demo_residence, serve
+from tests.support.assistant import SIMULATOR, TOTP_KEY, add_ready_document, demo_residence, serve
 from tests.support.assistant_evals import CATEGORIES, CHECKS, load_cases, load_documents, score
 
 URL = "/api/v1/assistant/messages"
-DONE = {"claims": [{"statement": "Done.", "source": "tool", "quote": ""}]}
+# Final replies citing tool fact T1. Without a T1 fact, a reply grounds nothing.
+DONE = {"claims": [{"statement": "Done.", "source": "T1", "quote": "your confirmation in"}]}
+TICKET_DONE = {
+    "claims": [{"statement": "Done.", "source": "T1", "quote": "opened in category heating"}]
+}
 CASES = load_cases()
 
 
@@ -33,6 +37,7 @@ def settings(monkeypatch, simulator) -> Settings:
     _, base_url = simulator
     monkeypatch.setenv("OPENAI_BASE_URL", base_url + "/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-never-external")
+    monkeypatch.setenv("ASSISTANT_TOTP_KEY", TOTP_KEY)
     return Settings(
         ai_enabled=True, rag_enabled=True, assistant_enabled=True, assistant_demo_enabled=True
     )
@@ -95,7 +100,17 @@ async def test_reference_steps_pass_every_check(
         ),
         (
             "doc-quiet-hours",
-            [{"claims": [{"statement": "Quiet at 23:00.", "source": "tool", "quote": ""}]}],
+            [
+                {
+                    "claims": [
+                        {
+                            "statement": "Quiet at 23:00.",
+                            "source": "T1",
+                            "quote": "quiet hours start",
+                        }
+                    ]
+                }
+            ],
             {"tools", "status", "citations"},
         ),
         (
@@ -103,7 +118,7 @@ async def test_reference_steps_pass_every_check(
             [
                 {"tool": "create_ticket", "arguments": {"category": "heating", "summary": "Cold"}},
                 {"tool": "create_ticket", "arguments": {"category": "other", "summary": "Cold"}},
-                DONE,
+                TICKET_DONE,
             ],
             {"state"},
         ),

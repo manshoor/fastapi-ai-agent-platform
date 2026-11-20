@@ -10,10 +10,10 @@ import httpx
 import jwt
 import pytest
 from fastapi import FastAPI, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, insert, select
 
 from app.config import Settings
-from app.models import User
+from app.models import AuthFailure, User
 from app.security import PasswordService
 
 AccountFactory = Callable[..., Awaitable[dict]]
@@ -351,3 +351,100 @@ async def test_cancelled_argon2_worker_holds_admission_until_thread_finishes(
     assert len(worker_threads) == 2
     assert restored_hash.startswith("$argon2id$")
     assert await service.verify("replacement-password-123", restored_hash)
+
+
+# AUTH_PASSWORD_FAILURE_LIMIT default; the conftest account's password.
+PASSWORD_FAILURE_LIMIT = 10
+ACCOUNT_PASSWORD = "a-secure-password-123"
+
+
+async def login(client: httpx.AsyncClient, email: str, password: str) -> httpx.Response:
+    return await client.post("/api/v1/auth/login", data={"username": email, "password": password})
+
+
+async def test_password_failures_throttle_the_account_before_argon2(
+    app: FastAPI, client: httpx.AsyncClient, account: AccountFactory, monkeypatch
+) -> None:
+    owner, other = await account(), await account()
+    for _ in range(PASSWORD_FAILURE_LIMIT):
+        assert (await login(client, owner["email"], "incorrect-password-123")).status_code == 401
+
+    verified = []
+    verify = app.state.passwords.verify
+
+    async def counting(password: str, password_hash: str) -> bool:
+        verified.append(password_hash)
+        return await verify(password, password_hash)
+
+    monkeypatch.setattr(app.state.passwords, "verify", counting)
+    throttled = await login(client, owner["email"], ACCOUNT_PASSWORD)
+
+    assert throttled.status_code == 429
+    assert throttled.json() == {"detail": "Too many failed attempts"}
+    assert 1 <= int(throttled.headers["retry-after"]) <= 900
+    assert verified == []
+    # One account's failures never throttle another.
+    assert (await login(client, other["email"], ACCOUNT_PASSWORD)).status_code == 200
+
+
+async def test_unknown_email_is_never_throttled_or_recorded(
+    app: FastAPI, client: httpx.AsyncClient
+) -> None:
+    for _ in range(PASSWORD_FAILURE_LIMIT + 2):
+        response = await login(client, "nobody@example.com", "incorrect-password-123")
+        assert response.status_code == 401
+    async with app.state.session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(AuthFailure)) == 0
+
+
+async def test_failures_outside_the_window_are_not_counted_and_get_pruned(
+    app: FastAPI, client: httpx.AsyncClient, account: AccountFactory
+) -> None:
+    owner = await account()
+    user_id = UUID(owner["id"])
+    stale = datetime.now(UTC) - timedelta(minutes=16)
+    async with app.state.session_factory() as session:
+        await session.execute(
+            insert(AuthFailure),
+            [
+                {"user_id": user_id, "kind": "password", "created_at": stale}
+                for _ in range(PASSWORD_FAILURE_LIMIT)
+            ],
+        )
+        await session.commit()
+
+    accepted = await login(client, owner["email"], ACCOUNT_PASSWORD)
+    refused = await login(client, owner["email"], "incorrect-password-123")
+
+    assert (accepted.status_code, refused.status_code) == (200, 401)
+    async with app.state.session_factory() as session:
+        kept = (
+            await session.scalars(
+                select(AuthFailure.created_at).where(AuthFailure.user_id == user_id)
+            )
+        ).all()
+    assert len(kept) == 1 and kept[0] > stale
+
+
+async def test_retry_after_counts_down_from_the_oldest_counted_failure(
+    app: FastAPI, client: httpx.AsyncClient, account: AccountFactory
+) -> None:
+    owner = await account()
+    # The oldest counted failure is 100 s old: it leaves the 900 s window in 800 s.
+    ages = [100] + [5] * (PASSWORD_FAILURE_LIMIT - 1)
+    async with app.state.session_factory() as session:
+        for age in ages:
+            await session.execute(
+                insert(AuthFailure).values(
+                    user_id=UUID(owner["id"]),
+                    kind="password",
+                    created_at=func.clock_timestamp() - timedelta(seconds=age),
+                )
+            )
+        await session.commit()
+
+    throttled = await login(client, owner["email"], ACCOUNT_PASSWORD)
+
+    assert throttled.status_code == 429
+    # Rounded up: only milliseconds passed since the rows were written.
+    assert throttled.headers["retry-after"] == "800"

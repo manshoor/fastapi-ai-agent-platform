@@ -1,6 +1,7 @@
 """Confirming a pending unlock. Only the resident's own request can run it; no tool can.
 
-one transaction:
+The router first runs step_up.verify, which spends a matching authenticator code in its
+own committed transaction. Then, in one transaction:
   claim own pending, unexpired row while still a resident  -- won  --> unlock + audit -> 200
   otherwise diagnose:  missing, foreign or membership gone -------> 404
                        expired (mark it, commit)            -------> 409

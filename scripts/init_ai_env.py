@@ -1,10 +1,30 @@
-"""Create a separate private AI Compose environment; never read normal .env credentials."""
+"""Create a separate private AI Compose environment; never read normal .env credentials.
+
+An existing private environment keeps every value. Only a missing AI_ASSISTANT_TOTP_KEY
+is appended, so environments made before unlock step-up keep working.
+"""
 
 import argparse
+import base64
 import os
 import secrets
 import stat
+from enum import StrEnum
 from pathlib import Path
+
+TOTP_KEY_NAME = "AI_ASSISTANT_TOTP_KEY"
+# AES-256 key that seals authenticator secrets (ASSISTANT_TOTP_KEY).
+TOTP_KEY_BYTES = 32
+
+
+class EnvResult(StrEnum):
+    CREATED = "created"
+    KEY_ADDED = "key_added"
+    UNCHANGED = "unchanged"
+
+
+class EnvKeyError(ValueError):
+    """The private .env holds a TOTP key this script must not keep or fix by itself."""
 
 
 def require_private(metadata: os.stat_result, *, directory: bool) -> None:
@@ -21,7 +41,55 @@ def require_private(metadata: os.stat_result, *, directory: bool) -> None:
         )
 
 
-def initialize(directory: Path, api_port: int) -> bool:
+def _totp_key() -> str:
+    return base64.b64encode(secrets.token_bytes(TOTP_KEY_BYTES)).decode("ascii")
+
+
+def _key_values(content: str) -> list[str]:
+    """Every value the .env assigns to the TOTP key, read as Compose reads a line."""
+    values = []
+    for line in content.splitlines():
+        name, separator, value = line.strip().removeprefix("export ").partition("=")
+        if separator and name.strip() == TOTP_KEY_NAME:
+            # Base64 holds no space or '#': " #" can only start an inline comment.
+            values.append(value.split(" #", 1)[0].strip().strip("\"'"))
+    return values
+
+
+def _is_totp_key(value: str) -> bool:
+    try:
+        return len(base64.b64decode(value, validate=True)) == TOTP_KEY_BYTES
+    except ValueError:
+        return False
+
+
+def _add_missing_key(env_fd: int) -> EnvResult:
+    """Append the TOTP key to an existing private .env that lacks it; change nothing else."""
+    with os.fdopen(env_fd, "r+", encoding="utf-8") as handle:
+        # Checked before any write: a public, linked or foreign file is never touched.
+        require_private(os.fstat(handle.fileno()), directory=False)
+        try:
+            content = handle.read()
+        except UnicodeDecodeError:
+            raise EnvKeyError("The private AI .env is not UTF-8 text; nothing changed.") from None
+
+        # A present key is never replaced: secrets sealed with it would stop opening.
+        # An unusable one is reported for the user to remove.
+        values = _key_values(content)
+        if len(values) > 1:
+            raise EnvKeyError(f"{TOTP_KEY_NAME} is set more than once; keep one line, then rerun.")
+        if values and not _is_totp_key(values[0]):
+            raise EnvKeyError(
+                f"{TOTP_KEY_NAME} is not 32 bytes encoded as base64; remove that line, then rerun."
+            )
+        if values:
+            return EnvResult.UNCHANGED
+        separator = "" if not content or content.endswith("\n") else "\n"
+        handle.write(f"{separator}{TOTP_KEY_NAME}={_totp_key()}\n")
+    return EnvResult.KEY_ADDED
+
+
+def initialize(directory: Path, api_port: int) -> EnvResult:
     # A single dedicated child avoids traversing attacker-controlled parent symlinks and
     # prevents accidental use of normal .env, artifacts, or benchmark directories.
     if len(directory.parts) != 1 or not directory.name.startswith(".ai-"):
@@ -49,20 +117,18 @@ def initialize(directory: Path, api_port: int) -> bool:
         finally:
             os.close(artifact_fd)
         try:
-            env_fd = os.open(".env", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=root_fd)
+            # O_APPEND: the only write this can make is a line at the end.
+            env_fd = os.open(".env", os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW, dir_fd=root_fd)
         except FileNotFoundError:
             env_fd = None
         if env_fd is not None:
-            try:
-                require_private(os.fstat(env_fd), directory=False)
-            finally:
-                os.close(env_fd)
-            return False
+            return _add_missing_key(env_fd)
         values = {
             "AI_DB_PASSWORD": secrets.token_hex(32),
             "AI_JWT_SECRET": secrets.token_hex(48),
             "AI_API_PORT": str(api_port),
             "AI_AUTH_TOKEN_TTL_SECONDS": "900",
+            TOTP_KEY_NAME: _totp_key(),
         }
         env_fd = os.open(
             ".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=root_fd
@@ -70,9 +136,18 @@ def initialize(directory: Path, api_port: int) -> bool:
         with os.fdopen(env_fd, "w") as handle:
             handle.write("# Private isolated AI local credentials; do not commit.\n")
             handle.writelines(f"{key}={value}\n" for key, value in values.items())
-        return True
+        return EnvResult.CREATED
     finally:
         os.close(root_fd)
+
+
+MESSAGES = {
+    EnvResult.CREATED: "Created private AI environment (0600), directories (0700).",
+    EnvResult.KEY_ADDED: (
+        f"Added {TOTP_KEY_NAME} to the existing private AI environment; other values unchanged."
+    ),
+    EnvResult.UNCHANGED: "Preserved existing private AI environment; credentials unchanged.",
+}
 
 
 def main() -> None:
@@ -81,17 +156,15 @@ def main() -> None:
     parser.add_argument("--api-port", type=int, default=8002)
     args = parser.parse_args()
     try:
-        created = initialize(args.directory, args.api_port)
+        result = initialize(args.directory, args.api_port)
+    except EnvKeyError as error:
+        parser.error(str(error))
     except (OSError, ValueError):
         parser.error(
             "Unsafe or inaccessible AI paths/port. Use a dedicated .ai-* child with current-owner "
             "0700 directories and a nonsymlink, single-link 0600 .env; paths are never repaired."
         )
-    print(
-        "Created private AI environment (0600), directories (0700)."
-        if created
-        else "Preserved existing private AI environment; credentials unchanged."
-    )
+    print(MESSAGES[result])
 
 
 if __name__ == "__main__":

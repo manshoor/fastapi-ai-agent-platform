@@ -72,6 +72,10 @@ class Settings(DatabaseSettings):
     auth_token_ttl_seconds: int = Field(default=900, ge=1, le=86400)
     auth_hash_concurrency: int = Field(default=2, ge=1)
     auth_hash_queue_timeout_seconds: float = Field(default=0.1, gt=0)
+    # Failed password checks per account, at login and authenticator enrollment, before
+    # the account answers 429 until the oldest failure leaves the window.
+    auth_password_failure_limit: int = Field(default=10, ge=1, le=1000)
+    auth_password_failure_window_seconds: float = Field(default=900, gt=0, le=86400)
     jwt_issuer: str = Field(default="fastapi-crud", min_length=1)
     jwt_audience: str = Field(default="fastapi-crud-api", min_length=1)
     ai_enabled: bool = False

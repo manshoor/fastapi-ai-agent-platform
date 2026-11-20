@@ -134,7 +134,7 @@ async def test_scripted_reply_and_unknown_tool_pass_through(simulator):
             {"tool": "lock_door", "raw_arguments": "{not json"},
             {
                 "claims": [
-                    {"statement": "The door is locked.", "source": "tool", "quote": ""},
+                    {"statement": "The door is locked.", "source": "T1", "quote": "door is locked"},
                     {"statement": "Doors lock at night.", "source": "P1", "quote": "doors lock at"},
                 ]
             },
@@ -145,7 +145,7 @@ async def test_scripted_reply_and_unknown_tool_pass_through(simulator):
     assert (await step(url)).call.arguments == "{not json"
     reply = (await step(url)).reply
     assert [(claim.source, claim.quote) for claim in reply.claims] == [
-        ("tool", ""),
+        ("T1", "door is locked"),
         ("P1", "doors lock at"),
     ]
 

@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 from pgvector.sqlalchemy import VECTOR
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -784,7 +785,8 @@ class AssistantToolCall(Base):
         ),
         CheckConstraint(
             "result_code IN ('ok','duplicate','already_pending','not_found','not_permitted',"
-            "'invalid_arguments','unknown_tool','limit_exceeded','no_documents')",
+            "'invalid_arguments','unknown_tool','limit_exceeded','no_documents',"
+            "'step_up_required','step_up_failed')",
             name="ck_assistant_tool_calls_result",
         ),
         # Typed values only: any other key (a question, a summary) is rejected.
@@ -795,4 +797,51 @@ class AssistantToolCall(Base):
         ),
         Index("ix_assistant_tool_calls_user_created", "user_id", "created_at"),
         Index("ix_assistant_tool_calls_turn", "turn_id"),
+    )
+
+
+class TotpCredential(Base):
+    """One authenticator secret per user, sealed by the API (AES-256-GCM)."""
+
+    __tablename__ = "totp_credentials"
+
+    user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    secret_ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Set together by the first matching code; last_used_step stops a code's reuse.
+    enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_step: Mapped[int | None] = mapped_column(BigInteger)
+
+    __table_args__ = (
+        CheckConstraint("octet_length(nonce) = 12", name="ck_totp_credentials_nonce"),
+        # A 20-byte secret plus the 16-byte tag; room for longer secrets later.
+        CheckConstraint(
+            "octet_length(secret_ciphertext) BETWEEN 17 AND 64", name="ck_totp_credentials_secret"
+        ),
+        CheckConstraint(
+            "(enabled_at IS NULL) = (last_used_step IS NULL)", name="ck_totp_credentials_enabled"
+        ),
+    )
+
+
+class AuthFailure(Base):
+    """One failed password or code check, counted per user over a sliding window."""
+
+    __tablename__ = "auth_failures"
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    kind: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
+    )
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('password','totp')", name="ck_auth_failures_kind"),
+        Index("ix_auth_failures_user_kind_created", "user_id", "kind", "created_at"),
     )

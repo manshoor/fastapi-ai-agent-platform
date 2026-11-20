@@ -2,16 +2,20 @@
 
     demo residence -> upload house rules as manager -> wait for ready
       -> "set the living room to 21 degrees"  -> thermostat at 21
+      -> owner and stranger enroll an authenticator and enable it with a first code
+      -> wait for a fresh 30 s step: a code is spent once
       -> "unlock the front door"              -> pending, door still locked
-      -> stranger confirm 404 -> owner confirm 200 -> door unlocked
+      -> stranger confirm 404 -> owner wrong code 403 -> owner confirm 200 -> door unlocked
       -> house-rules question                 -> cited answer
       -> account without a residence         -> 403
 
 No paid service: run it against the isolated AI stack with the provider simulator.
-Prints no bearer tokens, messages, document text or answers.
+Prints no bearer tokens, passwords, authenticator secrets or codes, messages, document
+text or answers.
 """
 
 import argparse
+import base64
 import importlib.util
 import time
 from pathlib import Path
@@ -34,12 +38,18 @@ def _load(name: str, relative: str):
 
 
 _smoke_ai = _load("smoke_ai", "scripts/smoke_ai.py")
+_totp = _load("totp", "app/assistant/totp.py")
 expect = _smoke_ai.expect
+TOTP = "/api/v1/assistant/totp"
 
 
-def _account(client: httpx.Client) -> dict:
+def _password() -> str:
+    return f"synthetic-{uuid4().hex}!"
+
+
+def _account(client: httpx.Client, password: str | None = None) -> dict:
     email = f"assistant-smoke-{uuid4().hex}@example.com"
-    password = f"synthetic-{uuid4().hex}!"
+    password = password or _password()
     expect(client.post("/api/v1/auth/register", json={"email": email, "password": password}), 201)
     login = expect(
         client.post("/api/v1/auth/login", data={"username": email, "password": password}), 200
@@ -51,6 +61,27 @@ def _say(client: httpx.Client, owner: dict, message: str) -> dict:
     return expect(client.post(MESSAGES, headers=owner, json={"message": message}), 200).json()
 
 
+def _step() -> int:
+    return int(time.time()) // _totp.STEP_SECONDS
+
+
+def _authenticator(client: httpx.Client, owner: dict, password: str) -> bytes:
+    """Enroll and enable an authenticator; return its secret. Spends the current step."""
+    enrolled = expect(
+        client.post(f"{TOTP}/enroll", headers=owner, json={"password": password}), 201
+    )
+    encoded = enrolled.json()["secret"]
+    secret = base64.b32decode(encoded + "=" * (-len(encoded) % 8))
+    code = _totp.code_at(secret, _step())
+    expect(client.post(f"{TOTP}/activate", headers=owner, json={"code": code}), 200)
+    return secret
+
+
+def _wait_for_next_step(after: int) -> None:
+    while _step() <= after:
+        time.sleep(0.5)
+
+
 def _device(client: httpx.Client, owner: dict, name: str) -> dict:
     devices = expect(client.get(RESIDENCE, headers=owner), 200).json()["devices"]
     return next(device for device in devices if device["name"] == name)
@@ -60,7 +91,9 @@ def run_smoke(base_url: str, *, timeout_seconds: float = 60) -> None:
     _smoke_ai.validate_destination(base_url)
     with httpx.Client(base_url=base_url, timeout=60, trust_env=False) as client:
         expect(client.get("/health/ready"), 200)
-        owner, stranger = _account(client), _account(client)
+        owner_password, stranger_password = _password(), _password()
+        owner = _account(client, owner_password)
+        stranger = _account(client, stranger_password)
         view = expect(client.post(f"{RESIDENCE}/demo", headers=owner), 201).json()
         expect(client.post(f"{RESIDENCE}/demo", headers=stranger), 201)
 
@@ -88,13 +121,23 @@ def run_smoke(base_url: str, *, timeout_seconds: float = 60) -> None:
         assert turn["status"] == "answered", "Thermostat turn not answered"
         assert _device(client, owner, "Living room thermostat")["target_celsius"] == 23.0
 
-        # An unlock only creates a pending action until the owner confirms it.
+        # Unlock step-up: each enables an authenticator. Its first code spends this step,
+        # so wait for the next one before the unlock, not after it.
+        owner_secret = _authenticator(client, owner, owner_password)
+        stranger_secret = _authenticator(client, stranger, stranger_password)
+        _wait_for_next_step(_step())
+
+        # An unlock only creates a pending action until the owner confirms it with a code.
         turn = _say(client, owner, "Unlock the front door")
         [pending] = turn["pending_actions"]
         assert _device(client, owner, "Front door")["locked"] is True
         confirm = f"/api/v1/assistant/actions/{pending['id']}/confirm"
-        expect(client.post(confirm, headers=stranger), 404)
-        expect(client.post(confirm, headers=owner), 200)
+        stranger_code = _totp.code_at(stranger_secret, _step())
+        expect(client.post(confirm, headers=stranger, json={"code": stranger_code}), 404)
+        code = _totp.code_at(owner_secret, _step())
+        wrong = f"{(int(code) + 1) % 10**_totp.DIGITS:0{_totp.DIGITS}d}"
+        expect(client.post(confirm, headers=owner, json={"code": wrong}), 403)
+        expect(client.post(confirm, headers=owner, json={"code": code}), 200)
         assert _device(client, owner, "Front door")["locked"] is False
 
         # A building question is answered with a citation.
@@ -119,7 +162,7 @@ def main() -> None:
         parser.error("unsafe smoke destination; select the isolated AI API")
     except httpx.HTTPError:
         raise SystemExit("Assistant smoke HTTP transport failed (details withheld)") from None
-    print("PASS: demo, device action, pending unlock, confirm, cited answer, 403")
+    print("PASS: demo, device action, pending unlock, step-up, confirm, cited answer, 403")
 
 
 if __name__ == "__main__":
