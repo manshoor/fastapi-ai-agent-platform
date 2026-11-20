@@ -24,8 +24,8 @@ x-processing-environment: &processing-environment
   KAFKA_REQUEST_TOPIC: ai.item-rewrite.requested.v1
   KAFKA_DEAD_LETTER_TOPIC: ai.item-rewrite.dead-letter.v1
   RAG_ENABLED: "true"
-  KAFKA_RAG_REQUEST_TOPIC: rag.document-ingest.requested.v1
-  KAFKA_RAG_DEAD_LETTER_TOPIC: rag.document-ingest.dead-letter.v1
+  KAFKA_RAG_EVENT_TOPIC: rag.document-events.v1
+  KAFKA_RAG_DEAD_LETTER_TOPIC: rag.document-events.dead-letter.v1
   OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
   OTEL_EXPORTER_OTLP_TIMEOUT: "3"
   OTEL_BSP_SCHEDULE_DELAY: "100"
@@ -115,7 +115,7 @@ services:
     entrypoint: ["/bin/bash", "-ec"]
     command:
       - |
-        for topic in ai.item-rewrite.requested.v1 ai.item-rewrite.dead-letter.v1 rag.document-ingest.requested.v1 rag.document-ingest.dead-letter.v1; do
+        for topic in ai.item-rewrite.requested.v1 ai.item-rewrite.dead-letter.v1 rag.document-events.v1 rag.document-events.dead-letter.v1; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$$topic" --partitions 6 --replication-factor 1 --config retention.ms=86400000 --config retention.bytes=268435456 --config max.message.bytes=65536
           description=$$(/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$$topic")
           [[ "$$description" == *"PartitionCount: 6"* ]] || { echo 'Topic requires exactly six partitions' >&2; exit 1; }

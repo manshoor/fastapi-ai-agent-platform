@@ -49,6 +49,7 @@ _SPANS = frozenset(
         "ai.submit",
         "ai.poll",
         "rag.upload",
+        "rag.update",
         "rag.consume",
         "rag.dispatcher.publish",
         "rag.ingest",
@@ -95,6 +96,7 @@ _NUMBERS = frozenset(
     {
         "attempt",
         "lease_generation",
+        "document_version",
         "partition",
         "offset",
         "queue_depth",
@@ -126,6 +128,7 @@ _TAGS = frozenset(
         "error_code",
         "provider",
         "operation",
+        "event_type",
         "topic",
         "gen_ai.system",
         "gen_ai.operation.name",

@@ -60,6 +60,7 @@ async def test_chunk_cannot_belong_to_another_owner(app: FastAPI, account):
             await session.execute(
                 insert(RAGChunk).values(
                     document_id=document_id,
+                    version=1,
                     ordinal=0,
                     owner_id=stranger,
                     content="foreign",
@@ -78,6 +79,7 @@ async def test_document_delete_cascades_chunks_and_outbox(app: FastAPI, account)
             [
                 {
                     "document_id": document_id,
+                    "version": 1,
                     "ordinal": ordinal,
                     "owner_id": owner,
                     "page": None,
@@ -89,7 +91,7 @@ async def test_document_delete_cascades_chunks_and_outbox(app: FastAPI, account)
         )
         await session.execute(
             insert(RAGOutbox).values(
-                id=uuid4(), document_id=document_id, event_kind="requested", attempt=1
+                id=uuid4(), document_id=document_id, event_kind="created", version=1, attempt=1
             )
         )
         await session.commit()
@@ -106,6 +108,7 @@ async def test_user_delete_cascades_documents_chunks_and_queries(app: FastAPI, a
         await session.execute(
             insert(RAGChunk).values(
                 document_id=document_id,
+                version=1,
                 ordinal=0,
                 owner_id=owner,
                 content="kept until delete",
@@ -136,7 +139,12 @@ async def test_user_delete_cascades_documents_chunks_and_queries(app: FastAPI, a
         ({"source": None}, "ck_rag_documents_source"),
         # Terminal rows must drop source bytes and record when they finished.
         (
-            {"status": "ready", "chunk_count": 1, "finished_at": datetime.now(UTC)},
+            {
+                "status": "ready",
+                "active_version": 1,
+                "chunk_count": 1,
+                "finished_at": datetime.now(UTC),
+            },
             "ck_rag_documents_source",
         ),
         (
@@ -147,21 +155,49 @@ async def test_user_delete_cascades_documents_chunks_and_queries(app: FastAPI, a
             {"status": "failed", "source": None, "finished_at": datetime.now(UTC)},
             "ck_rag_documents_error",
         ),
-        ({"status": "ready", "source": None, "chunk_count": 1}, "ck_rag_documents_terminal"),
-        ({"content_type": "text/html"}, "ck_rag_documents_content_type"),
+        (
+            {"status": "ready", "source": None, "active_version": 1, "chunk_count": 1},
+            "ck_rag_documents_terminal",
+        ),
+        ({"content_type": "text/csv"}, "ck_rag_documents_content_type"),
         ({"embedding_dimensions": 3072}, "ck_rag_documents_dimensions"),
         ({"attempt": 4}, "ck_rag_documents_attempt"),
         # Each biconditional, checked from the unfinished side as well.
         ({"chunk_count": 1}, "ck_rag_documents_ready"),
         ({"finished_at": datetime.now(UTC)}, "ck_rag_documents_terminal"),
         (
-            {"status": "ready", "source": None, "chunk_count": 0, "finished_at": datetime.now(UTC)},
+            {
+                "status": "ready",
+                "source": None,
+                "active_version": 1,
+                "chunk_count": 0,
+                "finished_at": datetime.now(UTC),
+            },
             "ck_rag_documents_ready",
         ),
+        # Failed and deleted never serve a version.
+        (
+            {
+                "status": "deleted",
+                "source": None,
+                "active_version": 1,
+                "chunk_count": 1,
+                "finished_at": datetime.now(UTC),
+            },
+            "ck_rag_documents_ready",
+        ),
+        ({"active_version": 2, "chunk_count": 1}, "ck_rag_documents_version"),
+        ({"version": 0}, "ck_rag_documents_version"),
+        ({"update_error_code": "no_text"}, "ck_rag_documents_update_error"),
+        ({"update_key_hash": "a" * 64}, "ck_rag_documents_update_key"),
+        ({"source_kind": "connector"}, "ck_rag_documents_source_kind"),
+        ({"connector_name": "notices", "external_id": "1"}, "ck_rag_documents_source_kind"),
+        ({"source_kind": "connector", "connector_name": "notices"}, "ck_rag_documents_source_kind"),
         (
             {
                 "status": "ready",
                 "source": None,
+                "active_version": 1,
                 "chunk_count": 1,
                 "error_code": "no_text",
                 "finished_at": datetime.now(UTC),
@@ -191,7 +227,13 @@ async def test_terminal_document_without_source_is_valid(app: FastAPI, account):
         await session.execute(
             update(RAGDocument)
             .where(RAGDocument.id == document_id)
-            .values(status="ready", source=None, chunk_count=1, finished_at=func.now())
+            .values(
+                status="ready",
+                source=None,
+                active_version=1,
+                chunk_count=1,
+                finished_at=func.now(),
+            )
         )
         await session.commit()
         loaded = await session.get(RAGDocument, document_id)
@@ -266,6 +308,7 @@ async def test_embedding_dimension_is_enforced(app: FastAPI, account):
             await session.execute(
                 insert(RAGChunk).values(
                     document_id=document_id,
+                    version=1,
                     ordinal=0,
                     owner_id=owner,
                     content="short vector",
@@ -283,6 +326,7 @@ async def test_zero_vector_is_rejected(app: FastAPI, account):
             await session.execute(
                 insert(RAGChunk).values(
                     document_id=document_id,
+                    version=1,
                     ordinal=0,
                     owner_id=owner,
                     content="no direction",
@@ -315,6 +359,7 @@ async def test_owner_filtered_cosine_search_round_trips(app: FastAPI, account):
             [
                 {
                     "document_id": document_id,
+                    "version": 1,
                     "ordinal": 0,
                     "owner_id": owner_id,
                     "page": 1,
@@ -404,6 +449,7 @@ async def test_chunk_heading_is_null_or_short_text(app: FastAPI, account, headin
     document_id = await add_document(app, owner)
     statement = insert(RAGChunk).values(
         document_id=document_id,
+        version=1,
         ordinal=0,
         owner_id=owner,
         content="text",
@@ -428,6 +474,7 @@ async def test_chunk_heading_is_at_most_300_characters(app: FastAPI, account):
             await session.execute(
                 insert(RAGChunk).values(
                     document_id=document_id,
+                    version=1,
                     ordinal=0,
                     owner_id=owner,
                     content="text",

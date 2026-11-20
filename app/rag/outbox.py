@@ -1,4 +1,7 @@
-"""RAG ingestion outbox and Kafka record handling. Mirrors app/ai/kafka.py for documents."""
+"""RAG document-event outbox and Kafka record handling. Mirrors app/ai/kafka.py.
+
+created, updated and deleted rows go to the events topic; dead letters to its DLQ.
+"""
 
 import asyncio
 import hashlib
@@ -24,7 +27,7 @@ from app.ai.kafka import (
 from app.ai.processing import HandleResult, SessionFactory
 from app.models import RAGDocument, RAGOutbox
 from app.rag.config import RAGSettings
-from app.rag.contracts import IngestEvent
+from app.rag.contracts import DocumentEvent, DocumentEventType, ingest_kind
 from app.rag.ingestion import Embedder, process_ingest
 from app.telemetry import Telemetry
 
@@ -33,8 +36,10 @@ from app.telemetry import Telemetry
 class OutboxLease:
     event_id: UUID
     document_id: UUID
+    version: int
     attempt: int
     kind: str
+    source_kind: str
     token: UUID
     created_at: datetime
     status: str
@@ -73,9 +78,10 @@ async def claim_outbox(
                         ),
                         or_(
                             RAGOutbox.published_at.is_(None),
-                            # Redispatch a request whose consumer may have lost it.
-                            (RAGOutbox.event_kind == "requested")
+                            # Redispatch an ingest event whose consumer may have lost it.
+                            (RAGOutbox.event_kind.in_(("created", "updated")))
                             & (RAGDocument.status == "pending")
+                            & (RAGDocument.version == RAGOutbox.version)
                             & (RAGDocument.attempt == RAGOutbox.attempt)
                             & (RAGDocument.next_attempt_at <= func.clock_timestamp())
                             & (RAGDocument.deadline_at > func.clock_timestamp())
@@ -104,12 +110,16 @@ async def claim_outbox(
             lease = OutboxLease(
                 event_id=outbox.id,
                 document_id=document.id,
+                version=outbox.version,
                 attempt=outbox.attempt,
                 kind=outbox.event_kind,
+                source_kind=document.source_kind,
                 token=outbox.lease_token,
                 created_at=outbox.created_at,
-                status=document.status,
-                error_code=document.error_code,
+                # A dead letter is a failed version: with an older version still
+                # served, its code is in update_error_code.
+                status="failed" if outbox.event_kind == "dead_letter" else document.status,
+                error_code=document.error_code or document.update_error_code,
                 trace_context=dict(document.trace_context),
             )
         return lease
@@ -157,11 +167,16 @@ async def _defer_publication(*, session_factory: SessionFactory, lease: OutboxLe
 
 
 def _payload(lease: OutboxLease) -> bytes:
-    event = IngestEvent(
+    # A dead letter reports the version's ingest event type plus its outcome.
+    kind = ingest_kind(lease.version) if lease.kind == "dead_letter" else lease.kind
+    event = DocumentEvent(
         version=1,
         event_id=lease.event_id,
+        type=DocumentEventType(f"doc.{kind}"),
         document_id=lease.document_id,
+        document_version=lease.version,
         attempt=lease.attempt,
+        source_kind=lease.source_kind,
         created_at=lease.created_at,
     )
     data = event.model_dump(mode="json")
@@ -188,9 +203,9 @@ async def dispatch_once(
         if lease is None:
             break
         topic = (
-            settings.kafka_rag_request_topic
-            if lease.kind == "requested"
-            else settings.kafka_rag_dead_letter_topic
+            settings.kafka_rag_dead_letter_topic
+            if lease.kind == "dead_letter"
+            else settings.kafka_rag_event_topic
         )
         context = telemetry.extract_context(lease.trace_context) if telemetry else None
         span = (
@@ -250,7 +265,7 @@ async def handle_record(
     try:
         if not isinstance(raw, bytes) or len(raw) > MAX_EVENT_BYTES:
             raise ValueError("event size")
-        event = IngestEvent.model_validate_json(raw)
+        event = DocumentEvent.model_validate_json(raw)
     except (ValueError, ValidationError):
         payload = json.dumps(
             {
@@ -283,6 +298,8 @@ async def handle_record(
             context=context,
             document_id=str(event.document_id),
             event_id=str(event.event_id),
+            event_type=str(event.type),
+            document_version=event.document_version,
             attempt=event.attempt,
             topic=record.topic,
             partition=record.partition,

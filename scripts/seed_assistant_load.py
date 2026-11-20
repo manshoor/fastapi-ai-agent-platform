@@ -100,6 +100,7 @@ def _document_rows(manager_id: UUID, building_id: UUID, model: str) -> tuple[dic
         "idempotency_key_hash": uuid4().hex,
         "request_fingerprint": uuid4().hex,
         "status": "ready",
+        "active_version": 1,
         "deadline_at": func.now() + timedelta(hours=1),
         "embedding_model": model,
         "embedding_dimensions": RAG_EMBEDDING_DIMENSIONS,
@@ -111,6 +112,7 @@ def _document_rows(manager_id: UUID, building_id: UUID, model: str) -> tuple[dic
     chunks = [
         {
             "document_id": document_id,
+            "version": 1,
             "owner_id": manager_id,
             "ordinal": ordinal,
             "page": None,

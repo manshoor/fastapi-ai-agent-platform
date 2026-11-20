@@ -9,8 +9,10 @@ from pydantic import AfterValidator, AwareDatetime, Field, StringConstraints
 
 from app.schemas import StrictSchema, Title, reject_nul
 
+# Readers never see "deleted": a tombstone is a 404.
 DocumentStatus = Literal["pending", "processing", "ready", "failed"]
-TERMINAL_STATES = frozenset({"ready", "failed"})
+TERMINAL_STATES = frozenset({"ready", "failed", "deleted"})
+SourceKind = Literal["upload", "connector"]
 UNSETTLED_STATES = ("pending", "processing")
 CHUNKER_VERSION = "recursive-v2"
 
@@ -58,6 +60,12 @@ class DocumentResponse(StrictSchema):
     chunk_count: int | None
     page_count: int | None
     error_code: str | None
+    # The newest version, and the one queries read (null until a version is ready).
+    version: int
+    active_version: int | None
+    # Why the newest version failed while active_version stays served.
+    update_error_code: str | None
+    source_kind: SourceKind
     created_at: datetime
     updated_at: datetime
     finished_at: datetime | None
@@ -158,9 +166,34 @@ class DiagnosticsResponse(QueryResponse):
     usage: DiagnosticUsage
 
 
-class IngestEvent(StrictSchema):
+class DocumentEventType(StrEnum):
+    CREATED = "doc.created"
+    UPDATED = "doc.updated"
+    DELETED = "doc.deleted"
+
+
+# Outbox kind for each event type, and back.
+EVENT_KINDS = {
+    DocumentEventType.CREATED: "created",
+    DocumentEventType.UPDATED: "updated",
+    DocumentEventType.DELETED: "deleted",
+}
+INGEST_TYPES = frozenset({DocumentEventType.CREATED, DocumentEventType.UPDATED})
+
+
+def ingest_kind(version: int) -> str:
+    """Outbox kind for ingesting a version: the first is a create, later ones updates."""
+    return "created" if version == 1 else "updated"
+
+
+class DocumentEvent(StrictSchema):
+    """Kafka payload. Identifiers only: no title, text or connector settings."""
+
     version: Literal[1]
     event_id: UUID
+    type: DocumentEventType
     document_id: UUID
+    document_version: int = Field(ge=1, strict=True)
     attempt: int = Field(ge=1, le=3, strict=True)
+    source_kind: SourceKind
     created_at: AwareDatetime

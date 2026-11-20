@@ -61,8 +61,9 @@ class RAGSettings(AISettings):
     rag_lease_seconds: float = Field(default=120, gt=0)
     rag_max_attempts: int = Field(default=3, ge=1, le=3)
     rag_queue_timeout_seconds: float = Field(default=3600, gt=0, le=86400)
-    kafka_rag_request_topic: str = "rag.document-ingest.requested.v1"
-    kafka_rag_dead_letter_topic: str = "rag.document-ingest.dead-letter.v1"
+    # doc.created, doc.updated and doc.deleted, keyed by document id.
+    kafka_rag_event_topic: str = "rag.document-events.v1"
+    kafka_rag_dead_letter_topic: str = "rag.document-events.dead-letter.v1"
     kafka_rag_group_id: str = "rag-ingest-worker-v1"
 
     @model_validator(mode="after")

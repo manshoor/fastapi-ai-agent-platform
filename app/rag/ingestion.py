@@ -1,14 +1,19 @@
 """Fenced document ingestion. No transaction spans parsing, provider, or Kafka I/O.
 
-    claim (pending -> processing, new lease)
-      -> parse (child process for PDF) -> chunk (thread)
-      -> per batch: embed (provider) -> store batch + renew lease (one transaction)
-      -> finish ready (source dropped)
-    failure -> retry (pending, attempt + 1, chunks deleted) or failed + dead letter
+    doc.created / doc.updated (one version in flight per document)
+      claim (pending -> processing, new lease)
+        -> parse (child process for PDF) -> chunk (thread)
+        -> per batch: embed (provider) -> store batch of this version + renew lease
+        -> swap: active_version = version, other versions' chunks deleted (one transaction)
+      failure -> retry (pending, attempt + 1, this version's chunks deleted), or
+                 ready on the old active version with update_error_code, or
+                 failed when no version is active; both with a dead letter
+    doc.deleted
+      purge the tombstone (cascades to its outbox rows)
 
-Every write after the claim carries the fence: status, attempt, lease token,
+Every write after the claim carries the fence: status, version, attempt, lease token,
 lease generation, and an unexpired database-clock lease. A stale worker, or one
-whose document was deleted, changes nothing.
+whose document was deleted or updated, changes nothing.
 """
 
 import asyncio
@@ -29,7 +34,16 @@ from app.ai.provider import Embeddings, ProviderFailure
 from app.models import RAGChunk, RAGDocument, RAGOutbox
 from app.rag.chunking import Chunk, chunk_document
 from app.rag.config import RAGSettings
-from app.rag.contracts import TERMINAL_STATES, ContentType, IngestError, IngestEvent
+from app.rag.contracts import (
+    EVENT_KINDS,
+    INGEST_TYPES,
+    TERMINAL_STATES,
+    ContentType,
+    DocumentEvent,
+    DocumentEventType,
+    IngestError,
+    ingest_kind,
+)
 from app.rag.parsing import ParseFailure, parse_document
 from app.telemetry import Telemetry
 
@@ -41,6 +55,8 @@ _RETRY_CODES = frozenset(
     {"provider_timeout", "provider_connection", "provider_unavailable", "provider_error"}
 )
 _MAX_BACKOFF_SECONDS = 60
+# Recovery purges tombstones whose deleted event was never consumed.
+TOMBSTONE_PURGE_SECONDS = 3600
 
 
 class Embedder(Protocol):
@@ -51,6 +67,7 @@ class Embedder(Protocol):
 class DocumentLease:
     document_id: UUID
     owner_id: UUID
+    version: int
     attempt: int
     token: UUID
     generation: int
@@ -66,6 +83,7 @@ def _fence(lease: DocumentLease):
         RAGDocument.id == lease.document_id,
         RAGDocument.owner_id == lease.owner_id,
         RAGDocument.status == "processing",
+        RAGDocument.version == lease.version,
         RAGDocument.attempt == lease.attempt,
         RAGDocument.lease_token == lease.token,
         RAGDocument.lease_generation == lease.generation,
@@ -87,10 +105,23 @@ def _record_outcome(
     )
 
 
+def _authentic(event: DocumentEvent):
+    """The persisted outbox row this event claims to be: id, document, kind, version, attempt."""
+    return select(RAGOutbox.id).where(
+        RAGOutbox.id == event.event_id,
+        RAGOutbox.document_id == event.document_id,
+        RAGOutbox.event_kind == EVENT_KINDS[event.type],
+        RAGOutbox.version == event.document_version,
+        RAGOutbox.attempt == event.attempt,
+    )
+
+
 async def claim_document(
-    *, session_factory: SessionFactory, settings: RAGSettings, event: IngestEvent
+    *, session_factory: SessionFactory, settings: RAGSettings, event: DocumentEvent
 ) -> tuple[DocumentLease, bytes] | None:
     """Commit a short lease, accepting only an authentic persisted outbox identity."""
+    if event.type not in INGEST_TYPES:
+        return None
     async with session_factory() as session:
         async with session.begin():
             document = await session.scalar(
@@ -102,18 +133,12 @@ async def claim_document(
             if (
                 document is None
                 or document.status != "pending"
+                or document.version != event.document_version
                 or document.attempt != event.attempt
                 or document.source is None
             ):
                 return None
-            authentic = await session.scalar(
-                select(RAGOutbox.id).where(
-                    RAGOutbox.id == event.event_id,
-                    RAGOutbox.document_id == document.id,
-                    RAGOutbox.attempt == event.attempt,
-                    RAGOutbox.event_kind == "requested",
-                )
-            )
+            authentic = await session.scalar(_authentic(event))
             if authentic is None:
                 return None
             now = await session.scalar(select(func.clock_timestamp()))
@@ -127,6 +152,7 @@ async def claim_document(
             lease = DocumentLease(
                 document_id=document.id,
                 owner_id=document.owner_id,
+                version=document.version,
                 attempt=document.attempt,
                 token=document.lease_token,
                 generation=document.lease_generation,
@@ -162,6 +188,7 @@ async def store_batch(
                 [
                     {
                         "document_id": lease.document_id,
+                        "version": lease.version,
                         "owner_id": lease.owner_id,
                         "ordinal": chunk.ordinal,
                         "page": chunk.page,
@@ -193,39 +220,60 @@ async def finish_ready(
     embedding_tokens: int | None,
     telemetry: Telemetry | None = None,
 ) -> bool:
+    """The swap: this version becomes active and every other version's chunks go."""
     async with session_factory() as session:
-        result = await session.execute(
-            update(RAGDocument)
-            .where(*_fence(lease))
-            .values(
-                status="ready",
-                source=None,
-                chunk_count=chunk_count,
-                page_count=page_count,
-                embedding_tokens=embedding_tokens,
-                error_code=None,
-                finished_at=func.clock_timestamp(),
-                updated_at=func.clock_timestamp(),
-                lease_token=None,
-                lease_expires_at=None,
+        async with session.begin():
+            held = await session.scalar(
+                select(RAGDocument.id).where(*_fence(lease)).with_for_update()
             )
-        )
-        await session.commit()
-    if result.rowcount == 1:
-        _record_outcome(telemetry, "ready", lease.created_at)
-    return result.rowcount == 1
+            if held is None:
+                return False
+            await session.execute(
+                delete(RAGChunk).where(
+                    RAGChunk.document_id == lease.document_id, RAGChunk.version != lease.version
+                )
+            )
+            await session.execute(
+                update(RAGDocument)
+                .where(RAGDocument.id == lease.document_id)
+                .values(
+                    status="ready",
+                    source=None,
+                    active_version=lease.version,
+                    chunk_count=chunk_count,
+                    page_count=page_count,
+                    embedding_tokens=embedding_tokens,
+                    error_code=None,
+                    update_error_code=None,
+                    finished_at=func.clock_timestamp(),
+                    updated_at=func.clock_timestamp(),
+                    lease_token=None,
+                    lease_expires_at=None,
+                )
+            )
+    _record_outcome(telemetry, "ready", lease.created_at)
+    return True
 
 
-def _terminal_values(code: str) -> dict:
-    return {
-        "status": "failed",
+def _terminal_values(code: str, active_version: int | None) -> dict:
+    """A version's last failure. With an older version active, that one stays served."""
+    values = {
         "source": None,
-        "error_code": code,
         "finished_at": func.clock_timestamp(),
         "updated_at": func.clock_timestamp(),
         "lease_token": None,
         "lease_expires_at": None,
     }
+    if active_version is None:
+        return {**values, "status": "failed", "error_code": code}
+    return {**values, "status": "ready", "error_code": None, "update_error_code": code}
+
+
+def _version_chunks(document: RAGDocument):
+    """Chunks of the version being ingested; never the active version's."""
+    return delete(RAGChunk).where(
+        RAGChunk.document_id == document.id, RAGChunk.version == document.version
+    )
 
 
 async def finish_failure(
@@ -250,7 +298,7 @@ async def finish_failure(
             may_retry = (
                 document.attempt < settings.rag_max_attempts and now + delay < document.deadline_at
             )
-            await session.execute(delete(RAGChunk).where(RAGChunk.document_id == document.id))
+            await session.execute(_version_chunks(document))
             if retry and may_retry:
                 values = {
                     "status": "pending",
@@ -263,16 +311,18 @@ async def finish_failure(
                 }
                 event = RAGOutbox(
                     document_id=document.id,
-                    event_kind="requested",
+                    event_kind=ingest_kind(document.version),
+                    version=document.version,
                     attempt=document.attempt + 1,
                     available_at=now + delay,
                 )
             else:
                 final = IngestError.ATTEMPTS_EXHAUSTED if retry else code
-                values = _terminal_values(final)
+                values = _terminal_values(final, document.active_version)
                 event = RAGOutbox(
                     document_id=document.id,
                     event_kind="dead_letter",
+                    version=document.version,
                     attempt=document.attempt,
                     available_at=now,
                 )
@@ -287,32 +337,26 @@ async def finish_failure(
         if telemetry is not None:
             telemetry.increment("ai.retries", error_code=code, operation="rag_ingest")
     else:
-        _record_outcome(telemetry, "failed", lease.created_at, values["error_code"])
+        _record_outcome(telemetry, "failed", lease.created_at, final)
     return True
 
 
 async def _durable_without_claim(
-    session_factory: SessionFactory, event: IngestEvent
+    session_factory: SessionFactory, event: DocumentEvent
 ) -> HandleResult:
     async with session_factory() as session:
         row = (
             await session.execute(
-                select(RAGDocument.status, RAGDocument.attempt).where(
+                select(RAGDocument.status, RAGDocument.version, RAGDocument.attempt).where(
                     RAGDocument.id == event.document_id
                 )
             )
         ).one_or_none()
-        authentic = await session.scalar(
-            select(RAGOutbox.id).where(
-                RAGOutbox.id == event.event_id,
-                RAGOutbox.document_id == event.document_id,
-                RAGOutbox.attempt == event.attempt,
-                RAGOutbox.event_kind == "requested",
-            )
-        )
+        authentic = await session.scalar(_authentic(event))
     if row is None or authentic is None or row.status in TERMINAL_STATES:
         return HandleResult.HANDLED
-    if row.attempt != event.attempt:
+    # An older version, or an older attempt of this one, is settled for good.
+    if (row.version, row.attempt) != (event.document_version, event.attempt):
         return HandleResult.HANDLED
     # Another holder, a future retry, or an expired lease must reach recovery first.
     return HandleResult.DEFERRED
@@ -355,14 +399,31 @@ async def _embed_and_store(
     return True, tokens
 
 
+async def purge_document(*, session_factory: SessionFactory, event: DocumentEvent) -> None:
+    """Remove a tombstone named by its own authentic deleted event; anything else is a no-op."""
+    async with session_factory() as session:
+        async with session.begin():
+            authentic = await session.scalar(_authentic(event))
+            if authentic is None:
+                return
+            await session.execute(
+                delete(RAGDocument).where(
+                    RAGDocument.id == event.document_id, RAGDocument.status == "deleted"
+                )
+            )
+
+
 async def process_ingest(
     *,
     session_factory: SessionFactory,
     settings: RAGSettings,
-    event: IngestEvent,
+    event: DocumentEvent,
     embedder: Embedder,
     telemetry: Telemetry | None = None,
 ) -> HandleResult:
+    if event.type is DocumentEventType.DELETED:
+        await purge_document(session_factory=session_factory, event=event)
+        return HandleResult.HANDLED
     claimed = await claim_document(session_factory=session_factory, settings=settings, event=event)
     if claimed is None:
         return await _durable_without_claim(session_factory, event)
@@ -394,7 +455,11 @@ async def _release_lease(*, session_factory: SessionFactory, lease: DocumentLeas
                 )
                 if document is None:
                     return False
-                await session.execute(delete(RAGChunk).where(RAGChunk.document_id == document))
+                await session.execute(
+                    delete(RAGChunk).where(
+                        RAGChunk.document_id == document, RAGChunk.version == lease.version
+                    )
+                )
                 await session.execute(
                     update(RAGDocument)
                     .where(RAGDocument.id == document)
@@ -417,7 +482,7 @@ async def _ingest_claimed(
     *,
     session_factory: SessionFactory,
     settings: RAGSettings,
-    event: IngestEvent,
+    event: DocumentEvent,
     embedder: Embedder,
     telemetry: Telemetry | None,
     lease: DocumentLease,
@@ -504,9 +569,17 @@ async def recover_documents(
     batch_size: int = 100,
     telemetry: Telemetry | None = None,
 ) -> int:
-    """Expire stale queue entries and move dead leases to their next attempt."""
+    """Expire stale queue entries, move dead leases to their next attempt, and purge
+    tombstones whose deleted event was lost."""
     async with session_factory() as session:
         async with session.begin():
+            await session.execute(
+                delete(RAGDocument).where(
+                    RAGDocument.status == "deleted",
+                    RAGDocument.finished_at
+                    <= func.clock_timestamp() - timedelta(seconds=TOMBSTONE_PURGE_SECONDS),
+                )
+            )
             documents = (
                 await session.scalars(
                     select(RAGDocument)
@@ -526,7 +599,7 @@ async def recover_documents(
             now = await session.scalar(select(func.clock_timestamp()))
             outcomes = []
             for document in documents:
-                await session.execute(delete(RAGChunk).where(RAGChunk.document_id == document.id))
+                await session.execute(_version_chunks(document))
                 if document.status == "pending":
                     code = IngestError.QUEUE_EXPIRED
                 elif document.attempt < settings.rag_max_attempts and document.deadline_at > now:
@@ -544,20 +617,22 @@ async def recover_documents(
                     session.add(
                         RAGOutbox(
                             document_id=document.id,
-                            event_kind="requested",
+                            event_kind=ingest_kind(document.version),
+                            version=document.version,
                             attempt=document.attempt,
                             available_at=now,
                         )
                     )
                     continue
-                document.status = "failed"
-                document.source = None
-                document.error_code = code
+                for name, value in _terminal_values(code, document.active_version).items():
+                    setattr(document, name, value)
                 document.finished_at = now
+                document.updated_at = now
                 session.add(
                     RAGOutbox(
                         document_id=document.id,
                         event_kind="dead_letter",
+                        version=document.version,
                         attempt=document.attempt,
                         available_at=now,
                     )

@@ -191,8 +191,20 @@ class AIOutbox(Base):
     )
 
 
-# RAG documents: one row per upload. Source bytes live here only until ingestion
-# ends; chunk text and embeddings live in rag_chunks until the owner deletes.
+# RAG documents: one row per upload or connector record. Source bytes live here only
+# until a version's ingestion ends; chunk text and embeddings live in rag_chunks.
+#
+#   version         the newest version (being ingested, or done)
+#   active_version  the version queries read; null until the first one is ready
+#   chunk_count, page_count describe the active version
+#   status deleted  a tombstone: no chunks, no source, 404 to every reader
+RAG_SOURCE_KINDS = ("upload", "connector")
+
+
+def _sql_in(values: tuple[str, ...]) -> str:
+    return ",".join(f"'{value}'" for value in values)
+
+
 class RAGDocument(Base):
     __tablename__ = "rag_documents"
 
@@ -213,6 +225,16 @@ class RAGDocument(Base):
     idempotency_key_hash: Mapped[str] = mapped_column(String(64))
     request_fingerprint: Mapped[str] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(16), server_default="pending")
+    version: Mapped[int] = mapped_column(Integer, server_default="1")
+    active_version: Mapped[int | None] = mapped_column(Integer)
+    source_kind: Mapped[str] = mapped_column(String(16), server_default="upload")
+    connector_name: Mapped[str | None] = mapped_column(String(64))
+    external_id: Mapped[str | None] = mapped_column(String(256))
+    # Why the newest version failed while an older one stays active.
+    update_error_code: Mapped[str | None] = mapped_column(String(64))
+    # Idempotency of the latest content update.
+    update_key_hash: Mapped[str | None] = mapped_column(String(64))
+    update_fingerprint: Mapped[str | None] = mapped_column(String(64))
     attempt: Mapped[int] = mapped_column(Integer, server_default="1")
     next_attempt_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -237,8 +259,28 @@ class RAGDocument(Base):
         UniqueConstraint("owner_id", "idempotency_key_hash", name="uq_rag_documents_owner_key"),
         # Target of the rag_chunks composite FK: a chunk's owner must be its document's owner.
         UniqueConstraint("id", "owner_id", name="uq_rag_documents_id_owner"),
+        UniqueConstraint("connector_name", "external_id", name="uq_rag_documents_connector_item"),
         CheckConstraint(
-            "status IN ('pending','processing','ready','failed')", name="ck_rag_documents_status"
+            "status IN ('pending','processing','ready','failed','deleted')",
+            name="ck_rag_documents_status",
+        ),
+        CheckConstraint(
+            "version >= 1 AND (active_version IS NULL OR active_version BETWEEN 1 AND version)",
+            name="ck_rag_documents_version",
+        ),
+        CheckConstraint(
+            f"source_kind IN ({_sql_in(RAG_SOURCE_KINDS)}) "
+            "AND (source_kind = 'connector') = (connector_name IS NOT NULL) "
+            "AND (connector_name IS NULL) = (external_id IS NULL)",
+            name="ck_rag_documents_source_kind",
+        ),
+        CheckConstraint(
+            "update_error_code IS NULL OR (status = 'ready' AND active_version IS NOT NULL)",
+            name="ck_rag_documents_update_error",
+        ),
+        CheckConstraint(
+            "(update_key_hash IS NULL) = (update_fingerprint IS NULL)",
+            name="ck_rag_documents_update_key",
         ),
         CheckConstraint(
             "content_type IN ('text/plain','text/markdown','application/pdf')",
@@ -266,15 +308,20 @@ class RAGDocument(Base):
         ),
         # Terminal rows are finished and hold no source bytes; unfinished rows keep them.
         CheckConstraint(
-            "(status IN ('ready','failed')) = (finished_at IS NOT NULL)",
+            "(status IN ('ready','failed','deleted')) = (finished_at IS NOT NULL)",
             name="ck_rag_documents_terminal",
         ),
         CheckConstraint(
-            "(status IN ('ready','failed')) = (source IS NULL)", name="ck_rag_documents_source"
+            "(status IN ('ready','failed','deleted')) = (source IS NULL)",
+            name="ck_rag_documents_source",
         ),
+        # Counts belong to the active version: they stay while a newer one is ingested.
+        # Ready always serves a version; failed and deleted never do.
         CheckConstraint(
-            "(status = 'ready') = (chunk_count IS NOT NULL) "
-            "AND (status <> 'ready' OR chunk_count >= 1)",
+            "(active_version IS NULL) = (chunk_count IS NULL) "
+            "AND (chunk_count IS NULL OR chunk_count >= 1) "
+            "AND (status <> 'ready' OR active_version IS NOT NULL) "
+            "AND (status NOT IN ('failed','deleted') OR active_version IS NULL)",
             name="ck_rag_documents_ready",
         ),
         CheckConstraint(
@@ -304,6 +351,12 @@ class RAGDocument(Base):
             "building_id",
             postgresql_where=text("building_id IS NOT NULL"),
         ),
+        Index(
+            # Recovery purges tombstones whose delete event was lost.
+            "ix_rag_documents_tombstone",
+            "finished_at",
+            postgresql_where=text("status = 'deleted'"),
+        ),
     )
 
 
@@ -327,14 +380,12 @@ CLAIM_FAILURES = (
 REASONING_EFFORTS = ("none", "low", "medium")
 
 
-def _sql_in(values: tuple[str, ...]) -> str:
-    return ",".join(f"'{value}'" for value in values)
-
-
 class RAGChunk(Base):
     __tablename__ = "rag_chunks"
 
     document_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    # Chunks of the version being ingested sit beside the active version's until the swap.
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
     ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
     owner_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
     page: Mapped[int | None] = mapped_column(Integer)
@@ -351,6 +402,7 @@ class RAGChunk(Base):
             name="fk_rag_chunks_document_owner",
         ),
         CheckConstraint("ordinal >= 0", name="ck_rag_chunks_ordinal"),
+        CheckConstraint("version >= 1", name="ck_rag_chunks_version"),
         CheckConstraint("page IS NULL OR page >= 1", name="ck_rag_chunks_page"),
         CheckConstraint("vector_norm(embedding) > 0", name="ck_rag_chunks_norm"),
         CheckConstraint("char_length(content) BETWEEN 1 AND 4000", name="ck_rag_chunks_content"),
@@ -369,6 +421,9 @@ class RAGChunk(Base):
     )
 
 
+RAG_OUTBOX_KINDS = ("created", "updated", "deleted", "dead_letter")
+
+
 class RAGOutbox(Base):
     __tablename__ = "rag_outbox"
 
@@ -377,6 +432,8 @@ class RAGOutbox(Base):
         PostgreSQLUUID(as_uuid=True), ForeignKey("rag_documents.id", ondelete="CASCADE")
     )
     event_kind: Mapped[str] = mapped_column(String(16))
+    # The document version this event is about.
+    version: Mapped[int] = mapped_column(Integer)
     attempt: Mapped[int] = mapped_column(Integer)
     available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -390,12 +447,17 @@ class RAGOutbox(Base):
 
     __table_args__ = (
         UniqueConstraint(
-            "document_id", "event_kind", "attempt", name="uq_rag_outbox_document_event_attempt"
+            "document_id",
+            "event_kind",
+            "version",
+            "attempt",
+            name="uq_rag_outbox_document_event_attempt",
         ),
         CheckConstraint(
-            "event_kind IN ('requested','dead_letter')", name="ck_rag_outbox_event_kind"
+            f"event_kind IN ({_sql_in(RAG_OUTBOX_KINDS)})", name="ck_rag_outbox_event_kind"
         ),
         CheckConstraint("attempt BETWEEN 1 AND 3", name="ck_rag_outbox_attempt"),
+        CheckConstraint("version >= 1", name="ck_rag_outbox_version"),
         Index(
             "ix_rag_outbox_due",
             "available_at",

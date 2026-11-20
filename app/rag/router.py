@@ -1,3 +1,4 @@
+import re
 from typing import Annotated
 from uuid import UUID
 
@@ -14,13 +15,22 @@ from app.rag.contracts import (
     QueryRequest,
     QueryResponse,
 )
-from app.rag.documents import delete_document, get_document, list_documents, submit_document
+from app.rag.documents import (
+    delete_document,
+    get_document,
+    list_documents,
+    submit_document,
+    update_document,
+)
 from app.rag.pipeline import answer_query, diagnose_query
 from app.rag.runtime import RAGRuntime
-from app.rag.uploads import read_upload
+from app.rag.uploads import UploadForm, read_upload
 from app.security import get_current_user_id
 
 UPLOAD_PATH = "/api/v1/rag/documents"
+# Content updates stream under the upload ceiling too. fullmatch: a trailing newline
+# (which the router accepts) gets the ordinary 32 KiB limit, never the larger one.
+UPDATE_PATH = re.compile(r"/api/v1/rag/documents/[^/]+/content")
 router = APIRouter(prefix="/api/v1/rag", tags=["rag"])
 Owner = Annotated[UUID, Depends(get_current_user_id)]
 Session = Annotated[AsyncSession, Depends(get_session)]
@@ -85,6 +95,55 @@ async def upload_document(
                 trace_context=telemetry.capture_context(),
                 telemetry=telemetry,
                 building_id=building_id,
+            )
+    response.status_code = status_code
+    response.headers["Location"] = result.status_url
+    response.headers["Cache-Control"] = "no-store"
+    return result
+
+
+@router.put(
+    "/documents/{document_id}/content",
+    response_model=DocumentResponse,
+    status_code=202,
+    responses={
+        200: {"model": DocumentResponse},
+        400: {},
+        404: {},
+        408: {},
+        409: {},
+        413: {},
+        415: {},
+        422: {},
+        429: {},
+        503: {},
+    },
+)
+async def update_document_content(
+    document_id: UUID,
+    request: Request,
+    response: Response,
+    owner_id: Owner,
+    session: Session,
+    idempotency_key: Key,
+) -> DocumentResponse:
+    """New content as the next version; queries read the current one until it is ready."""
+    # No Form/File parameters: FastAPI would read the body before authentication.
+    runtime = _runtime(request)
+    telemetry = runtime.telemetry
+    telemetry.increment("rag.requests", operation="update")
+    async with runtime.upload_slot(owner_id):
+        upload = await read_upload(request, runtime.settings, UploadForm.FILE_ONLY)
+        with telemetry.span("rag.update"):
+            result, status_code = await update_document(
+                session=session,
+                settings=runtime.settings,
+                owner_id=owner_id,
+                document_id=document_id,
+                upload=upload,
+                idempotency_key=idempotency_key,
+                trace_context=telemetry.capture_context(),
+                telemetry=telemetry,
             )
     response.status_code = status_code
     response.headers["Location"] = result.status_url

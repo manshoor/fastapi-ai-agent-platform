@@ -118,6 +118,7 @@ async def add_ready_document(
                 idempotency_key_hash=uuid4().hex,
                 request_fingerprint=uuid4().hex,
                 status=status,
+                active_version=1 if ready else None,
                 deadline_at=func.now() + timedelta(hours=1),
                 embedding_model=embedding_model,
                 embedding_dimensions=RAG_EMBEDDING_DIMENSIONS,
@@ -131,6 +132,7 @@ async def add_ready_document(
         session.add(
             RAGChunk(
                 document_id=document_id,
+                version=1,
                 owner_id=owner_id,
                 ordinal=0,
                 page=None,
@@ -559,6 +561,7 @@ async def add_chunks(app: FastAPI, owner_id: UUID, document_id: UUID, chunks: li
             session.add(
                 RAGChunk(
                     document_id=document_id,
+                    version=1,
                     owner_id=owner_id,
                     ordinal=ordinal,
                     page=page,
