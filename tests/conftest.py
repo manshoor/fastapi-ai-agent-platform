@@ -36,7 +36,7 @@ async def app(settings: Settings) -> AsyncIterator[FastAPI]:
                 text(
                     "TRUNCATE TABLE assistant_tool_calls, pending_actions, assistant_turns, "
                     "tickets, bookings, devices, memberships, apartments, buildings, "
-                    "rag_queries, rag_outbox, rag_chunks, rag_documents, "
+                    "rag_connector_runs, rag_queries, rag_outbox, rag_chunks, rag_documents, "
                     "ai_outbox, ai_jobs, items, users CASCADE"
                 )
             )

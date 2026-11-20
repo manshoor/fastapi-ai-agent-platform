@@ -46,6 +46,13 @@ class RAGSettings(AISettings):
     rag_owner_document_limit: int = Field(default=50, ge=1, le=10_000)
     rag_owner_unsettled_limit: int = Field(default=5, ge=1, le=1000)
     rag_global_unsettled_limit: int = Field(default=100, ge=1, le=100_000)
+    # Connector documents in progress, all connectors together: kept under the global
+    # limit so a large sync leaves room for uploads.
+    rag_connector_unsettled_limit: int = Field(default=20, ge=1, le=10_000)
+
+    # Connector sync service (python -m app.rag.connectors).
+    rag_connectors_file: str | None = None
+    rag_connector_poll_seconds: float = Field(default=15, gt=0, le=3600)
 
     # Query limits.
     rag_query_limit: int = Field(default=10, ge=1, le=10_000)

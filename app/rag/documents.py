@@ -29,6 +29,8 @@ ADMISSION_LOCK_KEY = 0x52414731
 DELETED_TITLE = "deleted"
 # Readers never see a tombstone.
 VISIBLE = RAGDocument.status != "deleted"
+# Owner quotas and lists cover uploads; connector documents have their own bounds.
+UPLOADS = RAGDocument.source_kind == "upload"
 
 
 def document_response(document: RAGDocument) -> DocumentResponse:
@@ -82,7 +84,7 @@ async def _check_unsettled(session: AsyncSession, settings: RAGSettings, owner_i
         await session.rollback()
         raise HTTPException(503, "Ingestion capacity unavailable", headers={"Retry-After": "5"})
     if (
-        await _count(session, unsettled, RAGDocument.owner_id == owner_id)
+        await _count(session, unsettled, RAGDocument.owner_id == owner_id, UPLOADS)
         >= settings.rag_owner_unsettled_limit
     ):
         await session.rollback()
@@ -138,7 +140,7 @@ async def submit_document(
         raise HTTPException(404, "Building not found")
     await _check_unsettled(session, settings, owner_id)
     if (
-        await _count(session, RAGDocument.owner_id == owner_id, VISIBLE)
+        await _count(session, RAGDocument.owner_id == owner_id, VISIBLE, UPLOADS)
         >= settings.rag_owner_document_limit
     ):
         await session.rollback()
@@ -194,7 +196,7 @@ async def list_documents(
     # The per-owner document quota bounds this list, so no cursor is needed.
     documents = await session.scalars(
         select(RAGDocument)
-        .where(RAGDocument.owner_id == owner_id, VISIBLE)
+        .where(RAGDocument.owner_id == owner_id, VISIBLE, UPLOADS)
         .order_by(RAGDocument.created_at.desc(), RAGDocument.id.desc())
         .limit(settings.rag_owner_document_limit)
     )
@@ -270,6 +272,7 @@ async def update_document(
     if document is None:
         await session.rollback()
         raise HTTPException(404, "Document not found")
+    await _refuse_connector(session, document)
     # Building documents: only a current manager of that building may change them.
     if document.building_id is not None and not await is_manager(
         session, owner_id, document.building_id
@@ -298,17 +301,40 @@ async def update_document(
     await session.execute(select(func.pg_advisory_xact_lock(ADMISSION_LOCK_KEY)))
     await _check_unsettled(session, settings, owner_id)
 
-    # New version and its event, in one transaction.
+    await start_version(session, settings, document, upload, trace_context)
+    document.update_key_hash = key_hash
+    document.update_fingerprint = fingerprint
+    await session.flush()
+    response = document_response(document)
+    await session.commit()
+    if telemetry is not None:
+        telemetry.increment("rag.documents", status="pending")
+    return response, 202
+
+
+async def _refuse_connector(session: AsyncSession, document: RAGDocument) -> None:
+    # The next sync would overwrite or re-create it; change the source instead.
+    if document.source_kind != "upload":
+        await session.rollback()
+        raise HTTPException(409, "Document is managed by a connector")
+
+
+async def start_version(
+    session: AsyncSession,
+    settings: RAGSettings,
+    document: RAGDocument,
+    upload: Upload,
+    trace_context: dict[str, str],
+) -> None:
+    """Next version and its event, uncommitted. Caller holds the row and admission locks."""
     now: datetime = await session.scalar(select(func.clock_timestamp()))
     version = document.version + 1
     document.version = version
     document.status = "pending"
     document.content_type = str(upload.content_type)
     document.size_bytes = len(upload.data)
-    document.content_sha256 = content_sha256
+    document.content_sha256 = hashlib.sha256(upload.data).hexdigest()
     document.source = upload.data
-    document.update_key_hash = key_hash
-    document.update_fingerprint = fingerprint
     document.attempt = 1
     document.next_attempt_at = now
     document.deadline_at = now + timedelta(seconds=settings.rag_queue_timeout_seconds)
@@ -330,12 +356,6 @@ async def update_document(
             available_at=now,
         )
     )
-    await session.flush()
-    response = document_response(document)
-    await session.commit()
-    if telemetry is not None:
-        telemetry.increment("rag.documents", status="pending")
-    return response, 202
 
 
 async def _current(session: AsyncSession, document: RAGDocument) -> tuple[DocumentResponse, int]:
@@ -355,6 +375,14 @@ async def delete_document(*, session: AsyncSession, owner_id: UUID, document_id:
     if document is None:
         await session.rollback()
         raise HTTPException(404, "Document not found")
+    await _refuse_connector(session, document)
+    await tombstone(session, document)
+    await session.commit()
+
+
+async def tombstone(session: AsyncSession, document: RAGDocument) -> None:
+    """Delete in place, uncommitted. Caller holds the document's row lock."""
+    document_id = document.id
     now: datetime = await session.scalar(select(func.clock_timestamp()))
     await session.execute(delete(RAGChunk).where(RAGChunk.document_id == document_id))
     await session.execute(
@@ -387,4 +415,3 @@ async def delete_document(*, session: AsyncSession, owner_id: UUID, document_id:
             available_at=now,
         )
     )
-    await session.commit()

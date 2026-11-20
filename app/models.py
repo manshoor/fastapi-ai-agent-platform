@@ -266,7 +266,6 @@ class RAGDocument(Base):
         UniqueConstraint("owner_id", "idempotency_key_hash", name="uq_rag_documents_owner_key"),
         # Target of the rag_chunks composite FK: a chunk's owner must be its document's owner.
         UniqueConstraint("id", "owner_id", name="uq_rag_documents_id_owner"),
-        UniqueConstraint("connector_name", "external_id", name="uq_rag_documents_connector_item"),
         CheckConstraint(
             "status IN ('pending','processing','ready','failed','deleted')",
             name="ck_rag_documents_status",
@@ -357,6 +356,14 @@ class RAGDocument(Base):
             "ix_rag_documents_building",
             "building_id",
             postgresql_where=text("building_id IS NOT NULL"),
+        ),
+        # One live document per connector record; a tombstone frees its record id.
+        Index(
+            "uq_rag_documents_connector_item",
+            "connector_name",
+            "external_id",
+            unique=True,
+            postgresql_where=text("connector_name IS NOT NULL AND status <> 'deleted'"),
         ),
         Index(
             # Recovery purges tombstones whose delete event was lost.
@@ -471,6 +478,43 @@ class RAGOutbox(Base):
             postgresql_where=text("published_at IS NULL"),
         ),
         Index("ix_rag_outbox_document_id", "document_id"),
+    )
+
+
+RAG_CONNECTOR_RUN_STATUSES = ("running", "complete", "partial", "failed")
+
+
+# One connector sync run: counts and a fixed code only. Never content, query or URL.
+class RAGConnectorRun(Base):
+    __tablename__ = "rag_connector_runs"
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    connector_name: Mapped[str] = mapped_column(String(64))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), server_default="running")
+    fetched: Mapped[int] = mapped_column(Integer, server_default="0")
+    created: Mapped[int] = mapped_column(Integer, server_default="0")
+    updated: Mapped[int] = mapped_column(Integer, server_default="0")
+    deleted: Mapped[int] = mapped_column(Integer, server_default="0")
+    unchanged: Mapped[int] = mapped_column(Integer, server_default="0")
+    skipped: Mapped[int] = mapped_column(Integer, server_default="0")
+    error_code: Mapped[str | None] = mapped_column(String(64))
+
+    __table_args__ = (
+        CheckConstraint(
+            f"status IN ({_sql_in(RAG_CONNECTOR_RUN_STATUSES)})",
+            name="ck_rag_connector_runs_status",
+        ),
+        CheckConstraint(
+            "(status = 'running') = (finished_at IS NULL)", name="ck_rag_connector_runs_finished"
+        ),
+        CheckConstraint(
+            "fetched >= 0 AND created >= 0 AND updated >= 0 AND deleted >= 0 "
+            "AND unchanged >= 0 AND skipped >= 0",
+            name="ck_rag_connector_runs_counts",
+        ),
+        Index("ix_rag_connector_runs_connector", "connector_name", started_at.desc()),
     )
 
 

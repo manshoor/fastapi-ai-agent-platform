@@ -278,6 +278,62 @@ services:
         condition: service_completed_successfully
     logging: *logging
 
+  # Connector sync and its local fakes: --profile connectors.
+  connector-sync:
+    profiles: [connectors]
+    build: *build
+    environment:
+      <<: *processing-environment
+      DB_POOL_SIZE: "2"
+      RAG_CONNECTORS_FILE: /etc/rag/connectors.yaml
+      # Fake-only reader of the local source-db; real DSNs come from a private env file.
+      SOURCE_DB_DSN: postgresql://notices_reader:local-fake-source-only@source-db:5432/notices
+    volumes:
+      - ${AI_CONNECTORS_FILE:-./docker/connectors/connectors.example.yaml}:/etc/rag/connectors.yaml:ro
+    command: ["python", "-m", "app.rag.connectors"]
+    networks: [default, connector_sources]
+    stop_grace_period: 30s
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      source-db:
+        condition: service_healthy
+      source-api:
+        condition: service_healthy
+    logging: *logging
+
+  source-db:
+    profiles: [connectors]
+    image: fastapi-crud-postgres:19rc1-pgvector-0.8.7
+    build: docker/postgres
+    environment:
+      POSTGRES_DB: notices
+      POSTGRES_USER: source_admin
+      POSTGRES_PASSWORD: local-fake-source-only
+    volumes:
+      - ./docker/connectors/source-db-init.sql:/docker-entrypoint-initdb.d/10-notices.sql:ro
+    networks: [connector_sources]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U source_admin -d notices"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    logging: *logging
+
+  source-api:
+    profiles: [connectors]
+    build: *build
+    command: ["uvicorn", "tests.support.source_api:app", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
+    networks: [connector_sources]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/records',timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    logging: *logging
+
 volumes:
   ai_postgres_data:
   ai_kafka_data:
@@ -288,3 +344,6 @@ networks:
   # Docker requires a non-internal API attachment for loopback port publication.
   api_ingress:
     internal: false
+  # The sync service and the fake sources only; real sources need their own egress overlay.
+  connector_sources:
+    internal: true
