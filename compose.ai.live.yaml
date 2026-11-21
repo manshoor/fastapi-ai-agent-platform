@@ -11,8 +11,14 @@ services:
     networks:
       - default
       - provider_egress
-  # RAG: the worker pays for document embeddings, the API for question embeddings and answers.
+  # RAG: both document workers (Kafka and SQS) pay for document embeddings, the API for
+  # question embeddings and answers. Both need the live provider: either may claim first.
   rag-worker:
+    environment: *live-provider
+    networks:
+      - default
+      - provider_egress
+  rag-worker-sqs:
     environment: *live-provider
     networks:
       - default

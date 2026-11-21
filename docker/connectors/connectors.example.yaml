@@ -1,0 +1,28 @@
+# Connector config for `python -m app.rag.connectors` (RAG_CONNECTORS_FILE), read once at start.
+# Secrets are named by environment variable (dsn_env, auth_header_env), never written here.
+# building_id and owner_user_id are placeholders: set them to a building and one of its
+# managers. Until then every run fails with owner_not_manager and writes nothing.
+connectors:
+  - name: notices-db
+    building_id: 00000000-0000-0000-0000-000000000000
+    owner_user_id: 00000000-0000-0000-0000-000000000000
+    interval_seconds: 60
+    max_records: 500
+    source:
+      kind: postgres
+      dsn_env: SOURCE_DB_DSN
+      query: SELECT id AS external_id, title, body AS content FROM notices
+
+  - name: notices-api
+    building_id: 00000000-0000-0000-0000-000000000000
+    owner_user_id: 00000000-0000-0000-0000-000000000000
+    interval_seconds: 60
+    max_records: 500
+    source:
+      kind: http_json
+      url: http://source-api:8080/records
+      # Plain http only because the fake is listed here; real sources use https.
+      allowed_hosts: [source-api]
+      pagination:
+        mode: page
+      max_pages: 20

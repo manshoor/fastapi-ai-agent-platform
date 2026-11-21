@@ -175,6 +175,7 @@ async def add_ready_document(
                 idempotency_key_hash=uuid4().hex,
                 request_fingerprint=uuid4().hex,
                 status="ready",
+                active_version=1,
                 deadline_at=func.now() + timedelta(hours=1),
                 embedding_model=EMBEDDING_MODEL,
                 embedding_dimensions=RAG_EMBEDDING_DIMENSIONS,
@@ -189,6 +190,7 @@ async def add_ready_document(
             [
                 {
                     "document_id": document_id,
+                    "version": 1,
                     "owner_id": owner_id,
                     "ordinal": ordinal,
                     "page": None,

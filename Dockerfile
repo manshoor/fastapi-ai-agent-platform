@@ -9,6 +9,13 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
+# OCR for scanned PDF pages: pdftoppm renders a page, tesseract reads it. Pinned.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        tesseract-ocr=5.3.0-2 \
+        tesseract-ocr-eng=1:4.1.0-2 \
+        poppler-utils=22.12.0-2+deb12u3 \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --uid 10001 app
 COPY pyproject.toml uv.lock ./
 COPY app ./app

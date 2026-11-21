@@ -49,6 +49,7 @@ _SPANS = frozenset(
         "ai.submit",
         "ai.poll",
         "rag.upload",
+        "rag.update",
         "rag.consume",
         "rag.dispatcher.publish",
         "rag.ingest",
@@ -95,6 +96,7 @@ _NUMBERS = frozenset(
     {
         "attempt",
         "lease_generation",
+        "document_version",
         "partition",
         "offset",
         "queue_depth",
@@ -105,6 +107,8 @@ _NUMBERS = frozenset(
         "gen_ai.usage.output_tokens",
         "chunk_count",
         "page_count",
+        "ocr_pages",
+        "ocr_truncated",
         "retrieved_count",
         "top_k",
         "model_calls",
@@ -126,7 +130,10 @@ _TAGS = frozenset(
         "error_code",
         "provider",
         "operation",
+        "event_type",
         "topic",
+        "sink",
+        "queue",
         "gen_ai.system",
         "gen_ai.operation.name",
         "gen_ai.request.model",
@@ -155,6 +162,7 @@ def _attributes(attrs, *, metric=False):
             "provider",
             "operation",
             "topic",
+            "sink",
             "partition",
         }:
             continue
