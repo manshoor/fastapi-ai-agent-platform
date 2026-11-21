@@ -88,6 +88,8 @@ class HTTPSource(_Strict):
 
     @model_validator(mode="after")
     def _safe_url(self) -> "HTTPSource":
+        if self.url != self.url.strip():
+            raise ValueError("url must not have surrounding whitespace")
         try:
             # httpx must accept it too, or every fetch would fail at request time.
             httpx.URL(self.url).port  # noqa: B018

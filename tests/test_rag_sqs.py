@@ -416,3 +416,50 @@ def test_event_sinks_always_include_kafka_once(runtime, sinks):
                 "rag_sqs_endpoint": ENDPOINT,
             }
         )
+
+
+async def test_failed_batch_releases_queued_messages(runtime, sqs_settings, queues):
+    for index in range(3):
+        await runtime.submit(f"Queued notice {index} about parking.".encode())
+        await publish(runtime, sqs_settings, queues)
+    settings = sqs_settings.model_copy(update={"ai_concurrency": 1})
+    broken = SQSQueues(FailingDeletes(queues.client), queues.events_url, queues.dead_letter_url)
+    with pytest.raises(ExceptionGroup):
+        async with asyncio.timeout(30):
+            await poll(runtime, settings, broken)
+    # Nothing is left invisible: the failed one and the two that never started are back.
+    assert await depth(queues, queues.events_url) == (3, 0)
+
+
+async def test_stop_mid_batch_starts_nothing_new(runtime, sqs_settings, queues):
+    first = await runtime.submit(b"First notice about the roof.")
+    second = await runtime.submit(b"Second notice about the yard.")
+    await publish(runtime, sqs_settings, queues)
+    await publish(runtime, sqs_settings, queues)
+    stop = asyncio.Event()
+
+    class Embedder(ControlledEmbedder):
+        async def embed(self, texts, *, model=None):
+            # Stop arrives while the first document is being handled.
+            stop.set()
+            return await super().embed(texts, model=model)
+
+    settings = sqs_settings.model_copy(update={"ai_concurrency": 1})
+    embedder = Embedder()
+    async with asyncio.timeout(30):
+        await poll_once(
+            session_factory=runtime.factory,
+            settings=settings,
+            queues=queues,
+            embedder=embedder,
+            wait_seconds=1,
+            stop=stop,
+        )
+    statuses = {
+        (await runtime.read(first.document_id)).status,
+        (await runtime.read(second.document_id)).status,
+    }
+    assert statuses == {"ready", "pending"}
+    assert len(embedder.calls) == 1
+    # The one never started is visible again at once.
+    assert await depth(queues, queues.events_url) == (1, 0)

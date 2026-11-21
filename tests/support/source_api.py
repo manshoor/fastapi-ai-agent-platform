@@ -78,6 +78,17 @@ def make_source_app(records: dict[str, dict] | None = None) -> FastAPI:
         body = gzip.compress(b" " * (64 * 1024 * 1024))
         return Response(body, media_type="application/json", headers={"Content-Encoding": "gzip"})
 
+    @app.get("/gzip-trailing")
+    async def gzip_trailing() -> Response:
+        # A valid member, then junk that zlib would keep as unused data.
+        body = gzip.compress(b"[]") + b"\x00" * (1024 * 1024)
+        return Response(body, media_type="application/json", headers={"Content-Encoding": "gzip"})
+
+    @app.get("/gzip-truncated")
+    async def gzip_truncated() -> Response:
+        body = gzip.compress(b"[]")[:-4]
+        return Response(body, media_type="application/json", headers={"Content-Encoding": "gzip"})
+
     @app.get("/brotli")
     async def brotli() -> Response:
         return Response(b"\x0b\x01\x80[]\x03", headers={"Content-Encoding": "br"})

@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 CONTENT_TYPE = ContentType.TEXT
 # Final failures caused by time, not content: the same content gets another version.
 RETRY_CODES = frozenset({IngestError.ATTEMPTS_EXHAUSTED, IngestError.QUEUE_EXPIRED})
-# Codes that end a run with nothing applied.
+# Fetch codes that still apply the records fetched, but forbid deletes.
 _FETCH_PARTIAL = frozenset({"record_limit", "page_limit", "invalid_record_id"})
 
 Fetcher = Callable[[Connector, Mapping[str, str]], Awaitable[Fetch]]

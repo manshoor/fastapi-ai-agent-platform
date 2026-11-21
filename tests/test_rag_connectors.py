@@ -366,6 +366,28 @@ async def test_http_source_missing_cursor_key_fails(connector, source_api):
     assert (result.complete, result.error_code, result.records) == (False, "source_malformed", [])
 
 
+@pytest.mark.parametrize("path", ["/gzip-trailing", "/gzip-truncated"])
+async def test_http_source_refuses_broken_gzip(connector, source_api, path):
+    result = await fetch(http_source(connector, path), source_api)
+    assert (result.complete, result.error_code, result.records) == (False, "source_malformed", [])
+
+
+async def test_http_source_caps_total_bytes(connector, source_api, monkeypatch):
+    monkeypatch.setattr(sources, "MAX_FETCH_BYTES", 150)
+    paged = http_source(connector, "/records", pagination={"mode": "page"})
+    result = await fetch(paged, source_api)
+    assert (result.complete, result.error_code, result.records) == (False, "source_too_large", [])
+
+
+async def test_postgres_source_has_a_fetch_deadline(connector, source_db, monkeypatch):
+    monkeypatch.setattr(sources, "FETCH_DEADLINE_SECONDS", 0.2)
+    slow = connector(
+        pg_source("SELECT 1 AS external_id, 't' AS title, 'c' AS content FROM pg_sleep(1)")
+    ).source
+    result = await fetch_postgres(slow, 10, source_db)
+    assert (result.complete, result.error_code) == (False, "source_query_failed")
+
+
 @pytest.mark.parametrize("path", ["/brotli", "/gzip-bomb"])
 async def test_http_source_bounds_decoding(connector, source_api, path):
     # Brotli is refused before decoding; gzip inflates only up to the cap.

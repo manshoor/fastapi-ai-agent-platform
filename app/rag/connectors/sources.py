@@ -21,7 +21,8 @@ SOURCE_TIMEOUT_SECONDS = 10
 # The whole fetch, all pages together.
 FETCH_DEADLINE_SECONDS = 120
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
-# One database fetch, all rows together; one row's content is capped at MAX_RESPONSE_BYTES.
+# One fetch, all database rows or all HTTP pages together.
+# One row's content is capped at MAX_RESPONSE_BYTES.
 MAX_FETCH_BYTES = 64 * 1024 * 1024
 # Rows asyncpg reads ahead: at most MAX_FETCH_BYTES of maximal rows are buffered.
 CURSOR_PREFETCH = max(1, MAX_FETCH_BYTES // MAX_RESPONSE_BYTES)
@@ -87,12 +88,23 @@ async def fetch_postgres(
         # ValueError: a DSN that does not parse.
         return Fetch(error_code="source_unreachable")
     try:
-        async with connection.transaction(readonly=True):
-            await connection.execute(f"SET LOCAL statement_timeout = '{SOURCE_TIMEOUT_SECONDS}s'")
-            rows = await _bounded_rows(connection, statement)
+        # The whole fetch, all cursor round trips together, like an HTTP fetch.
+        async with asyncio.timeout(FETCH_DEADLINE_SECONDS):
+            async with connection.transaction(readonly=True):
+                await connection.execute(
+                    f"SET LOCAL statement_timeout = '{SOURCE_TIMEOUT_SECONDS}s'"
+                )
+                rows = await _bounded_rows(connection, statement)
     except _SourceError as error:
         return Fetch(error_code=error.code)
-    except (OSError, TimeoutError, asyncpg.PostgresError, asyncpg.InterfaceError):
+    except (
+        OSError,
+        TimeoutError,
+        UnicodeDecodeError,
+        asyncpg.PostgresError,
+        asyncpg.InterfaceError,
+    ):
+        # UnicodeDecodeError: asyncpg decodes text as strict UTF-8.
         return Fetch(error_code="source_query_failed")
     finally:
         try:
@@ -138,16 +150,24 @@ def _at(data: Any, path: str) -> Any:
 
 
 def _inflate(inflater, chunk: bytes, body: bytearray) -> None:
-    """Inflate at most one byte past the cap per call, so memory stays bounded."""
+    """Inflate at most one byte past the cap per call, so memory stays bounded.
+
+    One gzip member only: bytes after its end (junk or a second member) are refused,
+    since zlib would keep them as unused data outside the cap.
+    """
     while chunk:
+        if inflater.eof:
+            raise _SourceError("source_malformed")
         body.extend(inflater.decompress(chunk, MAX_RESPONSE_BYTES + 1 - len(body)))
         if len(body) > MAX_RESPONSE_BYTES:
             raise _SourceError("source_too_large")
+        if inflater.unused_data:
+            raise _SourceError("source_malformed")
         chunk = inflater.unconsumed_tail
 
 
-async def _get_json(client: httpx.AsyncClient, url: httpx.URL, headers: dict) -> Any:
-    """One GET: 200 only, identity or gzip decoded here under the cap, then JSON."""
+async def _get_json(client: httpx.AsyncClient, url: httpx.URL, headers: dict) -> tuple[Any, int]:
+    """One GET: 200 only, identity or gzip decoded here under the cap, then JSON and size."""
     async with client.stream("GET", url, headers=headers) as response:
         if response.status_code != 200:
             raise _SourceError("source_http_status")
@@ -167,8 +187,11 @@ async def _get_json(client: httpx.AsyncClient, url: httpx.URL, headers: dict) ->
                     raise _SourceError("source_too_large")
         except zlib.error:
             raise _SourceError("source_malformed") from None
+        if inflater is not None and not inflater.eof:
+            # Cut short: the gzip trailer (and its CRC check) never arrived.
+            raise _SourceError("source_malformed")
     try:
-        return json.loads(body)
+        return json.loads(body), len(body)
     except (ValueError, RecursionError):
         raise _SourceError("source_malformed") from None
 
@@ -214,6 +237,8 @@ async def _pages(client, source: HTTPSource, max_records: int, headers: dict, fe
     paging = source.pagination
     cursor: str | None = None
     base = httpx.URL(source.url)
+    # All pages together stay under the database source's total bound.
+    total = 0
     for page in range(1, source.max_pages + 1):
         params: dict[str, str] = {}
         if paging.mode == "page":
@@ -222,7 +247,10 @@ async def _pages(client, source: HTTPSource, max_records: int, headers: dict, fe
             # A value, never a URL: the next request still goes to the configured URL.
             params[paging.cursor_param] = cursor
         # Merged into the URL's own query: httpx's params= would replace it.
-        data = await _get_json(client, base.copy_merge_params(params), headers)
+        data, size = await _get_json(client, base.copy_merge_params(params), headers)
+        total += size
+        if total > MAX_FETCH_BYTES:
+            raise _SourceError("source_too_large")
         items = _at(data, source.items_path)
         if not isinstance(items, list):
             # A missing list is a failure, never "zero records" (that would delete all).

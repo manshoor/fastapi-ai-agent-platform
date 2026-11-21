@@ -8,10 +8,12 @@
                                 consumer wins, a duplicate settles with no writes
           HANDLED  -> delete    (only after the outcome is durable)
           DEFERRED -> visible again in RETRY_DELAY_SECONDS; its group waits
-      while a message is handled its visibility is extended every third of it
-      at most AI_CONCURRENCY messages are handled at once; a failure in one group
-      cancels the others, which hand their leases back at the same attempt
-      on stop: nothing new starts; in-flight work gets DRAIN_SECONDS, then is cancelled
+      every held message (queued or in progress) is extended every third of its
+      visibility; at most AI_CONCURRENCY are handled at once
+      a failure in one group cancels the others, which hand their leases back at the
+      same attempt; whatever is still held when the batch ends is released at once
+      on stop: no new message starts; in-flight work gets DRAIN_SECONDS, then is
+      cancelled
 
 No redrive policy moves messages: a retrying event is not a dead letter.
 """
@@ -136,15 +138,27 @@ async def _set_visibility(queues: SQSQueues, receipt: str, seconds: int) -> None
         )
 
 
-async def _keep_invisible(queues: SQSQueues, receipt: str, seconds: int) -> None:
-    """Extend visibility while the message is handled, so no second consumer gets it."""
+class _Batch:
+    """The receipts of one poll this worker still holds: extended, then released."""
+
+    def __init__(self, queues: SQSQueues, messages: list[dict]):
+        self.queues = queues
+        self.open = {message["ReceiptHandle"]: message for message in messages}
+
+    def settle(self, message: dict) -> None:
+        self.open.pop(message["ReceiptHandle"], None)
+
+
+async def _keep_invisible(batch: _Batch, seconds: int) -> None:
+    """Extend every held message, queued or in progress, so no other consumer gets it."""
     while True:
         await asyncio.sleep(seconds / 3)
-        try:
-            await _set_visibility(queues, receipt, seconds)
-        except SQS_ERRORS:
-            # The claim fence still settles a redelivery; keep trying.
-            continue
+        for receipt in list(batch.open):
+            try:
+                await _set_visibility(batch.queues, receipt, seconds)
+            except SQS_ERRORS:
+                # The claim fence still settles a redelivery; keep trying.
+                continue
 
 
 async def process_message(
@@ -153,35 +167,27 @@ async def process_message(
     settings: RAGSettings,
     queues: SQSQueues,
     message: dict,
+    batch: _Batch,
     embedder: Embedder,
     telemetry: Telemetry | None = None,
 ) -> HandleResult:
-    receipt = message["ReceiptHandle"]
-    keeper = asyncio.create_task(
-        _keep_invisible(queues, receipt, settings.rag_sqs_visibility_seconds)
+    """Handle one message. On any failure it stays held, and the batch releases it."""
+    result = await handle_message(
+        session_factory=session_factory,
+        settings=settings,
+        queues=queues,
+        message=message,
+        embedder=embedder,
+        telemetry=telemetry,
     )
-    try:
-        result = await handle_message(
-            session_factory=session_factory,
-            settings=settings,
-            queues=queues,
-            message=message,
-            embedder=embedder,
-            telemetry=telemetry,
-        )
-    except BaseException:
-        await _stop_keeper(keeper)
-        # Best effort: let it come back soon; otherwise it returns when visibility ends.
-        await _release(queues, [message], RETRY_DELAY_SECONDS)
-        raise
-    # Awaited, so no late extension lands after the release below.
-    await _stop_keeper(keeper)
+    receipt = message["ReceiptHandle"]
     if result == HandleResult.HANDLED:
         # The outcome is committed: only now may the message go.
         async with asyncio.timeout(SQS_IO_TIMEOUT):
             await queues.client.delete_message(QueueUrl=queues.events_url, ReceiptHandle=receipt)
     else:
         await _set_visibility(queues, receipt, RETRY_DELAY_SECONDS)
+    batch.settle(message)
     return result
 
 
@@ -190,27 +196,36 @@ async def _stop_keeper(keeper: asyncio.Task) -> None:
     await asyncio.gather(keeper, return_exceptions=True)
 
 
-async def _release(queues: SQSQueues, messages: list[dict], seconds: int) -> None:
+async def _release(batch: _Batch, messages: list[dict], seconds: int) -> None:
     """Best effort: a message not released returns when its visibility ends."""
     for message in messages:
         try:
-            await _set_visibility(queues, message["ReceiptHandle"], seconds)
+            await _set_visibility(batch.queues, message["ReceiptHandle"], seconds)
         except SQS_ERRORS:
-            continue
+            pass
+        finally:
+            batch.settle(message)
 
 
-async def _run_group(messages: list[dict], semaphore: asyncio.Semaphore, **kwargs: Any) -> None:
+async def _run_group(
+    messages: list[dict],
+    semaphore: asyncio.Semaphore,
+    batch: _Batch,
+    stop: asyncio.Event | None,
+    **kwargs: Any,
+) -> None:
     """One document's messages in order; at most ai_concurrency handled at once."""
     for index, message in enumerate(messages):
-        try:
-            async with semaphore:
-                result = await process_message(message=message, **kwargs)
-        except BaseException:
-            await _release(kwargs["queues"], messages[index + 1 :], 0)
-            raise
+        if stop is not None and stop.is_set():
+            return
+        async with semaphore:
+            # Stop may have come while this message waited for a slot.
+            if stop is not None and stop.is_set():
+                return
+            result = await process_message(message=message, batch=batch, **kwargs)
         if result != HandleResult.HANDLED:
-            # Later messages of this document wait: release them to keep their order.
-            await _release(kwargs["queues"], messages[index + 1 :], RETRY_DELAY_SECONDS)
+            # Later messages of this document wait behind it, to keep their order.
+            await _release(batch, messages[index + 1 :], RETRY_DELAY_SECONDS)
             return
 
 
@@ -227,7 +242,8 @@ async def poll_once(
     """One long poll; returns how many messages were received.
 
     A failure in one group cancels the others (their leases are handed back at the same
-    attempt) and is raised only after every group has finished.
+    attempt) and is raised only after every group has finished. Every message still held
+    when the batch ends (failed, cancelled, never started) is made visible again at once.
     """
     wait = settings.rag_sqs_wait_seconds if wait_seconds is None else wait_seconds
     async with asyncio.timeout(wait + SQS_IO_TIMEOUT):
@@ -240,28 +256,37 @@ async def poll_once(
             MessageSystemAttributeNames=["MessageGroupId"],
         )
     messages = response.get("Messages") or []
+    batch = _Batch(queues, messages)
     if stop is not None and stop.is_set():
         # Stopping: start nothing new, hand the batch straight back.
-        await _release(queues, messages, 0)
+        await _release(batch, messages, 0)
         return len(messages)
     groups: dict[str, list[dict]] = defaultdict(list)
     for message in messages:
         group = (message.get("Attributes") or {}).get("MessageGroupId", "")
         groups[group].append(message)
     semaphore = asyncio.Semaphore(settings.ai_concurrency)
-    async with asyncio.TaskGroup() as tasks:
-        for group in groups.values():
-            tasks.create_task(
-                _run_group(
-                    group,
-                    semaphore,
-                    session_factory=session_factory,
-                    settings=settings,
-                    queues=queues,
-                    embedder=embedder,
-                    telemetry=telemetry,
+    keeper = asyncio.create_task(_keep_invisible(batch, settings.rag_sqs_visibility_seconds))
+    try:
+        async with asyncio.TaskGroup() as tasks:
+            for group in groups.values():
+                tasks.create_task(
+                    _run_group(
+                        group,
+                        semaphore,
+                        batch,
+                        stop,
+                        session_factory=session_factory,
+                        settings=settings,
+                        queues=queues,
+                        embedder=embedder,
+                        telemetry=telemetry,
+                    )
                 )
-            )
+    finally:
+        # Awaited first, so no late extension lands after the release.
+        await _stop_keeper(keeper)
+        await asyncio.shield(_release(batch, list(batch.open.values()), 0))
     return len(messages)
 
 
