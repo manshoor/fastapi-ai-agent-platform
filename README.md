@@ -492,10 +492,11 @@ connector-sync --------+--> rag_documents (new version) + rag_outbox, one transa
            rag-dispatcher-sqs ---+--> SQS rag-document-events.fifo ---> rag-worker-sqs
                 both workers: claim (first wins, the duplicate settles)
                   created/updated: parse (sandboxed: PDF + OCR, Word, HTML) -> chunk -> embed
+                                   (+ graph extraction per batch, RAG_GRAPH_ENABLED)
                                    -> swap to the new version in one transaction
                   deleted: purge the tombstone
 query  --> API: auth -> query slot -> admit (rate limit) -> embed question -> owner-scoped pgvector KNN
-                 -> neighbor windows (+ optional rerank) -> claims, each with a quote
+                 (+ graph-linked chunks) -> neighbor windows (+ optional rerank) -> claims, each with a quote
                  -> server checks every quote and number (+ optional verifier) -> 200
 ```
 
@@ -519,6 +520,7 @@ All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
 | `PUT /api/v1/rag/documents/{id}/content` | 202; 200 for the same content or a replay | Multipart `file` only, same types and limits, `Idempotency-Key`. Starts the next version; queries read the current `active_version` until the new one is ready. 409 while a version is in progress. |
 | `GET /api/v1/rag/documents` | 200 | Owner's uploaded documents, newest first (connector documents are not listed). |
 | `GET /api/v1/rag/documents/{id}` | 200 | Status, `version`, `active_version`, `update_error_code`, `source_kind`, chunk and page counts, error code, timestamps. Never the content. |
+| `GET /api/v1/rag/documents/{id}/graph` | 200 | Distinct nodes and edges of the active version (at most 1,000 each, `truncated`), and `graph_error_code`. Owner only; empty while no version is active. |
 | `DELETE /api/v1/rag/documents/{id}` | 204 | One transaction removes the chunks and the source and leaves a tombstone (404 to every reader) plus a `doc.deleted` event; the worker purges the row and **its idempotency record**, so the same key can then create a new document. |
 | `POST /api/v1/rag/query` | 200 | JSON `question` (1–2,000 chars), `top_k` (1–8, default 4), optional `document_ids` (1–20). Returns `status` (`answered`/`no_context`), `answer`, `citations[{document_id,title,ordinal,page,snippet,quotes}]`. `quotes` are the checked, word-for-word spans the answer relies on. |
 
@@ -612,17 +614,55 @@ answer = statements joined; citations = cited passages with their quotes
 
 `RAG_QUERY_DEADLINE_SECONDS` (default 60, at most 120) must exceed the embedding timeout plus one provider timeout per chat call; rerank and the verifier each add one. With the default 20 s and 30 s timeouts that is 80 s for one of them and 110 s for both. Startup fails otherwise. `compose.ai.yaml` sets 115 s so the eval can try either.
 
+### Knowledge graph (GraphRAG)
+
+Off unless `RAG_GRAPH_ENABLED=true`. Each extraction batch is one paid chat call at ingest (prompt `graph-extract-v1`), so the graph costs money only while documents are ingested; queries make no extra call.
+
+```
+ingest, per batch of RAG_GRAPH_BATCH_SIZE chunks (after the embed call, no transaction open)
+  model -> nodes{chunk C<n>, type, name} + edges{source, relation, target, quote}
+  server keeps:  type and triple in the ontology (building-ontology-v1)
+                 name: in its chunk on word edges, no email or phone number
+                 edge: quote of 3+ words in its chunk naming both ends; two distinct keys
+  -> rag_graph_nodes / rag_graph_edges, stored with the batch's chunks (same fence)
+query (after vector search, one REPEATABLE READ snapshot, same scope and active versions)
+  seeds:    nodes the question names (whole words), then nodes of the vector hits
+            within the relevance margin; at most 50
+  hops:     RAG_GRAPH_HOPS, each reads at most 50 unread edges outside the vector hits
+  evidence: their chunks, most links first, then closest; up to RAG_GRAPH_EXTRA_PASSAGES
+```
+
+- **Grounded, not trusted.** Graph passages are ordinary chunk text, so every answer quote is still checked against what the model received. The graph only decides which extra chunks are sent; it is never a source of its own. The relation, its direction and the node types are the model's reading of the quote; retrieval follows edges as undirected links.
+- **Scope.** Nodes and edges belong to one chunk of one version and cascade with it, so swaps, retries, deletes and purges remove them. Entities merge across documents only at query time, by `node_key` (`type:normalized name`), inside one owner's or one building's documents.
+- **Failures.** A rejected, invalid or cut-short extraction stores no graph for that batch and records `graph_error_code` (`graph_rejected`, `graph_invalid`, `graph_incomplete`); the document is still served. A transient provider failure (timeout, rate limit, 5xx) retries the whole document like an embedding failure and can use up its three attempts.
+- **Privacy.** People are kept out by the prompt only; the server refuses names that look like an email address or phone number. Spans carry counts only (`node_count`, `edge_count`, `graph_dropped`, `graph_passages`), never names or quotes.
+- **Limits.** Graph passages fill only the slots left under 8: with `top_k` 8 (or rerank with `top_k` 4 or more) the graph adds nothing. In the assistant, graph passages use the turn's 8 passage labels. A graph passage can repeat text the neighbor window already holds. Existing documents get a graph on their next version; there is no backfill.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `RAG_GRAPH_ENABLED` | `false` | Extraction at ingest and expansion at query time. Adds one provider timeout to the lease floor. |
+| `RAG_GRAPH_BATCH_SIZE` | `4` | Chunks per extraction call (1–8); also the stored batch size while the graph is on. |
+| `RAG_GRAPH_MAX_ITEMS_PER_CHUNK` | `8` | Nodes and edges kept per chunk (1–24). Larger values can exceed `AI_MAX_OUTPUT_TOKENS`. |
+| `RAG_GRAPH_HOPS` | `1` | Edge hops from the seeds (1–2). |
+| `RAG_GRAPH_EXTRA_PASSAGES` | `2` | Graph passages after the vector passages (0–4). |
+
 ### RAG evaluation
 
-`POST /api/v1/rag/query/diagnostics` is an eval-only route. It is 404 (before authentication) and hidden from the schema unless `RAG_DIAGNOSTICS_ENABLED=true`, which only `compose.ai.yaml` sets. It runs the normal query (same owner scope, rate limit and usage row) and also returns, to the owner only, the passages sent to the model, each claim with its check result, verifier verdicts, the refusal reason and usage. It takes optional `overrides`: `neighbor_chunks`, `relevance_margin`, `rerank`, `reasoning_effort`, `verifier`. An override set that does not fit the deadline is 422.
+`POST /api/v1/rag/query/diagnostics` is an eval-only route. It is 404 (before authentication) and hidden from the schema unless `RAG_DIAGNOSTICS_ENABLED=true`, which only `compose.ai.yaml` sets. It runs the normal query (same owner scope, rate limit and usage row) and also returns, to the owner only, the passages sent to the model, each claim with its check result, verifier verdicts, the refusal reason and usage. It takes optional `overrides`: `neighbor_chunks`, `relevance_margin`, `rerank`, `reasoning_effort`, `verifier`, `graph`. Each passage carries its `source` (`vector` or `graph`). An override set that does not fit the deadline is 422.
 
-`tests/evals/rag_v1.jsonl` holds 32 golden cases over the five documents in `tests/evals/rag_documents/` (single fact, numeric, condition, multi-passage, heading, split across chunks, distractor, not covered, injection). Each case is scored on retrieval, citations, status, facts and forbidden strings, so a wrong answer after a correct retrieval is counted on its own (`wrong_given_hit`). CI checks the data and the scorer only; the simulator cannot judge answers.
+`tests/evals/rag_v1.jsonl` holds 34 golden cases over the five documents in `tests/evals/rag_documents/` (single fact, numeric, condition, multi-passage, heading, split across chunks, distractor, not covered, injection, multi-hop). A multi-hop case needs two facts from two documents that share one entity (storage cages -> cellar -> opening hours). Each case is scored on retrieval, citations, status, facts and forbidden strings, so a wrong answer after a correct retrieval is counted on its own (`wrong_given_hit`). CI checks the data and the scorer only; the simulator cannot judge answers.
 
 Live, paid, after explicit authorisation, against the AI stack started with `compose.ai.live.yaml`:
 
 ```bash
 uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --repeat 3 --config base --config checked=verifier:on --output artifacts/rag-eval.json
 uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --judge --judge-model MODEL
+```
+
+`--graph` runs every selected case twice, as configurations `vector` (`graph:off`) and `graph` (`graph:on`). Start the API with `RAG_GRAPH_ENABLED=true` so the fixture documents are ingested with a graph; extraction is paid too.
+
+```bash
+uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --graph --case multi-hop-storage-hours --case multi-hop-guest-apartment
 ```
 
 `--judge` first runs six judge controls with known verdicts and exits 2 if the judge gets one wrong. The script accepts loopback destinations only (not ports 8000 or 8001) and prints case IDs, check names, rates and fixed codes; `--output` saves scores without text, mode 0600. Against the simulator it exits 1 by design: it only checks the wiring.

@@ -35,3 +35,7 @@ The party room costs €50 per booking plus a €100 deposit. The deposit is ret
 ## Refunds
 
 Refunds of deposits and cancelled bookings are paid to the account that paid the original amount. Cash is not accepted for any charge.
+
+## Guest apartment
+
+The guest apartment is operated by the concierge service. Residents book it for their visitors.

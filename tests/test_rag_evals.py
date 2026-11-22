@@ -45,6 +45,7 @@ EXPECTED_CATEGORIES = {
     "distractor": 3,
     "not_covered": 3,
     "injection": 2,
+    "multi_hop": 2,
 }
 
 
@@ -90,6 +91,12 @@ def test_facts_are_stated_by_the_evidence_documents():
         text = "\n".join(_holders(item)[0]["text"] for item in case["evidence"])
         for group in case["facts"]:
             assert any(contains(text, item) for item in group), case["id"]
+
+
+def test_multi_hop_evidence_spans_two_documents():
+    for case in _cases("multi_hop"):
+        holders = [_holders(item)[0]["name"] for item in case["evidence"]]
+        assert len(holders) == 2 and len(set(holders)) == 2, case["id"]
 
 
 def test_distractor_answers_come_from_another_document():
@@ -422,6 +429,13 @@ def test_setup_stops_when_the_route_is_not_reachable(status, message):
     with pytest.raises(script.SetupError, match=message):
         script.check_route(_Client(status))
     script.check_route(_Client(401))
+
+
+def test_graph_compares_the_graph_off_and_on():
+    args = _script().parse_args(["--allow-paid-requests", "--graph"])
+    assert args.configs == [("vector", {"graph": "off"}), ("graph", {"graph": "on"})]
+    with pytest.raises(SystemExit):
+        _script().parse_args(["--allow-paid-requests", "--graph", "--config", "base"])
 
 
 def test_configurations_carry_typed_overrides():

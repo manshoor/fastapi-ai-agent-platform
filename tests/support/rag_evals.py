@@ -36,6 +36,8 @@ CATEGORIES = frozenset(
         "distractor",
         "not_covered",
         "injection",
+        # Two facts in two documents, linked by one entity: graph expansion's target.
+        "multi_hop",
     }
 )
 STATUSES = frozenset({"answered", "no_context"})
