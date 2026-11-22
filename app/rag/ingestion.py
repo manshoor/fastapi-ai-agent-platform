@@ -3,7 +3,8 @@
     doc.created / doc.updated (one version in flight per document)
       claim (pending -> processing, new lease)
         -> parse (child process for PDF) -> chunk (thread)
-        -> per batch: embed (provider) -> store batch of this version + renew lease
+        -> per batch: embed (provider) [-> graph extraction (provider), grounded]
+           -> store batch (chunks and graph rows) of this version + renew lease
         -> swap: active_version = version, other versions' chunks deleted (one transaction)
       failure -> retry (pending, attempt + 1, this version's chunks deleted), or
                  ready on the old active version with update_error_code, or
@@ -22,6 +23,7 @@ from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -30,8 +32,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import undefer
 
 from app.ai.processing import HandleResult, SessionFactory
-from app.ai.provider import Embeddings, ProviderFailure
-from app.models import RAGChunk, RAGDocument, RAGOutbox
+from app.ai.provider import (
+    Embeddings,
+    GraphResult,
+    OpenAIEmbedder,
+    OpenAIGraphExtractor,
+    ProviderFailure,
+)
+from app.models import RAGChunk, RAGDocument, RAGGraphEdge, RAGGraphNode, RAGOutbox
 from app.rag.chunking import Chunk, chunk_document
 from app.rag.config import RAGSettings
 from app.rag.contracts import (
@@ -44,6 +52,7 @@ from app.rag.contracts import (
     IngestError,
     ingest_kind,
 )
+from app.rag.graph import GraphRows, ground
 from app.rag.parsing import ParseFailure, parse_document
 from app.telemetry import Telemetry
 
@@ -59,8 +68,32 @@ _MAX_BACKOFF_SECONDS = 60
 TOMBSTONE_PURGE_SECONDS = 3600
 
 
+class GraphError(StrEnum):
+    """Why a version's graph is missing or partial; the document is still served."""
+
+    REJECTED = "graph_rejected"
+    INVALID = "graph_invalid"
+    # The output hit the token budget: that batch has no graph.
+    INCOMPLETE = "graph_incomplete"
+
+
 class Embedder(Protocol):
     async def embed(self, texts: Sequence[str], *, model: str | None = None) -> Embeddings: ...
+
+
+class GraphExtractor(Protocol):
+    async def extract(
+        self, chunks: Sequence[str], *, limit: int, model: str | None = None
+    ) -> GraphResult: ...
+
+
+def graph_extractor(
+    settings: RAGSettings, telemetry: Telemetry | None, embedder: OpenAIEmbedder
+) -> GraphExtractor | None:
+    """The worker's extractor when the graph is on; it borrows the embedder's client."""
+    if not settings.rag_graph_enabled:
+        return None
+    return OpenAIGraphExtractor(settings, telemetry, client=embedder.client)
 
 
 @dataclass(frozen=True)
@@ -173,8 +206,9 @@ async def store_batch(
     lease: DocumentLease,
     chunks: Sequence[Chunk],
     vectors: Sequence[Sequence[float]],
+    graph: GraphRows | None = None,
 ) -> bool:
-    """Insert one embedded batch and renew the lease, only while the fence holds."""
+    """Insert one embedded batch, its graph rows, and renew the lease, while the fence holds."""
     async with session_factory() as session:
         async with session.begin():
             # Row lock: a concurrent reset or delete waits for, or blocks, this insert.
@@ -199,6 +233,8 @@ async def store_batch(
                     for chunk, vector in zip(chunks, vectors, strict=True)
                 ],
             )
+            if graph is not None:
+                await _insert_graph(session, lease, graph)
             await session.execute(
                 update(RAGDocument)
                 .where(RAGDocument.id == lease.document_id)
@@ -211,6 +247,40 @@ async def store_batch(
         return True
 
 
+async def _insert_graph(session, lease: DocumentLease, graph: GraphRows) -> None:
+    keys = {"document_id": lease.document_id, "version": lease.version, "owner_id": lease.owner_id}
+    if graph.nodes:
+        await session.execute(
+            insert(RAGGraphNode),
+            [
+                {
+                    **keys,
+                    "ordinal": node.ordinal,
+                    "node_key": node.node_key,
+                    "node_type": str(node.node_type),
+                    "name": node.name,
+                    "match_name": node.match_name,
+                }
+                for node in graph.nodes
+            ],
+        )
+    if graph.edges:
+        await session.execute(
+            insert(RAGGraphEdge),
+            [
+                {
+                    **keys,
+                    "ordinal": edge.ordinal,
+                    "source_key": edge.source_key,
+                    "relation": str(edge.relation),
+                    "target_key": edge.target_key,
+                    "quote": edge.quote,
+                }
+                for edge in graph.edges
+            ],
+        )
+
+
 async def finish_ready(
     *,
     session_factory: SessionFactory,
@@ -218,6 +288,7 @@ async def finish_ready(
     chunk_count: int,
     page_count: int | None,
     embedding_tokens: int | None,
+    graph_error_code: str | None = None,
     telemetry: Telemetry | None = None,
 ) -> bool:
     """The swap: this version becomes active and every other version's chunks go."""
@@ -245,6 +316,7 @@ async def finish_ready(
                     embedding_tokens=embedding_tokens,
                     error_code=None,
                     update_error_code=None,
+                    graph_error_code=graph_error_code,
                     finished_at=func.clock_timestamp(),
                     updated_at=func.clock_timestamp(),
                     lease_token=None,
@@ -373,11 +445,17 @@ async def _embed_and_store(
     lease: DocumentLease,
     chunks: list[Chunk],
     embedder: Embedder,
+    extractor: GraphExtractor | None = None,
     telemetry: Telemetry | None,
-) -> tuple[bool, int | None]:
-    """Embed and store batch by batch. Returns (fence held, total embedding tokens)."""
+) -> tuple[bool, int | None, str | None]:
+    """Embed (and extract) and store batch by batch.
+
+    Returns (fence held, total embedding tokens, graph error code). With the graph on, a
+    batch is one extraction call, so batches follow RAG_GRAPH_BATCH_SIZE.
+    """
     tokens: int | None = 0
-    size = settings.rag_embedding_batch_size
+    graph_error: str | None = None
+    size = settings.rag_embedding_batch_size if extractor is None else settings.rag_graph_batch_size
     for start in range(0, len(chunks), size):
         batch = chunks[start : start + size]
         result = await embedder.embed(
@@ -386,6 +464,10 @@ async def _embed_and_store(
         tokens = (
             None if tokens is None or result.input_tokens is None else tokens + result.input_tokens
         )
+        graph = None
+        if extractor is not None:
+            graph, code = await _extract_graph(extractor, settings, lease, batch, telemetry)
+            graph_error = graph_error or code
         with _span(telemetry, "rag.store", document_id=str(lease.document_id)):
             stored = await store_batch(
                 session_factory=session_factory,
@@ -393,10 +475,43 @@ async def _embed_and_store(
                 lease=lease,
                 chunks=batch,
                 vectors=result.vectors,
+                graph=graph,
             )
         if not stored:
-            return False, tokens
-    return True, tokens
+            return False, tokens, graph_error
+    return True, tokens, graph_error
+
+
+async def _extract_graph(
+    extractor: GraphExtractor,
+    settings: RAGSettings,
+    lease: DocumentLease,
+    batch: list[Chunk],
+    telemetry: Telemetry | None,
+) -> tuple[GraphRows | None, str | None]:
+    """Grounded graph rows for one batch, or none with a code. The graph is an extra:
+    only a transient provider failure is raised, to retry the document like an embed."""
+    with _span(telemetry, "rag.graph.extract", document_id=str(lease.document_id)):
+        try:
+            result = await extractor.extract(
+                [chunk.content for chunk in batch], limit=settings.rag_graph_max_items_per_chunk
+            )
+        except ProviderFailure as failure:
+            if failure.retryable or failure.code in _RETRY_CODES:
+                raise
+            if failure.code == "provider_invalid_output":
+                return None, GraphError.INVALID
+            if failure.code == "provider_incomplete":
+                return None, GraphError.INCOMPLETE
+            return None, GraphError.REJECTED
+        rows = ground(result.extraction, batch, settings.rag_graph_max_items_per_chunk)
+        if telemetry is not None:
+            telemetry.annotate(
+                node_count=len(rows.nodes),
+                edge_count=len(rows.edges),
+                graph_dropped=rows.dropped,
+            )
+    return rows, None
 
 
 async def purge_document(*, session_factory: SessionFactory, event: DocumentEvent) -> None:
@@ -419,6 +534,7 @@ async def process_ingest(
     settings: RAGSettings,
     event: DocumentEvent,
     embedder: Embedder,
+    extractor: GraphExtractor | None = None,
     telemetry: Telemetry | None = None,
 ) -> HandleResult:
     if event.type is DocumentEventType.DELETED:
@@ -434,6 +550,7 @@ async def process_ingest(
             settings=settings,
             event=event,
             embedder=embedder,
+            extractor=extractor,
             telemetry=telemetry,
             lease=lease,
             source=source,
@@ -484,6 +601,7 @@ async def _ingest_claimed(
     settings: RAGSettings,
     event: DocumentEvent,
     embedder: Embedder,
+    extractor: GraphExtractor | None = None,
     telemetry: Telemetry | None,
     lease: DocumentLease,
     source: bytes,
@@ -527,12 +645,13 @@ async def _ingest_claimed(
             )
             return HandleResult.HANDLED if committed else HandleResult.DEFERRED
         try:
-            held, tokens = await _embed_and_store(
+            held, tokens, graph_error = await _embed_and_store(
                 session_factory=session_factory,
                 settings=settings,
                 lease=lease,
                 chunks=chunks,
                 embedder=embedder,
+                extractor=extractor,
                 telemetry=telemetry,
             )
         except ProviderFailure as failure:
@@ -562,6 +681,7 @@ async def _ingest_claimed(
             chunk_count=len(chunks),
             page_count=parsed.page_count,
             embedding_tokens=tokens,
+            graph_error_code=graph_error,
             telemetry=telemetry,
         )
     return HandleResult.HANDLED if committed else HandleResult.DEFERRED

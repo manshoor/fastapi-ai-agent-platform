@@ -27,6 +27,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.rag.ontology import MAX_NAME_CHARACTERS, NodeType, Relation
+
 # Fixed by the vector(1536) column; changing it needs a migration and re-embedding.
 RAG_EMBEDDING_DIMENSIONS = 1536
 
@@ -208,6 +210,10 @@ RAG_CONTENT_TYPES = (
 )
 
 
+# Why a version's knowledge graph is missing or partial (app/rag/ingestion.py).
+RAG_GRAPH_ERRORS = ("graph_rejected", "graph_invalid", "graph_incomplete")
+
+
 def _sql_in(values: tuple[str, ...]) -> str:
     return ",".join(f"'{value}'" for value in values)
 
@@ -239,6 +245,9 @@ class RAGDocument(Base):
     external_id: Mapped[str | None] = mapped_column(String(256))
     # Why the newest version failed while an older one stays active.
     update_error_code: Mapped[str | None] = mapped_column(String(64))
+    # Why the active version's knowledge graph is missing or partial; null when complete
+    # or when graph extraction is off.
+    graph_error_code: Mapped[str | None] = mapped_column(String(64))
     # Idempotency of the latest content update.
     update_key_hash: Mapped[str | None] = mapped_column(String(64))
     update_fingerprint: Mapped[str | None] = mapped_column(String(64))
@@ -283,6 +292,10 @@ class RAGDocument(Base):
         CheckConstraint(
             "update_error_code IS NULL OR (status = 'ready' AND active_version IS NOT NULL)",
             name="ck_rag_documents_update_error",
+        ),
+        CheckConstraint(
+            f"graph_error_code IS NULL OR graph_error_code IN ({_sql_in(RAG_GRAPH_ERRORS)})",
+            name="ck_rag_documents_graph_error",
         ),
         CheckConstraint(
             "(update_key_hash IS NULL) = (update_fingerprint IS NULL)",
@@ -432,6 +445,84 @@ class RAGChunk(Base):
             postgresql_with={"m": 16, "ef_construction": 64},
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+    )
+
+
+class RAGGraphNode(Base):
+    """A node one chunk states (`app/rag/graph.py`). Merged across documents by node_key
+    at query time, within one owner's or one building's documents."""
+
+    __tablename__ = "rag_graph_nodes"
+
+    document_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    node_type: Mapped[str] = mapped_column(String(32))
+    name: Mapped[str] = mapped_column(String(MAX_NAME_CHARACTERS))
+    # The name's words only (graph.match_name): questions name nodes in this form.
+    match_name: Mapped[str] = mapped_column(String(160))
+
+    __table_args__ = (
+        # The chunk's delete (swap, retry, purge) removes its graph rows with it.
+        ForeignKeyConstraint(
+            ["document_id", "version", "ordinal"],
+            ["rag_chunks.document_id", "rag_chunks.version", "rag_chunks.ordinal"],
+            ondelete="CASCADE",
+            name="fk_rag_graph_nodes_chunk",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "owner_id"],
+            ["rag_documents.id", "rag_documents.owner_id"],
+            ondelete="CASCADE",
+            name="fk_rag_graph_nodes_document_owner",
+        ),
+        CheckConstraint(
+            f"node_type IN ({_sql_in(tuple(NodeType))})", name="ck_rag_graph_nodes_type"
+        ),
+        CheckConstraint(
+            f"char_length(name) BETWEEN 1 AND {MAX_NAME_CHARACTERS}",
+            name="ck_rag_graph_nodes_name",
+        ),
+        Index("ix_rag_graph_nodes_match", "match_name"),
+    )
+
+
+class RAGGraphEdge(Base):
+    """source -relation-> target, with the quote of its chunk that states it."""
+
+    __tablename__ = "rag_graph_edges"
+
+    document_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    relation: Mapped[str] = mapped_column(String(32), primary_key=True)
+    target_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    quote: Mapped[str] = mapped_column(String(300))
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["document_id", "version", "ordinal"],
+            ["rag_chunks.document_id", "rag_chunks.version", "rag_chunks.ordinal"],
+            ondelete="CASCADE",
+            name="fk_rag_graph_edges_chunk",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "owner_id"],
+            ["rag_documents.id", "rag_documents.owner_id"],
+            ondelete="CASCADE",
+            name="fk_rag_graph_edges_document_owner",
+        ),
+        CheckConstraint(
+            f"relation IN ({_sql_in(tuple(Relation))})", name="ck_rag_graph_edges_relation"
+        ),
+        CheckConstraint("char_length(quote) BETWEEN 1 AND 300", name="ck_rag_graph_edges_quote"),
+        CheckConstraint("source_key <> target_key", name="ck_rag_graph_edges_distinct"),
+        Index("ix_rag_graph_edges_source", "source_key"),
+        Index("ix_rag_graph_edges_target", "target_key"),
     )
 
 

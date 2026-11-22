@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import AfterValidator, AwareDatetime, Field, StringConstraints
 
+from app.rag.ontology import MAX_NAME_CHARACTERS, NodeType, Relation
 from app.schemas import Description, StrictSchema, Title, reject_nul
 
 TERMINAL_STATES = frozenset({"succeeded", "failed", "needs_reconciliation"})
@@ -77,6 +78,42 @@ class QuotedAnswer(StrictSchema):
     """Structured model output for a RAG answer. No claims means "not in passages"."""
 
     claims: list[Claim] = Field(max_length=8)
+
+
+# Chunks of one extraction call, in order: C1 is the first chunk sent.
+ChunkLabel = Annotated[str, StringConstraints(pattern=r"^C[1-8]$")]
+NodeName = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_NAME_CHARACTERS),
+    AfterValidator(reject_nul),
+]
+# Per call: at most 8 chunks, at most 24 items of each kind per chunk.
+MAX_GRAPH_ITEMS = 8 * 24
+
+
+class GraphNode(StrictSchema):
+    chunk: ChunkLabel
+    type: NodeType
+    name: NodeName
+
+
+class GraphEdge(StrictSchema):
+    """source -relation-> target, with a quote of the chunk that states it."""
+
+    chunk: ChunkLabel
+    source: NodeName
+    source_type: NodeType
+    relation: Relation
+    target: NodeName
+    target_type: NodeType
+    quote: Quote
+
+
+class GraphExtraction(StrictSchema):
+    """Graph extraction output. The server keeps only items grounded in their chunk."""
+
+    nodes: list[GraphNode] = Field(max_length=MAX_GRAPH_ITEMS)
+    edges: list[GraphEdge] = Field(max_length=MAX_GRAPH_ITEMS)
 
 
 # Where an assistant claim comes from this turn: a search passage (P1-P8) or the

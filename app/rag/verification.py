@@ -80,6 +80,12 @@ def _quoted_in(quote: str, passage: str) -> bool:
     return re.search(pattern, passage) is not None
 
 
+def appears_in(phrase: str, text: str) -> bool:
+    """`phrase` occurs in `text` after normalizing both, starting and ending on word edges."""
+    quoted = _quote(phrase)
+    return bool(quoted) and _quoted_in(quoted, normalize(text))
+
+
 def _numbers(text: str) -> set[str]:
     """Numbers in normalized text. A date's parts count too: 01.03.2025 allows 2025."""
     numbers = set()

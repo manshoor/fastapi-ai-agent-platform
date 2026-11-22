@@ -164,6 +164,96 @@ def claim_verdicts(request: dict, mode: str) -> dict:
     return {"verdicts": verdicts}
 
 
+def wants_graph(request: dict) -> bool:
+    return {"nodes", "edges"} <= set(_schema_properties(request))
+
+
+# Graph extraction: "The <source> is <relation> the <target>." sentences become an edge.
+# Types come from the last word of a name; the server checks the ontology, not this.
+GRAPH_SENTENCE = re.compile(
+    r"^(?:the\s+)?(?P<source>[a-z][\w' -]*?)\s+(?:is|are)\s+"
+    r"(?P<relation>located in|part of|operated by|governed by|scheduled on|the contact for)"
+    r"\s+(?:the\s+)?(?P<target>[a-z][\w' -]*?)$",
+    re.IGNORECASE,
+)
+GRAPH_RELATIONS = {
+    "located in": "located_in",
+    "part of": "part_of",
+    "operated by": "operated_by",
+    "governed by": "governed_by",
+    "scheduled on": "scheduled_on",
+    "the contact for": "contact_for",
+}
+GRAPH_TYPES = {
+    "floor": "location",
+    "basement": "location",
+    "garage": "location",
+    "level": "location",
+    "wing": "location",
+    "courtyard": "location",
+    "lobby": "location",
+    "building": "building",
+    "tower": "building",
+    "rules": "rule",
+    "rule": "rule",
+    "policy": "rule",
+    "regulations": "rule",
+    "weekdays": "schedule",
+    "weekends": "schedule",
+    "schedule": "schedule",
+    "concierge": "contact_role",
+    "caretaker": "contact_role",
+    "manager": "contact_role",
+    "office": "contact_role",
+    "service": "service",
+    "company": "service",
+    "team": "service",
+    "contractor": "service",
+    "lift": "device",
+    "elevator": "device",
+    "boiler": "device",
+    "thermostat": "device",
+}
+
+
+def _graph_type(name: str) -> str:
+    return GRAPH_TYPES.get(name.lower().split()[-1], "facility")
+
+
+def graph_extraction(request: dict, mode: str) -> dict:
+    """Edges from matching sentences of every chunk; "misquote" quotes no chunk."""
+    try:
+        chunks = json.loads(request.get("input", "")).get("chunks", [])
+    except (ValueError, AttributeError):
+        chunks = []
+    nodes, edges = [], []
+    for item in chunks if isinstance(chunks, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", item["text"]):
+            match = GRAPH_SENTENCE.match(sentence.strip().rstrip(".!?"))
+            if match is None:
+                continue
+            source, target = match["source"].strip(), match["target"].strip()
+            quote = sentence.strip().rstrip(".!?")
+            if mode == "misquote":
+                quote = "words that appear in no chunk"
+            for name in (source, target):
+                nodes.append({"chunk": item["label"], "type": _graph_type(name), "name": name})
+            edges.append(
+                {
+                    "chunk": item["label"],
+                    "source": source,
+                    "source_type": _graph_type(source),
+                    "relation": GRAPH_RELATIONS[match["relation"].lower()],
+                    "target": target,
+                    "target_type": _graph_type(target),
+                    "quote": quote,
+                }
+            )
+    return {"nodes": nodes, "edges": edges}
+
+
 def wants_ranking(request: dict) -> bool:
     return "passages" in _schema_properties(request)
 
@@ -560,6 +650,8 @@ def create_app() -> FastAPI:
                 output = claim_verdicts(value, mode)
             elif wants_claims(value):
                 output = quoted_answer(value, mode)
+            elif wants_graph(value):
+                output = graph_extraction(value, mode)
             elif wants_ranking(value):
                 output = ranking(value, mode)
             else:

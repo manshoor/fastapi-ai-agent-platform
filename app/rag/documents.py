@@ -397,6 +397,7 @@ async def tombstone(session: AsyncSession, document: RAGDocument) -> None:
             page_count=None,
             embedding_tokens=None,
             update_error_code=None,
+            graph_error_code=None,
             # Frees the upload key: the owner may reuse it for a new document.
             idempotency_key_hash=hashlib.sha256(f"deleted:{document_id}".encode()).hexdigest(),
             lease_token=None,

@@ -16,6 +16,7 @@ from app.ai.provider import OpenAIEmbedder
 from app.ai.worker import PARTITION_COUNT, PartitionProcessor, consume
 from app.db import create_engine, create_session_factory
 from app.rag.config import RAGSettings
+from app.rag.ingestion import graph_extractor
 from app.rag.outbox import handle_record
 from app.telemetry import configure_telemetry
 
@@ -57,6 +58,7 @@ async def run_worker(settings: RAGSettings | None = None) -> None:
     embedder = None
     try:
         embedder = OpenAIEmbedder(settings, telemetry)
+        extractor = graph_extractor(settings, telemetry, embedder)
         producer = await create_producer(settings)
         consumer = _consumer(settings)
 
@@ -67,6 +69,7 @@ async def run_worker(settings: RAGSettings | None = None) -> None:
                 record=record,
                 producer=producer,
                 embedder=embedder,
+                extractor=extractor,
                 telemetry=telemetry,
             )
 

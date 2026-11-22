@@ -15,6 +15,10 @@ ReasoningEffort = Literal["none", "low", "medium"]
 # on: one paid call judges every verified claim against its passage before answering.
 VerifierMode = Literal["off", "on"]
 VERIFIER_ON = "on"
+# Graph expansion of one query (eval override); the default follows RAG_GRAPH_ENABLED.
+GraphMode = Literal["off", "on"]
+GRAPH_ON = "on"
+GRAPH_OFF = "off"
 # Event sinks: Kafka always (it carries recovery's redispatch); SQS optionally beside it.
 EventSinks = Annotated[str, StringConstraints(pattern=r"^kafka(,sqs)?$|^sqs,kafka$")]
 SQS_SINK = "sqs"
@@ -75,6 +79,19 @@ class RAGSettings(AISettings):
     rag_answer_reasoning_effort: ReasoningEffort = "none"
     rag_verifier: VerifierMode = "off"
 
+    # Knowledge graph (app/rag/graph.py): extraction at ingest (one call per batch of
+    # chunks, stored with that batch) and expansion at query time. Off by default: each
+    # batch is a paid call.
+    rag_graph_enabled: bool = False
+    # Chunks per extraction call and per stored batch while the graph is on.
+    # 4 chunks x 8 nodes and 8 edges with short quotes is about 2,500 output tokens,
+    # inside the default AI_MAX_OUTPUT_TOKENS (4096). Output cut short has no graph.
+    rag_graph_batch_size: int = Field(default=4, ge=1, le=8)
+    rag_graph_max_items_per_chunk: int = Field(default=8, ge=1, le=24)
+    rag_graph_hops: int = Field(default=1, ge=1, le=2)
+    # Graph passages added after the vector passages; the total stays at most 8.
+    rag_graph_extra_passages: int = Field(default=2, ge=0, le=4)
+
     # Ingestion lifecycle.
     rag_lease_seconds: float = Field(default=120, gt=0)
     rag_max_attempts: int = Field(default=3, ge=1, le=3)
@@ -105,10 +122,16 @@ class RAGSettings(AISettings):
             raise ValueError("AI_EMBEDDING_DIMENSIONS must match the vector column")
         if self.rag_chunk_overlap >= self.rag_chunk_size:
             raise ValueError("RAG_CHUNK_OVERLAP must be smaller than RAG_CHUNK_SIZE")
-        # The first renewal comes only after parsing and the first embedding batch.
+        # The first renewal comes only after parsing and the first batch: its embedding
+        # call, and its graph extraction call when the graph is on.
         first_renewal = self.rag_pdf_timeout_seconds + self.ai_embedding_timeout_seconds
+        if self.rag_graph_enabled:
+            first_renewal += self.ai_provider_timeout_seconds
         if self.rag_lease_seconds <= first_renewal + 5:
-            raise ValueError("RAG_LEASE_SECONDS must exceed parse + embedding timeouts by 5s")
+            raise ValueError(
+                "RAG_LEASE_SECONDS must exceed parse + embedding (+ graph extraction) "
+                "timeouts by 5s"
+            )
         if SQS_SINK in self.event_sinks:
             self._validate_sqs()
         floor = query_deadline_floor(self, self.rag_rerank, self.rag_verifier)

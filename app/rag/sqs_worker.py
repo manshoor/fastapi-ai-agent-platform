@@ -35,7 +35,7 @@ from app.ai.provider import OpenAIEmbedder
 from app.db import create_engine, create_session_factory
 from app.rag.config import SQS_SINK, RAGSettings
 from app.rag.contracts import DocumentEvent
-from app.rag.ingestion import Embedder, process_ingest
+from app.rag.ingestion import Embedder, GraphExtractor, graph_extractor, process_ingest
 from app.rag.sinks import SQS_ERRORS, SQS_IO_TIMEOUT, SQSQueues, open_sqs, send_fifo
 from app.telemetry import Telemetry, configure_telemetry
 
@@ -88,6 +88,7 @@ async def handle_message(
     queues: SQSQueues,
     message: dict,
     embedder: Embedder,
+    extractor: GraphExtractor | None = None,
     telemetry: Telemetry | None = None,
 ) -> HandleResult:
     body = message.get("Body")
@@ -124,6 +125,7 @@ async def handle_message(
             settings=settings,
             event=event,
             embedder=embedder,
+            extractor=extractor,
             telemetry=telemetry,
         )
     if result == HandleResult.HANDLED and telemetry is not None:
@@ -169,6 +171,7 @@ async def process_message(
     message: dict,
     batch: _Batch,
     embedder: Embedder,
+    extractor: GraphExtractor | None = None,
     telemetry: Telemetry | None = None,
 ) -> HandleResult:
     """Handle one message. On any failure it stays held, and the batch releases it."""
@@ -178,6 +181,7 @@ async def process_message(
         queues=queues,
         message=message,
         embedder=embedder,
+        extractor=extractor,
         telemetry=telemetry,
     )
     receipt = message["ReceiptHandle"]
@@ -235,6 +239,7 @@ async def poll_once(
     settings: RAGSettings,
     queues: SQSQueues,
     embedder: Embedder,
+    extractor: GraphExtractor | None = None,
     telemetry: Telemetry | None = None,
     wait_seconds: int | None = None,
     stop: asyncio.Event | None = None,
@@ -280,6 +285,7 @@ async def poll_once(
                         settings=settings,
                         queues=queues,
                         embedder=embedder,
+                        extractor=extractor,
                         telemetry=telemetry,
                     )
                 )
@@ -321,6 +327,7 @@ async def run_worker(settings: RAGSettings | None = None) -> None:
     embedder = None
     try:
         embedder = OpenAIEmbedder(settings, telemetry)
+        extractor = graph_extractor(settings, telemetry, embedder)
         async with open_sqs(settings) as queues:
             while not stop.is_set():
                 batch = asyncio.create_task(
@@ -329,6 +336,7 @@ async def run_worker(settings: RAGSettings | None = None) -> None:
                         settings=settings,
                         queues=queues,
                         embedder=embedder,
+                        extractor=extractor,
                         telemetry=telemetry,
                         stop=stop,
                     )

@@ -58,6 +58,8 @@ _SPANS = frozenset(
         "rag.store",
         "rag.query",
         "rag.retrieve",
+        "rag.graph.extract",
+        "rag.graph.expand",
         "assistant.turn",
         "assistant.tool",
         "assistant.confirm",
@@ -113,6 +115,10 @@ _NUMBERS = frozenset(
         "top_k",
         "model_calls",
         "tool_calls",
+        "node_count",
+        "edge_count",
+        "graph_dropped",
+        "graph_passages",
     }
 )
 _IDS = frozenset(

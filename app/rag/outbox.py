@@ -30,7 +30,7 @@ from app.ai.processing import HandleResult, SessionFactory
 from app.models import RAGDocument, RAGOutbox, RAGOutboxDelivery
 from app.rag.config import RAGSettings
 from app.rag.contracts import DocumentEvent, DocumentEventType, EventSink, ingest_kind
-from app.rag.ingestion import Embedder, process_ingest
+from app.rag.ingestion import Embedder, GraphExtractor, process_ingest
 from app.telemetry import Telemetry
 
 
@@ -270,6 +270,7 @@ async def handle_record(
     record: Any,
     producer: Producer,
     embedder: Embedder,
+    extractor: GraphExtractor | None = None,
     telemetry: Telemetry | None = None,
 ) -> HandleResult:
     """Malformed deliveries are acknowledged only after a privacy-safe dead-letter ACK."""
@@ -327,6 +328,7 @@ async def handle_record(
             settings=settings,
             event=event,
             embedder=embedder,
+            extractor=extractor,
             telemetry=telemetry,
         )
     if result == HandleResult.HANDLED and telemetry is not None:
