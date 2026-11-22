@@ -36,6 +36,8 @@ x-api-environment: &api-environment
   AUTH_TOKEN_TTL_SECONDS: "900"
   # Test-only literal: base64 of "test-only-totp-key-not-a-secret!".
   ASSISTANT_TOTP_KEY: dGVzdC1vbmx5LXRvdHAta2V5LW5vdC1hLXNlY3JldCE=
+  # Test-only literal: base64 of "test-only-memory-key-not-secret!".
+  ASSISTANT_MEMORY_KEY: dGVzdC1vbmx5LW1lbW9yeS1rZXktbm90LXNlY3JldCE=
 x-logging: &logging
   driver: json-file
   options:

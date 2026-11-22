@@ -15,6 +15,8 @@ x-benchmark-environment: &benchmark-environment
   RAG_ENABLED: "true"
   ASSISTANT_ENABLED: "true"
   ASSISTANT_TOTP_KEY: ${BENCH_ASSISTANT_TOTP_KEY:?Use scripts/benchmark_assistant.py}
+  ASSISTANT_MEMORY_ENABLED: "true"
+  ASSISTANT_MEMORY_KEY: ${BENCH_ASSISTANT_MEMORY_KEY:?Use scripts/benchmark_assistant.py}
   # The provider simulator only. Literals, never interpolated: no run reaches a paid API.
   OPENAI_API_KEY: local-simulator-only-not-a-real-key
   OPENAI_BASE_URL: http://provider:8080/v1

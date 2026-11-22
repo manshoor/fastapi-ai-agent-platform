@@ -903,6 +903,8 @@ class AssistantTurn(Base):
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     embedding_tokens: Mapped[int | None] = mapped_column(Integer)
+    # Memories recalled into the turn: a count, never their text.
+    memory_count: Mapped[int] = mapped_column(Integer, server_default="0")
     error_code: Mapped[str | None] = mapped_column(String(64))
     claim_failure: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -932,6 +934,7 @@ class AssistantTurn(Base):
             f"AND claim_failure IN ({_sql_in(CLAIM_FAILURES)}))",
             name="ck_assistant_turns_claim_failure",
         ),
+        CheckConstraint("memory_count >= 0", name="ck_assistant_turns_memory_count"),
         Index("ix_assistant_turns_user_created", "user_id", "created_at"),
     )
 
@@ -1095,4 +1098,71 @@ class AuthFailure(Base):
     __table_args__ = (
         CheckConstraint("kind IN ('password','totp')", name="ck_auth_failures_kind"),
         Index("ix_auth_failures_user_kind_created", "user_id", "kind", "created_at"),
+    )
+
+
+MEMORY_SCOPES = ("resident", "residence")
+# Memory text is 3 to 300 characters: at most 1,200 UTF-8 bytes, plus the 16-byte tag.
+MAX_MEMORY_CIPHERTEXT_BYTES = 300 * 4 + 16
+
+
+class AssistantMemory(Base):
+    """A note the resident asked the assistant to keep, sealed by the API (AES-256-GCM).
+
+    `resident` follows the user; `residence` holds only while the user lives in
+    `building_id`. Rows past `expires_at` or a move-out are never served, then purged.
+    """
+
+    __tablename__ = "assistant_memories"
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    scope: Mapped[str] = mapped_column(String(16))
+    building_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("buildings.id", ondelete="CASCADE")
+    )
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary)
+    key_version: Mapped[int] = mapped_column(SmallInteger, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(f"scope IN ({_sql_in(MEMORY_SCOPES)})", name="ck_assistant_memories_scope"),
+        CheckConstraint(
+            "(scope = 'residence') = (building_id IS NOT NULL)",
+            name="ck_assistant_memories_building",
+        ),
+        CheckConstraint("octet_length(nonce) = 12", name="ck_assistant_memories_nonce"),
+        CheckConstraint(
+            f"octet_length(ciphertext) BETWEEN 19 AND {MAX_MEMORY_CIPHERTEXT_BYTES}",
+            name="ck_assistant_memories_ciphertext",
+        ),
+        CheckConstraint("key_version = 1", name="ck_assistant_memories_key_version"),
+        CheckConstraint("expires_at > created_at", name="ck_assistant_memories_expiry"),
+        Index("ix_assistant_memories_user_expires", "user_id", "expires_at"),
+        Index("ix_assistant_memories_expires", "expires_at"),
+    )
+
+
+class AssistantMemoryWrite(Base):
+    """One memory write, kept for a day: forgetting a memory does not give its write back."""
+
+    __tablename__ = "assistant_memory_writes"
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
+    )
+
+    __table_args__ = (
+        Index("ix_assistant_memory_writes_user_created", "user_id", "created_at"),
+        Index("ix_assistant_memory_writes_created", "created_at"),
     )

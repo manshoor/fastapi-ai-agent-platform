@@ -1,7 +1,8 @@
 """Create a separate private AI Compose environment; never read normal .env credentials.
 
-An existing private environment keeps every value. Only a missing AI_ASSISTANT_TOTP_KEY
-is appended, so environments made before unlock step-up keep working.
+An existing private environment keeps every value. Only a missing AI_ASSISTANT_TOTP_KEY or
+AI_ASSISTANT_MEMORY_KEY is appended, so environments made before unlock step-up or
+assistant memory keep working.
 """
 
 import argparse
@@ -13,7 +14,10 @@ from enum import StrEnum
 from pathlib import Path
 
 TOTP_KEY_NAME = "AI_ASSISTANT_TOTP_KEY"
-# AES-256 key that seals authenticator secrets (ASSISTANT_TOTP_KEY).
+MEMORY_KEY_NAME = "AI_ASSISTANT_MEMORY_KEY"
+# AES-256 keys: authenticator secrets (ASSISTANT_TOTP_KEY) and memories
+# (ASSISTANT_MEMORY_KEY). One key per purpose, in this order.
+KEY_NAMES = (TOTP_KEY_NAME, MEMORY_KEY_NAME)
 TOTP_KEY_BYTES = 32
 
 
@@ -24,7 +28,7 @@ class EnvResult(StrEnum):
 
 
 class EnvKeyError(ValueError):
-    """The private .env holds a TOTP key this script must not keep or fix by itself."""
+    """The private .env holds a key this script must not keep or fix by itself."""
 
 
 def require_private(metadata: os.stat_result, *, directory: bool) -> None:
@@ -45,12 +49,12 @@ def _totp_key() -> str:
     return base64.b64encode(secrets.token_bytes(TOTP_KEY_BYTES)).decode("ascii")
 
 
-def _key_values(content: str) -> list[str]:
-    """Every value the .env assigns to the TOTP key, read as Compose reads a line."""
+def _key_values(content: str, key_name: str) -> list[str]:
+    """Every value the .env assigns to `key_name`, read as Compose reads a line."""
     values = []
     for line in content.splitlines():
         name, separator, value = line.strip().removeprefix("export ").partition("=")
-        if separator and name.strip() == TOTP_KEY_NAME:
+        if separator and name.strip() == key_name:
             # Base64 holds no space or '#': " #" can only start an inline comment.
             values.append(value.split(" #", 1)[0].strip().strip("\"'"))
     return values
@@ -64,7 +68,7 @@ def _is_totp_key(value: str) -> bool:
 
 
 def _add_missing_key(env_fd: int) -> EnvResult:
-    """Append the TOTP key to an existing private .env that lacks it; change nothing else."""
+    """Append each missing key to an existing private .env; change nothing else."""
     with os.fdopen(env_fd, "r+", encoding="utf-8") as handle:
         # Checked before any write: a public, linked or foreign file is never touched.
         require_private(os.fstat(handle.fileno()), directory=False)
@@ -73,19 +77,29 @@ def _add_missing_key(env_fd: int) -> EnvResult:
         except UnicodeDecodeError:
             raise EnvKeyError("The private AI .env is not UTF-8 text; nothing changed.") from None
 
-        # A present key is never replaced: secrets sealed with it would stop opening.
-        # An unusable one is reported for the user to remove.
-        values = _key_values(content)
-        if len(values) > 1:
-            raise EnvKeyError(f"{TOTP_KEY_NAME} is set more than once; keep one line, then rerun.")
-        if values and not _is_totp_key(values[0]):
+        # A present key is never replaced: data sealed with it would stop opening.
+        # An unusable one is reported for the user to remove. All checks run first.
+        present = {}
+        for key_name in KEY_NAMES:
+            values = _key_values(content, key_name)
+            if len(values) > 1:
+                raise EnvKeyError(f"{key_name} is set more than once; keep one line, then rerun.")
+            if values and not _is_totp_key(values[0]):
+                raise EnvKeyError(
+                    f"{key_name} is not 32 bytes encoded as base64; remove that line, then rerun."
+                )
+            if values:
+                present[key_name] = values[0]
+        # Compared as bytes: base64 can spell one key in more than one way.
+        if len({base64.b64decode(value) for value in present.values()}) < len(present):
             raise EnvKeyError(
-                f"{TOTP_KEY_NAME} is not 32 bytes encoded as base64; remove that line, then rerun."
+                f"{MEMORY_KEY_NAME} must differ from {TOTP_KEY_NAME}; remove it, then rerun."
             )
-        if values:
+        missing = [key_name for key_name in KEY_NAMES if key_name not in present]
+        if not missing:
             return EnvResult.UNCHANGED
         separator = "" if not content or content.endswith("\n") else "\n"
-        handle.write(f"{separator}{TOTP_KEY_NAME}={_totp_key()}\n")
+        handle.write(separator + "".join(f"{key_name}={_totp_key()}\n" for key_name in missing))
     return EnvResult.KEY_ADDED
 
 
@@ -129,6 +143,7 @@ def initialize(directory: Path, api_port: int) -> EnvResult:
             "AI_API_PORT": str(api_port),
             "AI_AUTH_TOKEN_TTL_SECONDS": "900",
             TOTP_KEY_NAME: _totp_key(),
+            MEMORY_KEY_NAME: _totp_key(),
         }
         env_fd = os.open(
             ".env", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=root_fd
@@ -144,7 +159,8 @@ def initialize(directory: Path, api_port: int) -> EnvResult:
 MESSAGES = {
     EnvResult.CREATED: "Created private AI environment (0600), directories (0700).",
     EnvResult.KEY_ADDED: (
-        f"Added {TOTP_KEY_NAME} to the existing private AI environment; other values unchanged."
+        "Added the missing assistant keys to the existing private AI environment; "
+        "other values unchanged."
     ),
     EnvResult.UNCHANGED: "Preserved existing private AI environment; credentials unchanged.",
 }

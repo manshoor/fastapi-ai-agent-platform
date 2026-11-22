@@ -85,6 +85,14 @@ class Settings(DatabaseSettings):
     assistant_demo_enabled: bool = False
     # Eval-only: a hidden query route that also returns the passages sent to the model.
     rag_diagnostics_enabled: bool = False
+    # Read here only to fail at startup; app/assistant/config.py validates the rest.
+    assistant_memory_enabled: bool = False
+
+    @model_validator(mode="after")
+    def validate_memory(self) -> Self:
+        if self.assistant_memory_enabled and not self.assistant_enabled:
+            raise ValueError("ASSISTANT_MEMORY_ENABLED requires ASSISTANT_ENABLED")
+        return self
 
     @field_validator("jwt_secret")
     @classmethod

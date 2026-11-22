@@ -194,6 +194,9 @@ services:
       ASSISTANT_DEMO_ENABLED: "true"
       # Seals authenticator secrets for unlock step-up.
       ASSISTANT_TOTP_KEY: ${AI_ASSISTANT_TOTP_KEY:?Run scripts/init_ai_env.py once to add AI_ASSISTANT_TOTP_KEY}
+      # Assistant memory: notes sealed under their own key, never the TOTP key.
+      ASSISTANT_MEMORY_ENABLED: "true"
+      ASSISTANT_MEMORY_KEY: ${AI_ASSISTANT_MEMORY_KEY:?Run scripts/init_ai_env.py once to add AI_ASSISTANT_MEMORY_KEY}
       # Eval-only route for scripts/evaluate_rag.py: returns passages to their owner.
       RAG_DIAGNOSTICS_ENABLED: "true"
       # Room for rerank and the verifier as eval overrides: 20 s embedding + 3 x 30 s chat.

@@ -244,3 +244,37 @@ class TotpEnrollment(StrictSchema):
 
 class TotpStatus(StrictSchema):
     enabled: bool
+
+
+class MemoryScope(StrEnum):
+    # Follows the user wherever they live.
+    RESIDENT = "resident"
+    # Holds only while the user lives in the building it was saved in.
+    RESIDENCE = "residence"
+
+
+MAX_MEMORY_CHARACTERS = 300
+MemoryText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=3, max_length=MAX_MEMORY_CHARACTERS),
+    AfterValidator(reject_nul),
+]
+
+
+class MemoryRequest(StrictSchema):
+    text: MemoryText = Field(repr=False)
+    scope: MemoryScope
+
+
+class MemoryView(StrictSchema):
+    id: UUID
+    scope: MemoryScope
+    text: str = Field(repr=False)
+    created_at: datetime
+    expires_at: datetime
+
+
+class MemoryList(StrictSchema):
+    """Servable memories, newest first: unexpired, and residence ones of the current home."""
+
+    memories: list[MemoryView]

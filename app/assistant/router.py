@@ -4,12 +4,15 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.assistant import step_up, totp
+from app.assistant import memory, step_up, totp
 from app.assistant.actions import confirm_action
 from app.assistant.config import AssistantSettings
 from app.assistant.contracts import (
     CodeRequest,
     ConfirmResponse,
+    MemoryList,
+    MemoryRequest,
+    MemoryView,
     MessageRequest,
     PasswordRequest,
     ResidenceView,
@@ -170,3 +173,73 @@ async def send_message(
     )
     response.headers["Cache-Control"] = "no-store"
     return result
+
+
+def _memory_enabled(request: Request) -> None:
+    # Runs before authentication: with memory off the routes are absent, not refused.
+    settings = request.app.state.assistant_settings
+    if settings is None or not settings.assistant_memory_enabled:
+        raise HTTPException(404, "Not Found")
+
+
+MEMORIES = "/assistant/memories"
+
+
+@router.get(
+    MEMORIES,
+    response_model=MemoryList,
+    responses={404: {}, 500: {}},
+    dependencies=[Depends(_memory_enabled)],
+    include_in_schema=False,
+)
+async def read_memories(
+    request: Request, response: Response, owner_id: Owner, session: Session
+) -> MemoryList:
+    response.headers["Cache-Control"] = "no-store"
+    runtime: AssistantRuntime = request.app.state.assistant
+    return await memory.list_memories(session, runtime.memory_box, owner_id)
+
+
+@router.post(
+    MEMORIES,
+    response_model=MemoryView,
+    status_code=201,
+    responses={403: {}, 404: {}, 422: {}, 429: {}},
+    dependencies=[Depends(_memory_enabled)],
+    include_in_schema=False,
+)
+async def add_memory(
+    payload: MemoryRequest,
+    request: Request,
+    response: Response,
+    owner_id: Owner,
+    session: Session,
+) -> MemoryView:
+    response.headers["Cache-Control"] = "no-store"
+    runtime: AssistantRuntime = request.app.state.assistant
+    return await memory.add_memory(
+        session, runtime.memory_box, runtime.settings, owner_id, payload.scope, payload.text
+    )
+
+
+@router.delete(
+    MEMORIES + "/{memory_id}",
+    status_code=204,
+    responses={404: {}},
+    dependencies=[Depends(_memory_enabled)],
+    include_in_schema=False,
+)
+async def forget_memory(memory_id: UUID, owner_id: Owner, session: Session) -> Response:
+    await memory.forget_memory(session, owner_id, memory_id)
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+
+@router.delete(
+    MEMORIES,
+    status_code=204,
+    dependencies=[Depends(_memory_enabled)],
+    include_in_schema=False,
+)
+async def forget_memories(owner_id: Owner, session: Session) -> Response:
+    await memory.forget_all(session, owner_id)
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
