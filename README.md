@@ -211,7 +211,7 @@ The default stack uses a **local provider simulator**, not OpenAI or a paid mode
 
 The initializer creates a separate `.ai-local/.env` with random credentials and mode `0600`, plus private `0700` directories. Existing credentials are preserved; unsafe ownership, modes, links, and normal/escaping paths are rejected rather than repaired. For an existing file it appends only a missing `AI_ASSISTANT_TOTP_KEY` (the assistant's authenticator sealing key) and leaves every other line alone; an empty, malformed or repeated key is reported, not repaired. Until the key exists, `compose.ai.yaml` commands stop with an error naming the initializer. `.ai-*/` is excluded from version control and Docker build context. Settings read process environment only, never dotenv implicitly.
 
-`compose.ai.yaml` is standalone: **never merge it with normal, benchmark, or QA Compose**; the [TLS edge](#optional-tls-edge) overlay is the only file layered on it. It uses database `app_ai`, Redis DB 2, and project-owned PostgreSQL/Kafka volumes. Only the API publishes `127.0.0.1:8002` (with the edge overlay, only the edge publishes, on 8443); dependencies and simulator/telemetry control endpoints have no host ports. An API-only ingress network enables loopback publication; all dependency traffic stays on the internal network. The local image uses the test target to include simulators and operational scripts. This remains a development deployment, not production TLS, abuse protection, or Kafka HA.
+`compose.ai.yaml` is standalone: **never merge it with normal, benchmark, or QA Compose**; only the [TLS edge](#optional-tls-edge) and [Langfuse](#send-the-ai-stacks-traces-to-local-langfuse) overlays are layered on it. It uses database `app_ai`, Redis DB 2, and project-owned PostgreSQL/Kafka volumes. Only the API publishes `127.0.0.1:8002` (with the edge overlay, only the edge publishes, on 8443); dependencies and simulator/telemetry control endpoints have no host ports. An API-only ingress network enables loopback publication; all dependency traffic stays on the internal network (the Langfuse overlay is the one exception: its collector also joins Langfuse's web network). The local image uses the test target to include simulators and operational scripts. This remains a development deployment, not production TLS, abuse protection, or Kafka HA.
 
 Stop only this stack, retaining its volumes:
 
@@ -320,6 +320,52 @@ input/output content. No model call was made. Evidence:
 `artifacts/ingestion-f072fadff3cb41aea82525bc4d5ef528/result.json`.
 The same observations survived an explicit down/resume cycle. Verification services
 were then stopped with their volumes and private credentials preserved.
+
+#### Send the AI stack's traces to local Langfuse
+
+```bash
+uv run --locked python scripts/ai_langfuse.py --langfuse-state .langfuse-verification
+uv run --locked python scripts/smoke_assistant.py
+uv run --locked python scripts/smoke_rag.py
+```
+
+Open http://127.0.0.1:8005, sign in with the login in the state directory's
+`state.json` (read it yourself), and go to **Tracing → Traces**. The launcher resumes
+the saved Langfuse and waits for it, then recreates the AI collector with
+`compose.ai.langfuse.yaml` and starts the API and workers. `--live` adds
+`compose.ai.live.yaml` (billable model calls); `--edge` adds `compose.edge.yaml` and
+starts the edge (run `scripts/init_edge_tls.py` first). It prints no key. If a step
+fails, the error names it (`collector` or `services`).
+
+```
+api / workers --OTLP--> collector: transform/langfuse (allowlist, observation types)
+                           -> otlp stand-in receiver          (unchanged)
+                           -> langfuse-web:3000/api/public/otel (observability/collector.langfuse.yaml)
+```
+
+- You see `assistant.turn` (agent), `assistant.tool` (tool), `rag.query` (chain),
+  `rag.retrieve` (retriever), generations and embeddings with model, tokens, timing
+  and IDs. Input and output stay empty; there are no user or session fields.
+- The collector joins Langfuse's non-internal `api_ingress` network, so it also gains
+  outbound access, and its environment holds the project key. Never run
+  `docker compose config` or `docker inspect` against this stack with real values.
+- The collector's OTLP receiver and health port become reachable from `langfuse-web`.
+  Proxy variables are blanked in the collector, so a Docker client proxy setting cannot
+  carry the key off the machine.
+- If Langfuse goes away, the exporter retries for at most 5 s and drops spans; the API
+  and the stand-in receiver keep working. LangSmith stays on the stand-in receiver.
+- Any later `up` of these services without the overlay (for example the plain
+  `compose.ai.yaml` command) recreates the collector without the Langfuse export, and
+  without `--edge` the launcher recreates the API without the edge. Use the launcher
+  again to restore it.
+
+Tear down the AI stack first (the collector is attached to Langfuse's network), then
+Langfuse; volumes stay:
+
+```bash
+docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml down
+uv run --locked python scripts/langfuse_local.py down --directory .langfuse-verification
+```
 
 #### Cloud LangSmith
 
