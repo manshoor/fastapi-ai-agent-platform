@@ -140,7 +140,7 @@ async def test_tool_then_reply_is_answered_and_recorded_without_text(
     (row,) = await turns(app)
     assert (row.status, row.model_calls, row.tool_calls) == ("answered", 2, 1)
     assert (row.input_tokens, row.output_tokens, row.error_code) == (80, 40, None)
-    assert row.claim_failure is None and row.prompt_version == "assistant-v3"
+    assert row.claim_failure is None and row.prompt_version == "assistant-v4"
     assert row.model == "simulator-assistant" and row.finished_at is not None
     async with app.state.session_factory() as session:
         stored = [

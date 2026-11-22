@@ -3,6 +3,7 @@
     turn slot (bounded per process; quick same-process duplicate check)
       -> admit: per-user lock, running-turn lease, window count, turn row
       -> resident context (devices) read, transaction released
+      -> memory recall (memory on): servable memories, newest first, labelled M1..Mn
       -> graph under deadline backstop, LangSmith tracing off
       -> claim checks -> usage row -> TurnResponse
 
@@ -13,6 +14,10 @@
                                 fact; the reply shows the fact, never the statement.
                                 A label never handed out, or a fact a later result for
                                 its device replaced, grounds nothing
+      memory claim (M1..M20) -> quote checked against that recalled memory's text; the
+                                reply shows the whole memory as something the resident
+                                said, never the statement. A forgotten memory grounds
+                                nothing
       all verified  -> "answered"; no claims or a failed check -> "no_context",
                        or "incomplete" (claim_unverified) after a committed write
 
@@ -40,6 +45,7 @@ from app.ai.provider import ASSISTANT_PROMPT_VERSION, ProviderFailure
 from app.assistant.config import AssistantSettings
 from app.assistant.contracts import (
     GROUNDING_RESULTS,
+    MEMORY_TOOLS,
     ActionResult,
     Citation,
     PendingActionView,
@@ -47,6 +53,7 @@ from app.assistant.contracts import (
     TurnResponse,
 )
 from app.assistant.graph import BUDGET_CODE, TurnRun, first_input, recursion_limit
+from app.assistant.memory import recall_memories
 from app.assistant.residence import Resident
 from app.assistant.runtime import AssistantRuntime
 from app.assistant.tools import FACT_PREFIX, ToolContext
@@ -67,8 +74,15 @@ RUNNING_TURN_GRACE_SECONDS = 15
 NO_CONTEXT_ANSWER = "I could not find that in your building's documents."
 INCOMPLETE_ANSWER = "I could not finish. The completed steps are listed."
 WRITE_TOOLS = frozenset(
-    {ToolName.CREATE_TICKET, ToolName.SET_THERMOSTAT, ToolName.LOCK_DOOR, ToolName.UNLOCK_DOOR}
+    {
+        ToolName.CREATE_TICKET,
+        ToolName.SET_THERMOSTAT,
+        ToolName.LOCK_DOOR,
+        ToolName.UNLOCK_DOOR,
+        *MEMORY_TOOLS,
+    }
 )
+MEMORY_PREFIX = "M"
 # Device kinds the model may see. The alarm is never exposed.
 VISIBLE_KINDS = ("thermostat", "door_lock")
 DEADLINE_CODE = "turn_deadline"
@@ -177,7 +191,15 @@ async def _record(
     claim_failure: ClaimFailure | None = None,
 ) -> None:
     """Best effort: a failed usage write never turns a committed result into an error."""
-    counts = {"model_calls": run.model_calls, "tool_calls": len(run.actions)} if run else {}
+    counts = (
+        {
+            "model_calls": run.model_calls,
+            "tool_calls": len(run.actions),
+            "memory_count": len(run.context.memories),
+        }
+        if run
+        else {}
+    )
     # The claim failure is a fixed code: safe as a metric tag.
     outcome = {"outcome": str(claim_failure)} if claim_failure else {}
     telemetry.annotate(status=status, error_code=error_code, **counts)
@@ -195,6 +217,7 @@ async def _record(
             input_tokens=run.input_tokens,
             output_tokens=run.output_tokens,
             embedding_tokens=run.context.embedding_tokens,
+            memory_count=len(run.context.memories),
         )
         if run.response_model is not None:
             values["model"] = run.response_model
@@ -230,7 +253,7 @@ def _citations(run: TurnRun) -> list[Citation]:
     seen: set[str] = set()
     for claim in claims:
         label = claim.source
-        if label.startswith(FACT_PREFIX) or label in seen:
+        if label.startswith((FACT_PREFIX, MEMORY_PREFIX)) or label in seen:
             continue
         index = int(label[1:]) - 1
         if index >= len(passages):
@@ -255,19 +278,29 @@ def _claim_failure(run: TurnRun) -> ClaimFailure | None:
     """The first claim that fails its check, in reply order, or None when all pass.
 
     Each claim is checked against the one text it cites: the exact passage text the
-    search tool handed out, or the fact a successful tool result carried. Passage
-    labels were validated by `_citations`; a tool label never given out fails.
+    search tool handed out, the fact a successful tool result carried, or a recalled
+    memory. Passage labels were validated by `_citations`; a tool or memory label never
+    given out fails.
     """
-    passages = [passage["document"].page_content for passage in run.context.passages]
+    context = run.context
+    passages = [passage["document"].page_content for passage in context.passages]
+    memories = [memory.text for memory in context.memories]
     for claim in run.reply.claims:
-        failure = _check(claim, passages, run.context.facts)
+        failure = _check(claim, passages, context.facts, memories)
         if failure is not None:
             return failure
     return None
 
 
-def _check(claim: AssistantClaim, passages: list[str], facts: list[str]) -> ClaimFailure | None:
+def _check(
+    claim: AssistantClaim, passages: list[str], facts: list[str], memories: list[str]
+) -> ClaimFailure | None:
     index = int(claim.source[1:]) - 1
+    if claim.source.startswith(MEMORY_PREFIX):
+        if index >= len(memories) or not memories[index]:
+            return ClaimFailure.TOOL_CLAIM_UNGROUNDED
+        # The reply shows the quote as the resident's words, never the statement.
+        return check_quote(statement="", quote=claim.quote, text=memories[index])
     if not claim.source.startswith(FACT_PREFIX):
         return check_quote(claim.statement, claim.quote, passages[index])
     if index >= len(facts) or not facts[index]:
@@ -281,12 +314,21 @@ def _answer(run: TurnRun) -> str:
     """Passage claims as written; each cited tool fact once, as the server wrote it.
 
     Every fact holds only checked values, so a reply cannot misstate a tool result:
-    "The front door is unlocked." citing T1 shows T1's "Front door is locked."
+    "The front door is unlocked." citing T1 shows T1's "Front door is locked." A memory
+    claim shows the whole note as the resident's own words, so an old note such as
+    "I locked the door" never reads as something the assistant did.
     """
     facts = run.context.facts
+    memories = run.context.memories
     parts: list[str] = []
     shown: set[str] = set()
     for claim in run.reply.claims:
+        if claim.source.startswith(MEMORY_PREFIX):
+            # The whole note, once: a fragment could cut a number or drop a "not".
+            if claim.source not in shown:
+                shown.add(claim.source)
+                parts.append(f'You told me: "{memories[int(claim.source[1:]) - 1].text}".')
+            continue
         if not claim.source.startswith(FACT_PREFIX):
             parts.append(claim.statement)
             continue
@@ -456,6 +498,12 @@ async def _turn(
     run: TurnRun | None = None
     try:
         context = await _resident_context(session_factory, resident)
+        box = runtime.memory_box
+        memories = []
+        if box is not None:
+            memories = await recall_memories(
+                session_factory, box, resident.user_id, resident.building_id
+            )
         run = TurnRun(
             context=ToolContext(
                 session_factory=session_factory,
@@ -464,10 +512,19 @@ async def _turn(
                 turn_id=turn_id,
                 embedder=runtime.embedder,
                 telemetry=runtime.telemetry,
+                message=message,
+                memory_box=box,
+                memories=memories,
             ),
             model=runtime.model,
             deadline=started + settings.assistant_turn_deadline_seconds,
-            items=[first_input(context, message)],
+            items=[
+                first_input(
+                    context,
+                    message,
+                    [memory.text for memory in memories] if box is not None else None,
+                )
+            ],
         )
         return await _finish(session_factory, runtime, turn_id, run)
     except HTTPException:

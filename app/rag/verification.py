@@ -86,6 +86,24 @@ def appears_in(phrase: str, text: str) -> bool:
     return bool(quoted) and _quoted_in(quoted, normalize(text))
 
 
+# A quote never starts or ends inside a number: "1" is not in "1,200", "19" not in "19:00".
+_NOT_AFTER_NUMBER = r"(?<!\d[.,:])"
+_NOT_BEFORE_NUMBER = r"(?![.,:]\d)"
+
+
+def whole_quote(quote: str, text: str) -> bool:
+    """`quote` is at least three words of `text`, cutting no word and no number."""
+    quoted = _quote(quote)
+    if len(quoted.split()) < MIN_QUOTE_WORDS:
+        return False
+    pattern = re.escape(quoted)
+    if quoted[:1].isalnum():
+        pattern = r"(?<!\w)" + _NOT_AFTER_NUMBER + pattern
+    if quoted[-1:].isalnum():
+        pattern += r"(?!\w)" + _NOT_BEFORE_NUMBER
+    return re.search(pattern, normalize(text)) is not None
+
+
 def _numbers(text: str) -> set[str]:
     """Numbers in normalized text. A date's parts count too: 01.03.2025 allows 2025."""
     numbers = set()

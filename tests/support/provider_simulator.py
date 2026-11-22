@@ -57,10 +57,16 @@ TOOL_NAMES = frozenset(
         "set_thermostat",
         "lock_door",
         "unlock_door",
+        "remember",
+        "forget",
     }
 )
 NUMBER = re.compile(r"\d+(?:\.\d+)?")
 TICKET_WORDS = ("ticket", "broken", "leak", "repair")
+REMEMBER_WORD = "remember"
+# The server's quote check needs at least three words.
+MIN_NOTE_WORDS = 3
+RECALL_WORDS = ("what did i tell", "recall")
 THERMOSTAT_WORDS = ("degree", "thermostat", "temperature")
 # Benchmark knobs, read once at startup. Unset: no added latency and a cap of
 # 100 calls, as the tests expect.
@@ -324,6 +330,36 @@ def _device(devices: list, kind: str, message: str) -> str:
     return candidates[0]["name"] if candidates else "unknown"
 
 
+def _remember_step(message: str) -> dict:
+    """remember with the words after "remember" (and "that"), or the whole message."""
+    start = message.lower().index(REMEMBER_WORD) + len(REMEMBER_WORD)
+    text = message[start:].strip(" :,")
+    if text.lower().startswith("that "):
+        text = text[5:]
+    if len(text.split()) < MIN_NOTE_WORDS:
+        text = message
+    scope = "residence" if "this residence" in message.lower() else "resident"
+    return {"tool": "remember", "arguments": {"text": text[:300], "scope": scope}}
+
+
+def _memory_step(context: dict, message: str) -> dict | None:
+    """Memory keywords come first: "forget" and "remember" may sit beside "lock"."""
+    lowered = message.lower()
+    memories = context.get("memories")
+    memories = [m for m in memories if isinstance(m, dict)] if isinstance(memories, list) else []
+    if "forget" in lowered and memories:
+        arguments = {"label": memories[0].get("label", "M1"), "request_quote": message[:300]}
+        return {"tool": "forget", "arguments": arguments}
+    if REMEMBER_WORD in lowered:
+        return _remember_step(message)
+    if any(word in lowered for word in RECALL_WORDS) and memories:
+        first = memories[0]
+        quote = " ".join(str(first.get("text", "")).split()[:QUOTE_WORDS])
+        claim = {"statement": quote, "source": first.get("label", "M1"), "quote": quote}
+        return {"claims": [claim]}
+    return None
+
+
 def keyword_step(request: dict) -> dict:
     """Toy policy for unscripted agent requests: one tool from keywords, then an answer."""
     context, outputs = agent_context(request)
@@ -346,6 +382,9 @@ def keyword_step(request: dict) -> dict:
         # Nothing labelled, such as a denial: a claim that no fact supports.
         claim = {"statement": "Done.", "source": "T1", "quote": UNGROUNDED_QUOTE}
         return {"claims": [claim]}
+    memory = _memory_step(context, str(context.get("message", "")))
+    if memory is not None:
+        return memory
     message = str(context.get("message", "")).lower()
     resident = context.get("resident")
     devices = resident.get("devices", []) if isinstance(resident, dict) else []

@@ -4,7 +4,10 @@
             -> active memories < ASSISTANT_MEMORY_LIMIT, else 429
             -> writes in the last day < ASSISTANT_MEMORY_WRITES_PER_DAY, else 429
             -> seal -> insert memory + write row, one transaction, database clock
+            The route and the `remember` tool share this core; each commits itself.
     read    unexpired, and residence memories only while the user lives in that building
+    recall  a turn reads at most MAX_RECALLED of them, newest first; a row that does not
+            open is skipped and logged, never fatal
     forget  hard delete: one memory (404 if not the caller's) or all of them
     purge   the dispatcher tick deletes expired and moved-out memories, and day-old writes
 
@@ -16,6 +19,9 @@ open. Memory text is never logged, traced, or stored anywhere but the sealed col
 import base64
 import logging
 import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
 from uuid import UUID, uuid4
 
 from cryptography.exceptions import InvalidTag
@@ -38,6 +44,9 @@ ASSOCIATED_PREFIX = b"memory-v1"
 KEY_VERSION = 1
 # Rows each purge statement removes per dispatcher tick.
 PURGE_BATCH = 500
+# A turn recalls at most this many memories, newest first, within this many characters.
+MAX_RECALLED = 20
+MAX_RECALLED_CHARACTERS = 4000
 HTTP_FORBIDDEN = 403
 HTTP_NOT_FOUND = 404
 HTTP_TOO_MANY_REQUESTS = 429
@@ -103,27 +112,63 @@ def _servable(user_id: UUID, building_id: UUID | None) -> list:
     return [*current, or_(AssistantMemory.scope == MemoryScope.RESIDENT, home)]
 
 
-async def add_memory(
+class Refusal(StrEnum):
+    """Why a memory write was refused. Each route and tool maps these to its own reply."""
+
+    NO_RESIDENCE = "no_residence"
+    LIMIT_REACHED = "limit_reached"
+    WRITES_EXHAUSTED = "writes_exhausted"
+
+
+@dataclass(frozen=True)
+class Refused:
+    reason: Refusal
+    # Seconds until the oldest write leaves the one-day window (WRITES_EXHAUSTED only).
+    retry_after: int | None = None
+
+
+@dataclass(frozen=True)
+class Recalled:
+    """One memory opened for a turn. The turn labels them M1..Mn in this order."""
+
+    memory_id: UUID
+    text: str = field(repr=False)
+
+
+async def lock_writer(session: AsyncSession, user_id: UUID) -> datetime:
+    """Lock the user row and return the database clock. Take it before any other lock.
+
+    The lock serializes every memory write of one user, from the route and the tool
+    alike, so the limits hold under races.
+    """
+    await session.execute(select(User.id).where(User.id == user_id).with_for_update())
+    return await session.scalar(select(func.clock_timestamp()))
+
+
+async def write_memory(
     session: AsyncSession,
     box: MemoryBox,
     settings: AssistantSettings,
     user_id: UUID,
     scope: MemoryScope,
     text: str,
-) -> MemoryView:
-    """Seal and store one memory under the user's lock; the caller commits nothing else."""
-    # The user row lock serializes every write for one user: limits hold under races.
-    await session.execute(select(User.id).where(User.id == user_id).with_for_update())
-    now = await session.scalar(select(func.clock_timestamp()))
+    now: datetime,
+) -> MemoryView | Refused:
+    """Check the limits and insert one memory and its write row. Commits nothing.
 
-    # Residence scope is tied to the building the user lives in now.
+    The caller holds `lock_writer` in this transaction and commits or rolls back.
+    """
+    # Residence scope is tied to the building the user lives in now. The share lock
+    # makes a move-out wait until this write commits.
     building_id = None
     if scope is MemoryScope.RESIDENCE:
-        resident = await load_resident(session, user_id)
-        if resident is None:
-            await session.rollback()
-            raise HTTPException(HTTP_FORBIDDEN, NO_RESIDENCE)
-        building_id = resident.building_id
+        building_id = await session.scalar(
+            select(Membership.building_id)
+            .where(Membership.user_id == user_id, Membership.role == Role.RESIDENT)
+            .with_for_update(read=True)
+        )
+        if building_id is None:
+            return Refused(Refusal.NO_RESIDENCE)
 
     # Active memories: unexpired, and residence ones only while the user lives there,
     # so rows a read would hide never block a write before the purge removes them.
@@ -137,10 +182,9 @@ async def add_memory(
         )
     )
     if active >= settings.assistant_memory_limit:
-        await session.rollback()
-        raise HTTPException(HTTP_TOO_MANY_REQUESTS, LIMIT_REACHED)
+        return Refused(Refusal.LIMIT_REACHED)
 
-    # Writes in the last day; Retry-After is when the oldest one leaves the window.
+    # Writes in the last day; the retry time is when the oldest one leaves the window.
     window_start = now - func.make_interval(0, 0, 0, 0, 0, 0, DAY_SECONDS)
     writes, oldest = (
         await session.execute(
@@ -161,12 +205,7 @@ async def add_memory(
                 )
             )
         )
-        await session.rollback()
-        raise HTTPException(
-            HTTP_TOO_MANY_REQUESTS,
-            WRITES_EXHAUSTED,
-            headers={"Retry-After": str(max(int(retry), 1))},
-        )
+        return Refused(Refusal.WRITES_EXHAUSTED, retry_after=max(int(retry), 1))
 
     # Seal with the row's own id, then write the memory and its write row together.
     memory_id = uuid4()
@@ -190,10 +229,69 @@ async def add_memory(
         )
     ).one()
     await session.execute(insert(AssistantMemoryWrite).values(user_id=user_id, created_at=now))
-    await session.commit()
     return MemoryView(
         id=memory_id, scope=scope, text=text, created_at=created_at, expires_at=expires_at
     )
+
+
+async def add_memory(
+    session: AsyncSession,
+    box: MemoryBox,
+    settings: AssistantSettings,
+    user_id: UUID,
+    scope: MemoryScope,
+    text: str,
+) -> MemoryView:
+    """The route's write: one memory under the user's lock, committed, or an HTTP error."""
+    now = await lock_writer(session, user_id)
+    result = await write_memory(session, box, settings, user_id, scope, text, now)
+    if not isinstance(result, Refused):
+        await session.commit()
+        return result
+    await session.rollback()
+    if result.reason is Refusal.NO_RESIDENCE:
+        raise HTTPException(HTTP_FORBIDDEN, NO_RESIDENCE)
+    if result.reason is Refusal.LIMIT_REACHED:
+        raise HTTPException(HTTP_TOO_MANY_REQUESTS, LIMIT_REACHED)
+    raise HTTPException(
+        HTTP_TOO_MANY_REQUESTS,
+        WRITES_EXHAUSTED,
+        headers={"Retry-After": str(result.retry_after)},
+    )
+
+
+async def recall_memories(
+    session_factory: SessionFactory, box: MemoryBox, user_id: UUID, building_id: UUID
+) -> list[Recalled]:
+    """Servable memories for one turn, newest first, within the count and size caps.
+
+    A row that does not open is skipped, so one bad row never fails every turn.
+    """
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                select(AssistantMemory.id, AssistantMemory.nonce, AssistantMemory.ciphertext)
+                .where(*_servable(user_id, building_id))
+                .order_by(AssistantMemory.created_at.desc(), AssistantMemory.id.desc())
+                .limit(MAX_RECALLED)
+            )
+        ).all()
+        await session.rollback()
+    recalled: list[Recalled] = []
+    characters = 0
+    for row in rows:
+        try:
+            text = box.open(user_id, row.id, row.nonce, row.ciphertext)
+        except InvalidTag:
+            # A changed key or row. Logged without the id or any text.
+            logger.error("Assistant memory failed to open")
+            continue
+        # Newest first: the oldest notes are the ones left out.
+        if characters + len(text) > MAX_RECALLED_CHARACTERS:
+            break
+        characters += len(text)
+        recalled.append(Recalled(memory_id=row.id, text=text))
+    return recalled
 
 
 async def list_memories(session: AsyncSession, box: MemoryBox, user_id: UUID) -> MemoryList:
@@ -236,14 +334,19 @@ async def list_memories(session: AsyncSession, box: MemoryBox, user_id: UUID) ->
     return MemoryList(memories=memories)
 
 
-async def forget_memory(session: AsyncSession, user_id: UUID, memory_id: UUID) -> None:
-    """Hard delete one of the caller's memories; another user's and a missing one are 404."""
+async def delete_memory(session: AsyncSession, user_id: UUID, memory_id: UUID) -> bool:
+    """Hard delete one of the user's memories. Commits nothing; False if none matched."""
     deleted = await session.scalar(
         delete(AssistantMemory)
         .where(AssistantMemory.id == memory_id, AssistantMemory.user_id == user_id)
         .returning(AssistantMemory.id)
     )
-    if deleted is None:
+    return deleted is not None
+
+
+async def forget_memory(session: AsyncSession, user_id: UUID, memory_id: UUID) -> None:
+    """Hard delete one of the caller's memories; another user's and a missing one are 404."""
+    if not await delete_memory(session, user_id, memory_id):
         await session.rollback()
         raise HTTPException(HTTP_NOT_FOUND, NOT_FOUND)
     await session.commit()

@@ -1030,7 +1030,7 @@ class AssistantToolCall(Base):
         ),
         CheckConstraint(
             "tool IN ('search_documents','list_bookings','create_ticket','set_thermostat',"
-            "'lock_door','unlock_door','unknown')",
+            "'lock_door','unlock_door','remember','forget','unknown')",
             name="ck_assistant_tool_calls_tool",
         ),
         CheckConstraint(
@@ -1046,7 +1046,7 @@ class AssistantToolCall(Base):
         # Typed values only: any other key (a question, a summary) is rejected.
         CheckConstraint(
             "jsonb_typeof(details) = 'object' "
-            "AND (details - ARRAY['celsius','category','passage_count']) = '{}'::jsonb",
+            "AND (details - ARRAY['celsius','category','passage_count','scope']) = '{}'::jsonb",
             name="ck_assistant_tool_calls_details",
         ),
         Index("ix_assistant_tool_calls_user_created", "user_id", "created_at"),

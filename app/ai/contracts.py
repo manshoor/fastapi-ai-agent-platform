@@ -116,9 +116,10 @@ class GraphExtraction(StrictSchema):
     edges: list[GraphEdge] = Field(max_length=MAX_GRAPH_ITEMS)
 
 
-# Where an assistant claim comes from this turn: a search passage (P1-P8) or the
-# server-written fact of a tool result (T1-T8). The quote is copied from that text.
-ClaimSource = Annotated[str, StringConstraints(pattern=r"^[PT][1-8]$")]
+# Where an assistant claim comes from this turn: a search passage (P1-P8), the
+# server-written fact of a tool result (T1-T8), or a recalled memory (M1-M20). The quote
+# is copied from that text.
+ClaimSource = Annotated[str, StringConstraints(pattern=r"^(?:[PT][1-8]|M(?:[1-9]|1[0-9]|20))$")]
 AssistantQuote = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=300),

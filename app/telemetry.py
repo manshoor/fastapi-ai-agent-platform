@@ -119,6 +119,7 @@ _NUMBERS = frozenset(
         "edge_count",
         "graph_dropped",
         "graph_passages",
+        "memory_count",
     }
 )
 _IDS = frozenset(

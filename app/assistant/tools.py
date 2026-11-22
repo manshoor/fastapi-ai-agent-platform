@@ -6,6 +6,10 @@
                        write tools: one transaction =
                          per-user lock -> limits -> guarded write (membership in WHERE)
                          -> audit row
+                       memory tools (only while memory is on, only before any search):
+                         text or request quote must be a span of the current message ->
+                         remember: user row lock -> membership -> memory limits -> insert
+                         forget: delete the recalled M label's row -> audit row
                     -> result JSON back to the model; a result that grounds a reply
                        carries a server-written fact with the next label, T1..T8
 
@@ -14,6 +18,7 @@ The model supplies only names and values. User, apartment and building come from
 """
 
 import json
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, timedelta
@@ -30,26 +35,44 @@ from app.ai.provider import MAX_PASSAGES, ToolCall
 from app.assistant.config import AssistantSettings
 from app.assistant.contracts import (
     GROUNDING_RESULTS,
+    MEMORY_TOOLS,
     UNKNOWN_TOOL,
     ActionResult,
     Decision,
     DeviceArguments,
+    ForgetArguments,
+    MemoryScope,
     NoArguments,
+    RememberArguments,
     ResultCode,
     SearchArguments,
     ThermostatArguments,
     TicketArguments,
     ToolName,
 )
+from app.assistant.memory import (
+    MemoryBox,
+    Recalled,
+    Refusal,
+    Refused,
+    delete_memory,
+    lock_writer,
+    write_memory,
+)
 from app.assistant.residence import Resident, resident_member
 from app.models import AssistantToolCall, Booking, Device, Membership, PendingAction, Ticket
 from app.rag.retrieval import BuildingScopedRetriever, graph_search, has_building_context
+from app.rag.verification import MIN_QUOTE_WORDS, appears_in, normalize, whole_quote
 
 # Transaction advisory lock namespace for one user's tool writes ("ASTW").
 _WRITE_LOCK_NAMESPACE = 0x41535457
 SEARCH_TOP_K = 4
 BOOKING_LIMIT = 10
 DEVICE_TOOLS = (ToolName.SET_THERMOSTAT, ToolName.LOCK_DOOR)
+# A forget request names its intent in the quoted words, and is not "don't forget".
+_FORGET_INTENT = re.compile(r"\b(?:forget|delete|remove|erase)\b")
+_NEGATED_FORGET = re.compile(r"\b(?:don't|do not|never|not)\s+(?:forget|delete|remove|erase)\b")
+_WORD = re.compile(r"\w+")
 # Labels T1..T8, as for passages: a turn makes at most eight model calls.
 MAX_FACTS = 8
 FACT_PREFIX = "T"
@@ -73,6 +96,13 @@ class ToolContext:
     # (tool, device) -> index of that device's current fact in `facts`.
     _device_facts: dict[tuple[str, str], int] = field(default_factory=dict, init=False, repr=False)
     embedding_tokens: int = 0
+    # The resident's current message: memory tools may store or act only on its words.
+    message: str = field(default="", repr=False)
+    # Seals memory text; None while memory is off, and then no memory tool runs.
+    memory_box: MemoryBox | None = field(default=None, repr=False)
+    # Memories recalled for this turn: memories[0] is M1. A forgotten one is blanked,
+    # never removed, so labels keep their meaning.
+    memories: list[Recalled] = field(default_factory=list, repr=False)
 
 
 @dataclass(frozen=True)
@@ -293,6 +323,9 @@ async def list_bookings(ctx: ToolContext, args: NoArguments) -> ToolOutcome:
 
 async def create_ticket(ctx: ToolContext, args: TicketArguments) -> ToolOutcome:
     tool, resident, settings = ToolName.CREATE_TICKET, ctx.resident, ctx.settings
+    if _repeats_a_note(ctx, args.summary):
+        await _audited(ctx, tool, Decision.DENIED, ResultCode.NOT_PERMITTED)
+        return _outcome(tool, Decision.DENIED, ResultCode.NOT_PERMITTED)
     async with ctx.session_factory() as session:
         await _lock_user(session, ctx)
         if not await _hold_membership(session, ctx):
@@ -534,6 +567,115 @@ async def unlock_door(ctx: ToolContext, args: DeviceArguments) -> ToolOutcome:
     )
 
 
+SAVED_FACTS = {
+    MemoryScope.RESIDENT: "Saved your note to your memories.",
+    MemoryScope.RESIDENCE: "Saved your note for this residence.",
+}
+
+
+def _asks_to_forget(quote: str, message: str) -> bool:
+    """The quoted words name a forget request, and the message never says "don't forget"."""
+    return bool(_FORGET_INTENT.search(normalize(quote))) and not _NEGATED_FORGET.search(
+        normalize(message)
+    )
+
+
+def _repeats_a_note(ctx: ToolContext, text: str) -> bool:
+    """`text` holds three words in a row of a recalled note that the message does not.
+
+    Recalled notes are private: a ticket summary, which co-residents can read, may hold
+    what the resident says now but not what the model read from a note.
+    """
+    for memory in ctx.memories:
+        words = _WORD.findall(memory.text)
+        for start in range(len(words) - MIN_QUOTE_WORDS + 1):
+            window = " ".join(words[start : start + MIN_QUOTE_WORDS])
+            if appears_in(window, text) and not appears_in(window, ctx.message):
+                return True
+    return False
+
+
+async def _memory_gate(ctx: ToolContext, tool: str, quote: str) -> ToolOutcome | None:
+    """Refuse a memory tool a passage could have asked for, or words the resident never said.
+
+    Once a search handed out passages, a document could be steering the model, so memory
+    tools no longer run this turn. The quoted words must be the resident's own.
+    """
+    result = None
+    if ctx.passages:
+        result = ResultCode.NOT_PERMITTED
+    elif not whole_quote(quote, ctx.message):
+        result = ResultCode.INVALID_ARGUMENTS
+    elif tool == ToolName.FORGET and not _asks_to_forget(quote, ctx.message):
+        result = ResultCode.INVALID_ARGUMENTS
+    if result is None:
+        return None
+    await _audited(ctx, tool, Decision.DENIED, result)
+    return _outcome(tool, Decision.DENIED, result)
+
+
+async def remember(ctx: ToolContext, args: RememberArguments) -> ToolOutcome:
+    """Store a span of the resident's message as a memory, under the memory limits."""
+    tool, scope = ToolName.REMEMBER, args.scope
+    refused = await _memory_gate(ctx, tool, args.text)
+    if refused is not None:
+        return refused
+    async with ctx.session_factory() as session:
+        # User row first, then membership: the same order as the memory route.
+        now = await lock_writer(session, ctx.resident.user_id)
+        if not await _hold_membership(session, ctx):
+            return await _deny(session, ctx, tool, ResultCode.NOT_PERMITTED)
+        result = await write_memory(
+            session, ctx.memory_box, ctx.settings, ctx.resident.user_id, scope, args.text, now
+        )
+        if isinstance(result, Refused):
+            code = (
+                ResultCode.NOT_PERMITTED
+                if result.reason is Refusal.NO_RESIDENCE
+                else ResultCode.LIMIT_EXCEEDED
+            )
+            return await _deny(session, ctx, tool, code)
+        details = {"scope": str(scope)}
+        await session.execute(_audit(ctx, tool, Decision.ALLOWED, ResultCode.OK, details=details))
+        await session.commit()
+    return _outcome(
+        tool,
+        Decision.ALLOWED,
+        ResultCode.OK,
+        output={"scope": str(scope)},
+        fact=SAVED_FACTS[scope],
+    )
+
+
+async def forget(ctx: ToolContext, args: ForgetArguments) -> ToolOutcome:
+    """Hard delete one memory recalled this turn, named by its M label."""
+    tool = ToolName.FORGET
+    refused = await _memory_gate(ctx, tool, args.request_quote)
+    if refused is not None:
+        return refused
+    index = int(args.label[1:]) - 1
+    recalled = ctx.memories[index] if index < len(ctx.memories) else None
+    if recalled is None or not recalled.text:
+        await _audited(ctx, tool, Decision.DENIED, ResultCode.NOT_FOUND)
+        return _outcome(tool, Decision.DENIED, ResultCode.NOT_FOUND)
+    # Gone or going: either way it grounds no later claim this turn.
+    ctx.memories[index] = Recalled(memory_id=recalled.memory_id, text="")
+    async with ctx.session_factory() as session:
+        # Already gone: the resident deleted it through the route during this turn.
+        if not await delete_memory(session, ctx.resident.user_id, recalled.memory_id):
+            return await _deny(session, ctx, tool, ResultCode.NOT_FOUND)
+        await session.execute(_audit(ctx, tool, Decision.ALLOWED, ResultCode.OK))
+        await session.commit()
+    # The fact names the note in the resident's own words, so they see what went.
+    return _outcome(
+        tool,
+        Decision.ALLOWED,
+        ResultCode.OK,
+        output={"label": args.label},
+        fact=f'Forgot your note: "{recalled.text}".',
+    )
+
+
 @dataclass(frozen=True)
 class _Spec:
     arguments: type[BaseModel]
@@ -580,23 +722,54 @@ _SPECS: dict[str, _Spec] = {
         "Request a door unlock. The resident must confirm it in the app.",
         {"device": _STRING},
     ),
+    ToolName.REMEMBER: _Spec(
+        RememberArguments,
+        remember,
+        "Save a note the resident asks you to remember. text is copied word for word from "
+        "the resident's message. scope residence keeps it only while they live here.",
+        {"text": _STRING, "scope": {"type": "string", "enum": [str(s) for s in MemoryScope]}},
+    ),
+    ToolName.FORGET: _Spec(
+        ForgetArguments,
+        forget,
+        "Delete one recalled memory, by its label M1 to M20, when the resident asks. "
+        "request_quote is copied word for word from the resident's message.",
+        {"label": _STRING, "request_quote": _STRING},
+    ),
 }
 
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "name": str(name),
-        "description": spec.description,
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "properties": spec.properties,
-            "required": list(spec.properties),
-            "additionalProperties": False,
-        },
-    }
-    for name, spec in _SPECS.items()
-]
+
+def _offered(settings: AssistantSettings) -> dict[str, _Spec]:
+    """The tools of this deployment: the memory tools only while memory is on."""
+    if settings.assistant_memory_enabled:
+        return _SPECS
+    return {name: spec for name, spec in _SPECS.items() if name not in MEMORY_TOOLS}
+
+
+def tool_schemas(settings: AssistantSettings) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "name": str(name),
+            "description": spec.description,
+            "strict": True,
+            "parameters": {
+                "type": "object",
+                "properties": spec.properties,
+                "required": list(spec.properties),
+                "additionalProperties": False,
+            },
+        }
+        for name, spec in _offered(settings).items()
+    ]
+
+
+def _spec(ctx: ToolContext, name: str) -> _Spec | None:
+    spec = _offered(ctx.settings).get(name)
+    # A memory tool also needs the box: a context built without one runs none.
+    if name in MEMORY_TOOLS and ctx.memory_box is None:
+        return None
+    return spec
 
 
 async def execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
@@ -605,7 +778,7 @@ async def execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     if telemetry is None:
         return await _execute(ctx, call)
     # The span names only allowlisted tools; anything else is "unknown".
-    tool = call.name if call.name in _SPECS else UNKNOWN_TOOL
+    tool = call.name if _spec(ctx, call.name) is not None else UNKNOWN_TOOL
     with telemetry.span("assistant.tool", operation=tool, turn_id=str(ctx.turn_id)):
         outcome = await _execute(ctx, call)
         decision, result = str(outcome.action.decision), str(outcome.action.result)
@@ -615,7 +788,7 @@ async def execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
 
 
 async def _execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
-    spec = _SPECS.get(call.name)
+    spec = _spec(ctx, call.name)
     if spec is None:
         await _audited(ctx, UNKNOWN_TOOL, Decision.DENIED, ResultCode.UNKNOWN_TOOL)
         return _outcome(UNKNOWN_TOOL, Decision.DENIED, ResultCode.UNKNOWN_TOOL)
