@@ -38,6 +38,8 @@ x-processing-environment: &processing-environment
   # Every document event goes to Kafka and to the local SQS (ElasticMQ), never real AWS.
   RAG_EVENT_SINKS: kafka,sqs
   RAG_SQS_ENDPOINT: http://sqs:9324
+  # Knowledge graph extraction and expansion: off unless the invoking shell opts in.
+  RAG_GRAPH_ENABLED: ${AI_RAG_GRAPH_ENABLED:-false}
   OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
   OTEL_EXPORTER_OTLP_TIMEOUT: "3"
   OTEL_BSP_SCHEDULE_DELAY: "200"

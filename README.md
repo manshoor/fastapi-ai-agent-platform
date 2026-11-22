@@ -659,7 +659,11 @@ uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --repeat 3 
 uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --judge --judge-model MODEL
 ```
 
-`--graph` runs every selected case twice, as configurations `vector` (`graph:off`) and `graph` (`graph:on`). Start the API with `RAG_GRAPH_ENABLED=true` so the fixture documents are ingested with a graph; extraction is paid too.
+`--graph` runs every selected case twice, as configurations `vector` (`graph:off`) and `graph` (`graph:on`). Start the stack with `AI_RAG_GRAPH_ENABLED=true` in the invoking shell (it sets `RAG_GRAPH_ENABLED` for the API and workers; default off) so the fixture documents are ingested with a graph; extraction is paid too:
+
+```bash
+AI_RAG_GRAPH_ENABLED=true docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml -f compose.ai.live.yaml up --build -d --wait api worker rag-worker rag-worker-sqs dispatcher rag-dispatcher-sqs
+```
 
 ```bash
 uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --graph --case multi-hop-storage-hours --case multi-hop-guest-apartment
@@ -1022,3 +1026,5 @@ Recorded final CSV prefixes are `artifacts/local-final` and `artifacts/distribut
 Assistant hardening pass (`feature/assistant-hardening`): **1,058 passing main-suite tests (63 skipped) and 1,121 passing AI-suite tests**; Ruff and `alembic check` clean; the Alembic round trip passed, and the 0006 downgrade refuses while step-up audit rows exist. `scripts/smoke_assistant.py` (step-up flow) and `scripts/smoke_edge.py` passed against the isolated AI QA stack; the edge with the normal and AI-local stacks was checked with `docker compose config` only. The paid live assistant eval passed 21/21 before and again after the step-up change (no judge). The CRUD `benchmark_smoke.py` still passes (335 measured requests, 0 failures, p95 13 ms, p99 14 ms); assistant benchmark results are in [Assistant load benchmark](#assistant-load-benchmark).
 
 GraphRAG and memory pass (`feature/graph-memory`): **1,313 passing main-suite tests (87 skipped) and 1,400 passing AI-suite tests**; Ruff and `alembic check` clean. Migrations 0011, 0012 and 0013 round-trip, and each downgrade refuses while its data exists (graph rows or a graph error code, memories, memory tool audit rows). `scripts/smoke_assistant.py` (now with remember, recall and forget) and `scripts/smoke_rag.py` passed against the isolated AI QA stack with the simulator. No paid model call was made: the `evaluate_rag.py --graph` comparison and live memory behaviour are not measured.
+
+Paid graph eval (2026-11-22, `gpt-5.6-terra`, one repeat, the two multi-hop cases): `vector` and `graph` scored the same, 0/2 runs passing each, retrieval hit 50%, answer correct 50%, mean 1,262 tokens, with identical tokens per case, so expansion added no passage. Extraction stored 71 nodes and 13 edges over the 5 fixture documents with no extraction error, but none of the edges the cases need (storage cage to cellar, cellar to opening hours, guest apartment to the service that runs it). The limit is extraction recall, not expansion. With n = 1 per case this is a wiring and direction check, not a quality measure.
