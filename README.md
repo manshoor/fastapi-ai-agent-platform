@@ -586,7 +586,7 @@ Real sources need their own egress overlay and private env file; the fake creden
 
 ### Answer grounding
 
-Retrieval can find the right passage while the model still misreads it. So the answer is built only from claims the server can check (prompt `rag-answer-v2`):
+Retrieval can find the right passage while the model still misreads it. So the answer is built only from claims the server can check (prompt `rag-answer-v3`):
 
 ```
 model -> claims[{statement, citation P<n>, quote}]   (no claims -> no_context: no_claims)

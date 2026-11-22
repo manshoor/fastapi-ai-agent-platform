@@ -186,7 +186,7 @@ async def test_answer_cites_the_matching_document(app, client, account, simulato
     assert (row.status, row.retrieved_count, row.top_k) == ("answered", 1, 1)
     assert row.finished_at is not None and row.input_tokens == 25 and row.output_tokens == 15
     assert (row.chat_calls, row.reasoning_effort, row.no_context_reason) == (1, "none", None)
-    assert row.prompt_version == "rag-answer-v2"
+    assert row.prompt_version == "rag-answer-v3"
     assert row.provider_request_id.startswith("req_sim_")
 
 
