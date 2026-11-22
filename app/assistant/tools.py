@@ -62,7 +62,7 @@ from app.assistant.memory import (
 from app.assistant.residence import Resident, resident_member
 from app.models import AssistantToolCall, Booking, Device, Membership, PendingAction, Ticket
 from app.rag.retrieval import BuildingScopedRetriever, graph_search, has_building_context
-from app.rag.verification import MIN_QUOTE_WORDS, appears_in, normalize, whole_quote
+from app.rag.verification import MIN_QUOTE_WORDS, normalize, whole_quote
 
 # Transaction advisory lock namespace for one user's tool writes ("ASTW").
 _WRITE_LOCK_NAMESPACE = 0x41535457
@@ -580,19 +580,27 @@ def _asks_to_forget(quote: str, message: str) -> bool:
     )
 
 
+def _windows(text: str) -> set[tuple[str, ...]]:
+    """Every run of three words in `text`, normalized and stripped of punctuation."""
+    words = _WORD.findall(normalize(text))
+    return {
+        tuple(words[start : start + MIN_QUOTE_WORDS])
+        for start in range(len(words) - MIN_QUOTE_WORDS + 1)
+    }
+
+
 def _repeats_a_note(ctx: ToolContext, text: str) -> bool:
     """`text` holds three words in a row of a recalled note that the message does not.
 
     Recalled notes are private: a ticket summary, which co-residents can read, may hold
-    what the resident says now but not what the model read from a note.
+    what the resident says now but not what the model read from a note. Both sides are
+    compared as bare words, so punctuation cannot hide a note. A paraphrase still can:
+    this bounds copying, it is not a guarantee.
     """
-    for memory in ctx.memories:
-        words = _WORD.findall(memory.text)
-        for start in range(len(words) - MIN_QUOTE_WORDS + 1):
-            window = " ".join(words[start : start + MIN_QUOTE_WORDS])
-            if appears_in(window, text) and not appears_in(window, ctx.message):
-                return True
-    return False
+    if not ctx.memories:
+        return False
+    copied = _windows(text) - _windows(ctx.message)
+    return any(_windows(memory.text) & copied for memory in ctx.memories)
 
 
 async def _memory_gate(ctx: ToolContext, tool: str, quote: str) -> ToolOutcome | None:

@@ -492,3 +492,18 @@ async def test_a_note_gone_before_forget_grounds_nothing(app, client, resident):
     outcome = await tools.execute(ctx, ToolCall(name="forget", call_id="c1", arguments=arguments))
     assert outcome.action.result == "not_found"
     assert ctx.memories[0].text == ""
+
+
+async def test_punctuation_does_not_hide_a_recalled_note(app, client, resident, simulator):
+    owner = await resident()
+    await note(client, owner, "My spare-key hides under the blue pot")
+    script(
+        simulator,
+        {
+            "tool": "create_ticket",
+            "arguments": {"category": "other", "summary": "Spare. key. hides. under. the. pot."},
+        },
+        reply("T1", "Maintenance ticket opened"),
+    )
+    await send(client, owner, "Please open a ticket, the hallway light flickers")
+    assert await audits(app, "create_ticket") == [("denied", "not_permitted", {})]
