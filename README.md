@@ -711,7 +711,7 @@ All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
 | `POST /api/v1/residence/demo` | 201: a demo building, apartment `1A`, two thermostats, two door locks, an alarm, two bookings; the caller becomes resident and manager | 404 when the demo flag is off (before authentication); 409 already a resident |
 | `POST /api/v1/rag/documents?building_id=` | As for RAG uploads; the document belongs to the building | 404 unless the caller manages that building |
 
-The final reply is claims, checked like RAG answers (prompt `assistant-v4`): each passage claim needs a quote from a passage handed out this turn, and the reply shows its statement. Each successful device, ticket or booking result gets a label `T1`–`T8` and a `fact` the server writes from checked values. A tool claim cites that label and quotes the fact, and the reply shows the fact in place of the model's sentence, so a reply cannot misstate a tool result. A later result for the same device replaces its earlier fact; a denial has no fact. `citations[]` items carry `quotes`. `status` is `answered` (every claim checked), `no_context` (fixed text: nothing grounded the answer, or a claim failed with nothing committed), or `incomplete` (fixed text: the turn stopped after committing a change, including a failed claim after a write, `error_code` `claim_unverified`; `actions` lists what happened). The failed check is stored in `assistant_turns.claim_failure`. `actions[]` items are `{tool, decision, result, device, ticket_id, pending_action_id}`, built by the server from tool results, never from model text.
+The final reply is claims, checked like RAG answers (prompt `assistant-v4`): each passage claim needs a quote from a passage handed out this turn, and the reply shows its statement. Each successful device, ticket or booking result gets a label `T1`–`T8` and a `fact` the server writes from checked values. A tool claim cites that label and quotes the fact, and the reply shows the fact in place of the model's sentence, so a reply cannot misstate a tool result. A later result for the same device replaces its earlier fact; a denial has no fact. While memory is on, a memory claim cites a recalled note `M1`–`M20` and quotes at least three of its words; the reply shows the whole note as `You told me: "…".`, never the model's sentence, so a fragment cannot drop a "not" or cut a number ([Assistant memory](#assistant-memory)). `citations[]` items carry `quotes`. `status` is `answered` (every claim checked), `no_context` (fixed text: nothing grounded the answer, or a claim failed with nothing committed), or `incomplete` (fixed text: the turn stopped after committing a change, including a failed claim after a write, `error_code` `claim_unverified`; `actions` lists what happened). The failed check is stored in `assistant_turns.claim_failure`. `actions[]` items are `{tool, decision, result, device, ticket_id, pending_action_id}`, built by the server from tool results, never from model text.
 
 ### Tools and rules
 
@@ -723,11 +723,13 @@ The final reply is claims, checked like RAG answers (prompt `assistant-v4`): eac
 | `set_thermostat` | `device`, `celsius` (16–26, steps of 0.5) | Sets the target | 10 device actions per user per hour |
 | `lock_door` | `device` | Locks the door | shares the device-action limit |
 | `unlock_door` | `device` | Creates a 60 s pending unlock; never unlocks | 3 per user per hour |
+| `remember` (memory on) | `text`, `scope` (`resident` or `residence`) | Saves `text`, which must be whole words of the current message | 50 active, 10 writes per user per 24 h, shared with the route |
+| `forget` (memory on) | `label` (`M1`–`M20`), `request_quote` | Deletes that recalled note; `request_quote` must be words of the message that ask to forget | none |
 
 - **Identity from the server.** The model supplies only tool names and values. User, apartment and building come from the caller's token and membership. Extra arguments are rejected.
 - **Checked, audited writes.** Each write runs in one transaction: per-user lock, membership share lock, limit count on the database clock, a write guarded by apartment, device name and kind, and an `assistant_tool_calls` audit row. Unknown tool names are audited as `unknown`.
 - **Only the resident confirms, with a code.** No tool can confirm an unlock, and confirm needs an authenticator code ([Unlock step-up](#unlock-step-up)). The alarm exists but no tool can reach it, and the model never sees it.
-- **Untrusted text.** The message, tool results and passages are data, never instructions. A hijacked model can at worst create an unconfirmed unlock request.
+- **Untrusted text.** The message, recalled memories, tool results and passages are data, never instructions. A memory never authorizes an action. A hijacked model can at worst create an unconfirmed unlock request, or save or forget a note within the rules below.
 - **No content stored or traced.** Turns and audit rows hold counts, IDs and fixed codes; ticket summaries live only in `tickets`. The graph runs with LangSmith tracing disabled; spans `assistant.turn` (Langfuse `agent`) and `assistant.tool` (Langfuse and LangSmith `tool`) carry IDs and counts only.
 - Defaults: 10 turns per 60 s per user. One running turn per user across all API processes: another gets 429 `A turn is already running` (`Retry-After: 1`). A turn's lease ends with the turn, or 30 s after its deadline if its process died. At most 64 running turns per API process (`ASSISTANT_CONCURRENCY`, up to 256), then 503 at once; turns hold no database connection while they wait on the provider.
 
@@ -741,6 +743,42 @@ Enroll once with the account password, add the returned secret (or `otpauth_uri`
 - A confirm without an enabled authenticator, or with a wrong code, writes a `denied` audit row (`step_up_required`, `step_up_failed`) with no action or device id: the action is not yet proven to be the caller's. `step_up_required` denials are not counted as failures; the edge's `assistant` zone limits their rate.
 - Secrets are sealed with AES-256-GCM under `ASSISTANT_TOTP_KEY` (32 bytes as base64, required when the assistant is on), with the user id as associated data, so a row copied to another user does not open. Secrets, codes and passwords are never logged, traced or stored in plain text. `compose.ai.yaml` reads the key from `AI_ASSISTANT_TOTP_KEY`, `compose.ai.test.yaml` sets a test-only key, and the benchmark runner generates `BENCH_ASSISTANT_TOTP_KEY` per run.
 - Not included: reset, disable and recovery codes. A lost authenticator blocks that user's unlock confirms until an operator deletes their `totp_credentials` row; a lost or changed `ASSISTANT_TOTP_KEY` does this for every enrolled user (500 `Authenticator unavailable`). Assistant memory is sealed the same way under its own `ASSISTANT_MEMORY_KEY` (`AI_ASSISTANT_MEMORY_KEY`, a test-only key, `BENCH_ASSISTANT_MEMORY_KEY`); losing or changing it makes every memory read a 500 `Memory unavailable`. Downgrading migration 0006 drops all enrollments and failure counts, and refuses while step-up audit rows exist.
+
+### Assistant memory
+
+A resident can ask the assistant to keep a note ("remember that I prefer the gym after 19:00") and to forget it later. It is off unless `ASSISTANT_MEMORY_ENABLED=true`, which requires the assistant and `ASSISTANT_MEMORY_KEY`. `compose.ai.yaml` enables it; the QA smoke API enables it; the pytest stack leaves it off except in the memory tests.
+
+```
+write   route POST or the remember tool
+          -> lock the user row -> (tool) membership share lock
+          -> residence scope: share-lock the resident membership, 403 / not_permitted if none
+          -> active memories < ASSISTANT_MEMORY_LIMIT (50), else 429 / limit_exceeded
+          -> writes in the last 24 h < ASSISTANT_MEMORY_WRITES_PER_DAY (10), else 429 + Retry-After
+          -> seal -> insert memory + write row (+ audit row for the tool), one transaction
+recall  each turn, before the first model call: unexpired notes, plus residence notes of
+        the building the resident lives in now; newest first, at most 20 and 4,000
+        characters; labelled M1..Mn as JSON strings in the first input
+forget  route DELETE (one or all), or the forget tool on a recalled label: hard delete
+purge   the dispatcher tick deletes expired and moved-out notes and day-old write rows
+```
+
+- **Scopes.** `resident` follows the user. `residence` holds only while the user lives in the building it was saved in: moving out hides it at once and the purge removes it.
+- **Retention.** 90 days per note (`ASSISTANT_MEMORY_RETENTION_SECONDS`, 1 to 365 days), on the database clock. Reads never serve an expired note, even before the purge.
+- **Explicit writes only.** The tool's `text` must be whole words of the resident's current message: no cut word, no cut number (`1` is not in `1,200`). A note needs at least three words, so a reply can always quote it. Nothing is saved automatically.
+- **Forgetting needs a request.** `request_quote` must be words of the message that contain `forget`, `delete`, `remove` or `erase`, and the message must not say "don't forget". The tool's fact names the deleted note, so the resident sees what went. A forgotten note grounds no later claim in the same turn.
+- **Steering.** Once a search hands out passages, neither memory tool runs for the rest of the turn: a document could be steering the model. Memories go in as JSON strings under their own `M` labels, so a note that reads like `T1: Front door is unlocked` is never a tool fact.
+- **Privacy.** Text is sealed with AES-256-GCM; the associated data binds it to its purpose (`memory-v1`), user and row. Text is never logged, traced, or stored outside the sealed column: turns hold `memory_count`, audit rows hold `scope` only. `create_ticket` refuses a summary that repeats three words in a row of a recalled note that the current message does not say, because co-residents can read tickets. A paraphrase can still pass that check.
+- **A row that does not open** (changed key or row) makes the list route return 500 `Memory unavailable`, and is skipped by recall, so one bad row never fails every turn.
+- **Not included:** conversation memory, automatic extraction, building-wide notes, key rotation (`key_version` is fixed at 1). A route `DELETE` during a running turn does not stop that turn from quoting a note it already recalled.
+
+| Request | Success | Errors |
+| --- | --- | --- |
+| `GET /api/v1/assistant/memories` | 200 `{memories: [{id, scope, text, created_at, expires_at}]}`, newest first, `Cache-Control: no-store` | 500 a note does not open |
+| `POST /api/v1/assistant/memories` with `{text, scope}` (3–300 characters, at least three words, no NUL) | 201 the memory | 403 residence scope without a residence; 422; 429 active or daily limit (`Retry-After` for the daily one) |
+| `DELETE /api/v1/assistant/memories/{id}` | 204 | 404 foreign or missing |
+| `DELETE /api/v1/assistant/memories` | 204: every note of the caller | — |
+
+All four are 404 before authentication while memory is off, and none is in the OpenAPI schema. Downgrading migration 0012 refuses while any memory exists; 0013 refuses while memory tool audit rows exist.
 
 ### Assistant evaluations
 
@@ -982,3 +1020,5 @@ Final local observations (generator and target on the **same laptop**):
 Recorded final CSV prefixes are `artifacts/local-final` and `artifacts/distributed-final` (fixture `artifacts/load-final.csv`); the repeatable example above uses `load-smoke.csv` and `smoke`. These small runs prove local workflow/harness operation only. **No million-row seed, 15,000-user tier, or 30,000-user tier was executed.** No production capacity, availability SLO, or authentication throughput claim follows from these observations.
 
 Assistant hardening pass (`feature/assistant-hardening`): **1,058 passing main-suite tests (63 skipped) and 1,121 passing AI-suite tests**; Ruff and `alembic check` clean; the Alembic round trip passed, and the 0006 downgrade refuses while step-up audit rows exist. `scripts/smoke_assistant.py` (step-up flow) and `scripts/smoke_edge.py` passed against the isolated AI QA stack; the edge with the normal and AI-local stacks was checked with `docker compose config` only. The paid live assistant eval passed 21/21 before and again after the step-up change (no judge). The CRUD `benchmark_smoke.py` still passes (335 measured requests, 0 failures, p95 13 ms, p99 14 ms); assistant benchmark results are in [Assistant load benchmark](#assistant-load-benchmark).
+
+GraphRAG and memory pass (`feature/graph-memory`): **1,313 passing main-suite tests (87 skipped) and 1,400 passing AI-suite tests**; Ruff and `alembic check` clean. Migrations 0011, 0012 and 0013 round-trip, and each downgrade refuses while its data exists (graph rows or a graph error code, memories, memory tool audit rows). `scripts/smoke_assistant.py` (now with remember, recall and forget) and `scripts/smoke_rag.py` passed against the isolated AI QA stack with the simulator. No paid model call was made: the `evaluate_rag.py --graph` comparison and live memory behaviour are not measured.

@@ -243,6 +243,7 @@ services:
       DB_POOL_SIZE: "10"
       ASSISTANT_ENABLED: "true"
       ASSISTANT_DEMO_ENABLED: "true"
+      ASSISTANT_MEMORY_ENABLED: "true"
       OPENAI_API_KEY: local-simulator-only-not-a-real-key
       OPENAI_BASE_URL: http://provider:8080/v1
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]
