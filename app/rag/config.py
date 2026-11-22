@@ -83,10 +83,12 @@ class RAGSettings(AISettings):
     # chunks, stored with that batch) and expansion at query time. Off by default: each
     # batch is a paid call.
     rag_graph_enabled: bool = False
-    # Chunks per extraction call and per stored batch while the graph is on.
+    # Chunks per extraction call and per stored batch while the graph is on. One chunk
+    # per call by default: with several, a live model filled the first chunk and left the
+    # others empty. Each call is paid, so a long document makes one call per chunk.
     # 4 chunks x 8 nodes and 8 edges with short quotes is about 2,500 output tokens,
     # inside the default AI_MAX_OUTPUT_TOKENS (4096). Output cut short has no graph.
-    rag_graph_batch_size: int = Field(default=4, ge=1, le=8)
+    rag_graph_batch_size: int = Field(default=1, ge=1, le=8)
     rag_graph_max_items_per_chunk: int = Field(default=8, ge=1, le=24)
     rag_graph_hops: int = Field(default=1, ge=1, le=2)
     # Graph passages added after the vector passages; the total stays at most 8.

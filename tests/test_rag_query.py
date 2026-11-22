@@ -657,20 +657,20 @@ async def test_relevance_margin_drops_distant_candidates(app, client, account, s
 
 
 async def link(app: FastAPI, owner_id: UUID, document_id: UUID, source: str, target: str):
-    """One edge, and its two nodes, in the document's only chunk."""
+    """One edge, and its two nodes, in the document's only chunk. Ends are "type:name";
+    the stored key is the name alone, as `app/rag/graph.py` writes it."""
     chunk = {"document_id": document_id, "version": 1, "ordinal": 0, "owner_id": owner_id}
     async with app.state.session_factory() as session:
-        for key in (source, target):
-            node_type, name = key.split(":")
-            session.add(
-                RAGGraphNode(**chunk, node_key=key, node_type=node_type, name=name, match_name=name)
-            )
+        for end in (source, target):
+            node_type, name = end.split(":")
+            node = {"node_key": name, "node_type": node_type, "name": name, "match_name": name}
+            session.add(RAGGraphNode(**chunk, **node))
         session.add(
             RAGGraphEdge(
                 **chunk,
-                source_key=source,
+                source_key=source.split(":")[1],
                 relation="located_in" if target.startswith("location") else "governed_by",
-                target_key=target,
+                target_key=target.split(":")[1],
                 quote="quoted span of the chunk",
             )
         )

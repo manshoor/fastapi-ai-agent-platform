@@ -107,9 +107,9 @@ def test_grounded_edge_and_nodes_are_kept():
         [chunk(GYM)],
         12,
     )
-    assert {node.node_key for node in rows.nodes} == {"facility:gym", "location:basement"}
+    assert {node.node_key for node in rows.nodes} == {"gym", "basement"}
     assert [(e.source_key, e.relation, e.target_key) for e in rows.edges] == [
-        ("facility:gym", Relation.LOCATED_IN, "location:basement")
+        ("gym", Relation.LOCATED_IN, "basement")
     ]
     assert rows.dropped == 0
 
@@ -147,7 +147,7 @@ def test_names_must_appear_in_the_chunk_at_word_edges():
         [chunk(GYM)],
         12,
     )
-    assert [node.node_key for node in rows.nodes] == ["facility:gym"]
+    assert [node.node_key for node in rows.nodes] == ["gym"]
     assert rows.dropped == 2
 
 
@@ -174,7 +174,9 @@ def test_names_that_share_a_key_make_no_edge():
 
 
 def test_node_key_normalizes_case_and_spacing():
-    assert node_key(NodeType.FACILITY, "  Bike   Room ") == "facility:bike room"
+    assert node_key("  Bike   Room ") == "bike room"
+    # The type is not part of the identity: one entity, typed two ways, is one key.
+    assert node_key("Level-2 Gym") == node_key("level 2 gym") == "level 2 gym"
 
 
 # Extraction at ingest
@@ -245,8 +247,8 @@ async def test_ingest_stores_grounded_graph_with_the_chunks(graph_runtime):
     nodes, edges = await graph(graph_runtime, event.document_id)
     assert (document.status, document.graph_error_code) == ("ready", None)
     assert {(e.source_key, e.relation, e.target_key) for e in edges} == {
-        ("facility:gym", "located_in", "location:basement"),
-        ("location:basement", "governed_by", "rule:noise rules"),
+        ("gym", "located_in", "basement"),
+        ("basement", "governed_by", "noise rules"),
     }
     assert {node.owner_id for node in nodes} == {graph_runtime.owner_id}
     assert {node.version for node in nodes} == {1}
@@ -273,9 +275,9 @@ async def test_misquoted_graph_is_dropped_and_the_document_served(graph_runtime)
     # Every edge quotes no chunk; the names themselves are in the chunk, so nodes stay.
     assert edges == []
     assert {node.node_key for node in nodes} == {
-        "facility:gym",
-        "location:basement",
-        "rule:noise rules",
+        "gym",
+        "basement",
+        "noise rules",
     }
     assert (await graph_runtime.read(event.document_id)).status == "ready"
 
@@ -357,7 +359,7 @@ async def test_stale_worker_writes_no_graph_rows(graph_runtime):
         lease=lease,
         chunks=[chunk("gym")],
         vectors=[unit_vector("gym")],
-        graph=GraphRows(nodes=[NodeRow(0, "facility:gym", NodeType.FACILITY, "gym", "gym")]),
+        graph=GraphRows(nodes=[NodeRow(0, "gym", NodeType.FACILITY, "gym", "gym")]),
     )
     assert stored is False
     assert await graph(graph_runtime, event.document_id) == ([], [])
@@ -371,9 +373,7 @@ async def test_swap_and_delete_remove_old_graph_rows(graph_runtime):
     assert await ingest(graph_runtime, updated, ControlledExtractor()) is HandleResult.HANDLED
     nodes, edges = await graph(graph_runtime, event.document_id)
     assert {node.version for node in nodes} == {2}
-    assert [(e.source_key, e.target_key) for e in edges] == [
-        ("facility:pool", "location:courtyard")
-    ]
+    assert [(e.source_key, e.target_key) for e in edges] == [("pool", "courtyard")]
     await remove(graph_runtime, event.document_id)
     assert await graph(graph_runtime, event.document_id) == ([], [])
 

@@ -40,6 +40,8 @@ x-processing-environment: &processing-environment
   RAG_SQS_ENDPOINT: http://sqs:9324
   # Knowledge graph extraction and expansion: off unless the invoking shell opts in.
   RAG_GRAPH_ENABLED: ${AI_RAG_GRAPH_ENABLED:-false}
+  # Chunks per extraction call (1..8); the default 1 gives every chunk its own call.
+  RAG_GRAPH_BATCH_SIZE: ${AI_RAG_GRAPH_BATCH_SIZE:-1}
   OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
   OTEL_EXPORTER_OTLP_TIMEOUT: "3"
   OTEL_BSP_SCHEDULE_DELAY: "200"

@@ -4,7 +4,9 @@
       node: type in the ontology, acceptable name, name in its chunk (word edges)
       edge: allowed triple, quote of 3+ words in its chunk, both names in the quote,
             two distinct keys
-      -> rows keyed by node_key = "type:normalized name"; capped and deduplicated per chunk
+      -> rows keyed by node_key = the name's normalized words, without its type, so one
+         entity typed differently in two documents is still one node; capped and
+         deduplicated per chunk
 
 A dropped item is counted, never stored. The relation, its direction and the node types
 are the model's reading of the quote; the server checks only that the triple is allowed
@@ -56,8 +58,10 @@ class GraphRows:
     dropped: int = 0
 
 
-def node_key(node_type: NodeType, name: str) -> str:
-    return f"{node_type}:{normalize(name)}"[:MAX_NODE_KEY_CHARACTERS]
+def node_key(name: str) -> str:
+    """The entity's identity: its normalized words, without the type. A model may type
+    "cellar" as a location in one document and a facility in another; both are one key."""
+    return match_name(name)
 
 
 def match_name(name: str) -> str:
@@ -92,7 +96,7 @@ class _Chunk:
         """The node's key if it is grounded and fits; adds it once."""
         if not acceptable_name(name) or not appears_in(name, self.chunk.content):
             return None
-        key = node_key(node_type, name)
+        key = node_key(name)
         if key in self.nodes:
             return key
         if len(self.nodes) >= self.limit:

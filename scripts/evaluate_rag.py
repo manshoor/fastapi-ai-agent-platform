@@ -322,6 +322,13 @@ def _tokens(body: dict | None) -> int | None:
     return sum(count for count in counts if count is not None) if any(counts) else None
 
 
+def _graph_passages(body: dict | None) -> int | None:
+    """Passages graph expansion added to the context (a count, never text)."""
+    if body is None:
+        return None
+    return sum(1 for passage in body["passages"] if passage["source"] == "graph")
+
+
 def _percent(value) -> str:
     return "-" if value is None else f"{value:.0%}"
 
@@ -387,6 +394,7 @@ def run_case(account: Account, case: dict, args, overrides: dict, judge) -> dict
         "judge": verdict,
         "judge_error": judge_error,
         "tokens": _tokens(body),
+        "graph_passages": _graph_passages(body),
         "latency": round(latency, 3),
     }
 
@@ -411,6 +419,7 @@ def _line(name: str, repeat: int, run: dict) -> str:
     return (
         f"{name} r{repeat} {run['case']}: {'PASS' if passed(run) else 'FAIL'}"
         f" failed={','.join(misses) or '-'} judge={judged} error={run['error'] or '-'}"
+        f" graph_passages={'-' if run.get('graph_passages') is None else run['graph_passages']}"
     )
 
 

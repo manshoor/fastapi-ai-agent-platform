@@ -5,8 +5,9 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
+from app.ai.contracts import GraphExtraction
 from app.ai.processing import HandleResult
-from app.ai.provider import Embeddings
+from app.ai.provider import Embeddings, GraphResult
 from app.models import User
 from app.rag import retrieval as retrieval_module
 from app.rag.contracts import ContentType
@@ -31,7 +32,7 @@ class BagEmbedder:
         return Embeddings(vectors, "simulated-embedding", len(texts))
 
 
-async def ready(runtime, data: bytes, owner_id=None):
+async def ready(runtime, data: bytes, owner_id=None, extractor=None):
     if owner_id is None:
         event = await runtime.submit(data)
     else:
@@ -45,9 +46,30 @@ async def ready(runtime, data: bytes, owner_id=None):
                 trace_context={},
             )
         event = await runtime.event_for(response.id)
-    result = await ingest(runtime, event, ControlledExtractor(), BagEmbedder())
+    result = await ingest(runtime, event, extractor or ControlledExtractor(), BagEmbedder())
     assert result is HandleResult.HANDLED
     return event.document_id
+
+
+class RetypingExtractor(ControlledExtractor):
+    """Types one name differently, as a live model may from one document to the next."""
+
+    def __init__(self, name: str, node_type: str):
+        super().__init__()
+        self.name, self.node_type = name, node_type
+
+    async def extract(self, chunks, *, limit, model=None):
+        result = await super().extract(chunks, limit=limit, model=model)
+        value = result.extraction.model_dump()
+        for node in value["nodes"]:
+            if node["name"] == self.name:
+                node["type"] = self.node_type
+        for edge in value["edges"]:
+            for end in ("source", "target"):
+                if edge[end] == self.name:
+                    edge[f"{end}_type"] = self.node_type
+        extraction = GraphExtraction.model_validate(value)
+        return GraphResult(extraction, result.model, 10, 5, None)
 
 
 ONE_HOP = GraphSearch(hops=1, extra_passages=2)
@@ -88,6 +110,14 @@ async def test_one_hop_reaches_a_fact_vector_search_misses(graph_runtime):
     # Vector search alone returns only the gym chunk.
     alone = await retriever(graph_runtime, graph=None).ainvoke("When can I use the gym?")
     assert [d.metadata["source"] for d in alone] == ["vector"]
+
+
+async def test_one_entity_joins_across_types(graph_runtime):
+    # The gym document types "basement" as a location; the rules document, as a facility.
+    await ready(graph_runtime, GYM)
+    await ready(graph_runtime, RULES, extractor=RetypingExtractor("basement", "facility"))
+    found = await retriever(graph_runtime).ainvoke("When can I use the gym with a towel?")
+    assert ("graph", "The basement is governed by the noise rules") in sources(found)
 
 
 async def test_two_hops_follow_the_chain(graph_runtime):
@@ -157,7 +187,7 @@ async def test_margin_drops_seeds_before_the_graph(graph_runtime):
 async def test_another_owners_graph_is_never_reached(graph_runtime):
     await ready(graph_runtime, GYM)
     other = await new_owner(graph_runtime)
-    # Same node keys (location:basement) in another account's document.
+    # Same node keys (basement) in another account's document.
     await ready(graph_runtime, RULES, owner_id=other)
     found = await retriever(graph_runtime).ainvoke("When can I use the gym?")
     assert [d.metadata["source"] for d in found] == ["vector"]
@@ -193,7 +223,7 @@ async def test_graph_read_is_owner_only(graph_runtime):
         )
     assert graph.version == 1 and not graph.truncated
     assert [(e.source, e.relation, e.target) for e in graph.edges] == [
-        ("location:basement", "governed_by", "rule:noise rules")
+        ("basement", "governed_by", "noise rules")
     ]
     other = await new_owner(graph_runtime)
     async with graph_runtime.factory() as session:
