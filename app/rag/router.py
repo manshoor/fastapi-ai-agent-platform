@@ -10,6 +10,7 @@ from app.db import get_session
 from app.rag.contracts import (
     DiagnosticsRequest,
     DiagnosticsResponse,
+    DocumentGraph,
     DocumentList,
     DocumentResponse,
     QueryRequest,
@@ -17,6 +18,7 @@ from app.rag.contracts import (
 )
 from app.rag.documents import (
     delete_document,
+    document_graph,
     get_document,
     list_documents,
     submit_document,
@@ -169,6 +171,18 @@ async def read_document(
 ) -> DocumentResponse:
     _runtime(request)
     result = await get_document(session=session, owner_id=owner_id, document_id=document_id)
+    response.headers["Cache-Control"] = "no-store"
+    return result
+
+
+@router.get(
+    "/documents/{document_id}/graph", response_model=DocumentGraph, responses={404: {}, 503: {}}
+)
+async def read_document_graph(
+    document_id: UUID, request: Request, response: Response, owner_id: Owner, session: Session
+) -> DocumentGraph:
+    _runtime(request)
+    result = await document_graph(session=session, owner_id=owner_id, document_id=document_id)
     response.headers["Cache-Control"] = "no-store"
     return result
 

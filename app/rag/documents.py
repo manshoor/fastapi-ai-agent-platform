@@ -10,13 +10,23 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.assistant.residence import is_manager
-from app.models import RAG_EMBEDDING_DIMENSIONS, RAGChunk, RAGDocument, RAGOutbox
+from app.models import (
+    RAG_EMBEDDING_DIMENSIONS,
+    RAGChunk,
+    RAGDocument,
+    RAGGraphEdge,
+    RAGGraphNode,
+    RAGOutbox,
+)
 from app.rag.config import RAGSettings
 from app.rag.contracts import (
     CHUNKER_VERSION,
     TERMINAL_STATES,
     UNSETTLED_STATES,
+    DocumentGraph,
     DocumentResponse,
+    GraphEdgeView,
+    GraphNodeView,
     ingest_kind,
 )
 from app.rag.uploads import Upload
@@ -219,6 +229,72 @@ async def get_document(
     response = document_response(document)
     await session.rollback()
     return response
+
+
+# Rows per kind in one graph response.
+MAX_GRAPH_ROWS = 1000
+
+
+async def document_graph(
+    *, session: AsyncSession, owner_id: UUID, document_id: UUID
+) -> DocumentGraph:
+    """Distinct nodes and edges of the active version, owner only; 404 like get_document."""
+    # One snapshot: a version swap between the reads cannot pair version N with N+1 rows.
+    await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    document = await session.scalar(
+        select(RAGDocument).where(
+            RAGDocument.id == document_id, RAGDocument.owner_id == owner_id, VISIBLE
+        )
+    )
+    if document is None:
+        await session.rollback()
+        raise HTTPException(404, "Document not found")
+    # Read before the rollback below expires the row.
+    version, graph_error_code = document.active_version, document.graph_error_code
+    scope = (
+        RAGGraphNode.document_id == document_id,
+        RAGGraphNode.owner_id == owner_id,
+        RAGGraphNode.version == version,
+    )
+    nodes = (
+        await session.execute(
+            select(RAGGraphNode.node_key, RAGGraphNode.node_type, func.min(RAGGraphNode.name))
+            .where(*scope)
+            .group_by(RAGGraphNode.node_key, RAGGraphNode.node_type)
+            .order_by(RAGGraphNode.node_key)
+            .limit(MAX_GRAPH_ROWS + 1)
+        )
+    ).all()
+    edges = (
+        await session.execute(
+            select(
+                RAGGraphEdge.source_key,
+                RAGGraphEdge.relation,
+                RAGGraphEdge.target_key,
+                func.min(RAGGraphEdge.quote),
+            )
+            .where(
+                RAGGraphEdge.document_id == document_id,
+                RAGGraphEdge.owner_id == owner_id,
+                RAGGraphEdge.version == version,
+            )
+            .group_by(RAGGraphEdge.source_key, RAGGraphEdge.relation, RAGGraphEdge.target_key)
+            .order_by(RAGGraphEdge.source_key, RAGGraphEdge.relation, RAGGraphEdge.target_key)
+            .limit(MAX_GRAPH_ROWS + 1)
+        )
+    ).all()
+    await session.rollback()
+    return DocumentGraph(
+        document_id=document_id,
+        version=version,
+        graph_error_code=graph_error_code,
+        nodes=[GraphNodeView(key=k, type=t, name=n) for k, t, n in nodes[:MAX_GRAPH_ROWS]],
+        edges=[
+            GraphEdgeView(source=a, relation=r, target=b, quote=q)
+            for a, r, b, q in edges[:MAX_GRAPH_ROWS]
+        ],
+        truncated=len(nodes) > MAX_GRAPH_ROWS or len(edges) > MAX_GRAPH_ROWS,
+    )
 
 
 def _update_fingerprint(upload: Upload, document_id: UUID) -> str:

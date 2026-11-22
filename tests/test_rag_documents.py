@@ -476,3 +476,21 @@ async def test_content_update_body_is_bounded(client: httpx.AsyncClient, account
     created = (await upload(client, owner)).json()
     response = await put_content(client, owner, created["id"], data=b"x" * (TEXT_LIMIT + 1))
     assert response.status_code == 413
+
+
+async def test_graph_route_is_owner_only(client: httpx.AsyncClient, account):
+    owner, stranger = await account(), await account()
+    created = (await upload(client, owner)).json()
+    url = f"{URL}/{created['id']}/graph"
+    pending = await client.get(url, headers=owner["headers"])
+    assert pending.status_code == 200 and pending.headers["cache-control"] == "no-store"
+    body = pending.json()
+    assert (body["version"], body["nodes"], body["edges"], body["truncated"]) == (
+        None,
+        [],
+        [],
+        False,
+    )
+    assert (await client.get(url, headers=stranger["headers"])).status_code == 404
+    missing = await client.get(f"{URL}/{uuid4()}/graph", headers=owner["headers"])
+    assert missing.status_code == 404

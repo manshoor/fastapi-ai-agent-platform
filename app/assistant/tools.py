@@ -43,7 +43,7 @@ from app.assistant.contracts import (
 )
 from app.assistant.residence import Resident, resident_member
 from app.models import AssistantToolCall, Booking, Device, Membership, PendingAction, Ticket
-from app.rag.retrieval import BuildingScopedRetriever, has_building_context
+from app.rag.retrieval import BuildingScopedRetriever, graph_search, has_building_context
 
 # Transaction advisory lock namespace for one user's tool writes ("ASTW").
 _WRITE_LOCK_NAMESPACE = 0x41535457
@@ -233,6 +233,8 @@ async def search_documents(ctx: ToolContext, args: SearchArguments) -> ToolOutco
         embedding_model=settings.ai_embedding_model,
         top_k=min(SEARCH_TOP_K, remaining),
         telemetry=ctx.telemetry,
+        graph=graph_search(settings),
+        max_passages=remaining,
     )
     # A provider failure propagates: the turn records it; there is nothing to audit.
     documents = await retriever.ainvoke(args.question)
