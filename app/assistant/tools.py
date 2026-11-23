@@ -2,11 +2,13 @@
 
     model tool call -> allowlisted name? -- no --> audit "unknown" denial
                     -> arguments valid?  -- no --> audit invalid_arguments
+                    -> a search handed out passages and not in READ_TOOLS?
+                                         -- yes --> audit not_permitted
                     -> handler: read tools read and audit;
                        write tools: one transaction =
                          per-user lock -> limits -> guarded write (membership in WHERE)
                          -> audit row
-                       memory tools (only while memory is on, only before any search):
+                       memory tools (only while memory is on):
                          text or request quote must be a span of the current message ->
                          remember: user row lock -> membership -> memory limits -> insert
                          forget: delete the recalled M label's row -> audit row
@@ -36,6 +38,7 @@ from app.assistant.config import AssistantSettings
 from app.assistant.contracts import (
     GROUNDING_RESULTS,
     MEMORY_TOOLS,
+    READ_TOOLS,
     UNKNOWN_TOOL,
     ActionResult,
     Decision,
@@ -95,6 +98,8 @@ class ToolContext:
     facts: list[str] = field(default_factory=list)
     # (tool, device) -> index of that device's current fact in `facts`.
     _device_facts: dict[tuple[str, str], int] = field(default_factory=dict, init=False, repr=False)
+    # A change was refused because passages were handed out: the reply must say so.
+    refused_after_search: bool = False
     embedding_tokens: int = 0
     # The resident's current message: memory tools may store or act only on its words.
     message: str = field(default="", repr=False)
@@ -604,15 +609,9 @@ def _repeats_a_note(ctx: ToolContext, text: str) -> bool:
 
 
 async def _memory_gate(ctx: ToolContext, tool: str, quote: str) -> ToolOutcome | None:
-    """Refuse a memory tool a passage could have asked for, or words the resident never said.
-
-    Once a search handed out passages, a document could be steering the model, so memory
-    tools no longer run this turn. The quoted words must be the resident's own.
-    """
+    """Refuse a memory tool whose quoted words the resident never said."""
     result = None
-    if ctx.passages:
-        result = ResultCode.NOT_PERMITTED
-    elif not whole_quote(quote, ctx.message):
+    if not whole_quote(quote, ctx.message):
         result = ResultCode.INVALID_ARGUMENTS
     elif tool == ToolName.FORGET and not _asks_to_forget(quote, ctx.message):
         result = ResultCode.INVALID_ARGUMENTS
@@ -806,6 +805,13 @@ async def _execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     except ValidationError:
         await _audited(ctx, tool, Decision.DENIED, ResultCode.INVALID_ARGUMENTS)
         return _outcome(tool, Decision.DENIED, ResultCode.INVALID_ARGUMENTS)
+    # Once a search handed out passages, a document could be steering the model: only
+    # reads run for the rest of the turn.
+    if ctx.passages and tool not in READ_TOOLS:
+        ctx.refused_after_search = True
+        await _audited(ctx, tool, Decision.DENIED, ResultCode.NOT_PERMITTED)
+        device = getattr(args, "device", None)
+        return _outcome(tool, Decision.DENIED, ResultCode.NOT_PERMITTED, device=device)
     return _labelled(ctx, await spec.handler(ctx, args))
 
 

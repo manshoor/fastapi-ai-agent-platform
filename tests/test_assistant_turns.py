@@ -21,7 +21,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 import app.assistant.tools as tools
 import app.assistant.turns as turns_module
 from app.assistant.residence import load_resident
-from app.assistant.turns import INCOMPLETE_ANSWER, NO_CONTEXT_ANSWER, run_turn
+from app.assistant.turns import INCOMPLETE_ANSWER, NO_CONTEXT_ANSWER, REFUSED_NOTICE, run_turn
 from app.config import Settings
 from app.models import AssistantToolCall, AssistantTurn, Device
 from tests.support.assistant import SIMULATOR, TOTP_KEY, add_ready_document, demo_residence, serve
@@ -140,7 +140,7 @@ async def test_tool_then_reply_is_answered_and_recorded_without_text(
     (row,) = await turns(app)
     assert (row.status, row.model_calls, row.tool_calls) == ("answered", 2, 1)
     assert (row.input_tokens, row.output_tokens, row.error_code) == (80, 40, None)
-    assert row.claim_failure is None and row.prompt_version == "assistant-v4"
+    assert row.claim_failure is None and row.prompt_version == "assistant-v5"
     assert row.model == "simulator-assistant" and row.finished_at is not None
     async with app.state.session_factory() as session:
         stored = [
@@ -571,8 +571,8 @@ async def test_langsmith_environment_cannot_export_content(
             )
             script(
                 simulator,
-                {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
                 {"tool": "lock_door", "arguments": {"device": "Front door"}},
+                {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
                 passage_reply("Quiet hours start at 22:00.", "Quiet hours start at 22:00"),
             )
             body = (await send(client, owner)).json()
@@ -860,8 +860,8 @@ async def test_passage_and_tool_claims_in_one_reply(app: FastAPI, client, reside
     await add_ready_document(app, UUID(owner["id"]), "House rules", [RULE], building_id=building_id)
     script(
         simulator,
-        {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
         THERMOSTAT_21,
+        {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
         {
             "claims": [
                 {"statement": "Quiet starts at 22:00.", "source": "P1", "quote": "start at 22:00"},
@@ -994,3 +994,50 @@ async def test_programming_error_after_a_write_is_logged_and_reported(
     assert (row.status, row.error_code) == ("incomplete", "internal_error")
     assert "Assistant turn failure exception=KeyError" in caplog.text
     assert "synthetic bug" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("reply", "status", "answer"),
+    [
+        (
+            passage_reply("Quiet hours start at 22:00.", "Quiet hours start at 22:00"),
+            "answered",
+            f"Quiet hours start at 22:00. {REFUSED_NOTICE}",
+        ),
+        (tool_reply("The front door is locked."), "no_context", REFUSED_NOTICE),
+    ],
+)
+async def test_reply_says_an_action_after_a_search_did_not_run(
+    app: FastAPI, client, resident, simulator, reply, status, answer
+):
+    owner = await resident()
+    building_id = UUID(owner["view"]["building"]["id"])
+    await add_ready_document(app, UUID(owner["id"]), "House rules", [RULE], building_id=building_id)
+    script(
+        simulator,
+        {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
+        {"tool": "lock_door", "arguments": {"device": "Front door"}},
+        reply,
+    )
+    body = (await send(client, owner)).json()
+    assert (body["status"], body["answer"]) == (status, answer)
+    refused = body["actions"][1]
+    assert (refused["result"], refused["device"]) == ("not_permitted", "Front door")
+
+
+async def test_incomplete_reply_keeps_the_refusal_notice(app: FastAPI, client, resident, simulator):
+    owner = await resident()
+    building_id = UUID(owner["view"]["building"]["id"])
+    await add_ready_document(app, UUID(owner["id"]), "House rules", [RULE], building_id=building_id)
+    script(
+        simulator,
+        THERMOSTAT_21,
+        {"tool": "search_documents", "arguments": {"question": "quiet hours"}},
+        {"tool": "lock_door", "arguments": {"device": "Front door"}},
+        passage_reply("Quiet hours start at 21:00.", "Quiet hours start at 21:00"),
+    )
+    body = (await send(client, owner)).json()
+    assert (body["status"], body["answer"]) == (
+        "incomplete",
+        f"{INCOMPLETE_ANSWER} {REFUSED_NOTICE}",
+    )
