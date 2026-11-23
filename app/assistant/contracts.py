@@ -7,7 +7,7 @@ from uuid import UUID
 
 from pydantic import AfterValidator, Field, StringConstraints
 
-from app.schemas import StrictSchema, reject_nul
+from app.schemas import Password, StrictSchema, reject_nul
 
 # Thermostat limits the assistant may set; the database has a wider hard bound.
 THERMOSTAT_MIN_CELSIUS = 16.0
@@ -105,6 +105,10 @@ class ResultCode(StrEnum):
     UNKNOWN_TOOL = "unknown_tool"
     LIMIT_EXCEEDED = "limit_exceeded"
     NO_DOCUMENTS = "no_documents"
+    # A confirmation refused before its action is claimed: no enabled authenticator, or
+    # a code that did not match.
+    STEP_UP_REQUIRED = "step_up_required"
+    STEP_UP_FAILED = "step_up_failed"
 
 
 # Tool results that ground an answer on their own. Search grounds only through citations.
@@ -217,3 +221,26 @@ class ConfirmResponse(StrictSchema):
     action: Literal["unlock_door"]
     status: Literal["confirmed"]
     device: ConfirmedDevice
+
+
+# Six ASCII digits. [0-9], not \d: \d also matches digits of other scripts.
+TotpCode = Annotated[str, StringConstraints(pattern=r"^[0-9]{6}$")]
+
+
+class PasswordRequest(StrictSchema):
+    password: Password = Field(repr=False)
+
+
+class CodeRequest(StrictSchema):
+    code: TotpCode = Field(repr=False)
+
+
+class TotpEnrollment(StrictSchema):
+    """Shown once: the secret for the authenticator app, as base32 and as an otpauth URI."""
+
+    secret: str = Field(repr=False)
+    otpauth_uri: str = Field(repr=False)
+
+
+class TotpStatus(StrictSchema):
+    enabled: bool

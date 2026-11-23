@@ -18,6 +18,7 @@ from app.rag.uploads import Upload
 from tests.support.assistant import (
     EMBEDDING_MODEL,
     SIMULATOR,
+    TOTP_KEY,
     add_ready_document,
     add_resident,
     demo_residence,
@@ -40,6 +41,7 @@ async def simulator():
 def settings(monkeypatch, simulator) -> Settings:
     monkeypatch.setenv("OPENAI_BASE_URL", simulator + "/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-never-external")
+    monkeypatch.setenv("ASSISTANT_TOTP_KEY", TOTP_KEY)
     return Settings(
         ai_enabled=True, rag_enabled=True, assistant_enabled=True, assistant_demo_enabled=True
     )
@@ -104,6 +106,7 @@ async def test_unauthenticated_residence_is_401(client: httpx.AsyncClient):
 )
 async def test_disabled_flags(monkeypatch, simulator, flags, demo_status, residence_status):
     monkeypatch.setenv("OPENAI_BASE_URL", simulator + "/v1")
+    monkeypatch.setenv("ASSISTANT_TOTP_KEY", TOTP_KEY)
     from app.main import create_app
 
     settings = Settings(ai_enabled=True, rag_enabled=True, **flags)

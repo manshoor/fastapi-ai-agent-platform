@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from app.assistant.residence import load_resident
 from app.config import Settings
 from app.models import AssistantToolCall, Device, PendingAction
-from tests.support.assistant import SIMULATOR, add_ready_document, demo_residence, serve
+from tests.support.assistant import SIMULATOR, TOTP_KEY, add_ready_document, demo_residence, serve
 
 URL = "/api/v1/assistant/messages"
 PLANTED = (
@@ -35,6 +35,7 @@ def settings(monkeypatch, simulator) -> Settings:
     _, base_url = simulator
     monkeypatch.setenv("OPENAI_BASE_URL", base_url + "/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-never-external")
+    monkeypatch.setenv("ASSISTANT_TOTP_KEY", TOTP_KEY)
     return Settings(
         ai_enabled=True, rag_enabled=True, assistant_enabled=True, assistant_demo_enabled=True
     )
@@ -51,7 +52,9 @@ def resident(client: httpx.AsyncClient, account):
 
 async def hijacked(client, simulator, owner, *steps) -> dict:
     state, _ = simulator
-    state.script = [*steps, {"claims": [{"statement": "Done.", "source": "tool", "quote": ""}]}]
+    # The final claim quotes no tool fact, so a hijacked turn is never answered.
+    done = {"statement": "Done.", "source": "T1", "quote": "the request is done"}
+    state.script = [*steps, {"claims": [done]}]
     response = await client.post(
         URL, headers=owner["headers"], json={"message": "What are the house rules?"}
     )

@@ -1,7 +1,9 @@
 """Shared helpers for resident assistant tests: simulator, residences, ready chunks."""
 
 import asyncio
+import base64
 import importlib.util
+import json
 import socket
 import sys
 from contextlib import asynccontextmanager
@@ -14,9 +16,26 @@ import uvicorn
 from fastapi import FastAPI
 from sqlalchemy import func, insert
 
-from app.models import RAG_EMBEDDING_DIMENSIONS, Apartment, Membership, RAGChunk, RAGDocument
+from app.ai.provider import ToolCall
+from app.assistant.residence import load_resident
+from app.assistant.tools import ToolContext, execute
+from app.assistant.totp import code_at
+from app.models import (
+    RAG_EMBEDDING_DIMENSIONS,
+    Apartment,
+    AssistantTurn,
+    Membership,
+    RAGChunk,
+    RAGDocument,
+)
 
 EMBEDDING_MODEL = "text-embedding-3-small"
+# Test-only literal, as in compose.ai.test.yaml: base64 of "test-only-totp-key-not-a-secret!".
+TOTP_KEY = "dGVzdC1vbmx5LXRvdHAta2V5LW5vdC1hLXNlY3JldCE="
+# The `account` fixture's default password.
+ACCOUNT_PASSWORD = "a-secure-password-123"
+TOTP_PATH = "/api/v1/assistant/totp"
+FRONT_DOOR = "Front door"
 
 
 def _load_simulator():
@@ -52,6 +71,61 @@ async def serve(application):
         server.should_exit = True
         await asyncio.wait_for(task, 3)
         sock.close()
+
+
+class StepClock:
+    """Stands in for the database clock's TOTP step, so a test decides which codes are fresh.
+
+    Patch it over app.assistant.step_up._database_step.
+    """
+
+    def __init__(self) -> None:
+        self.step = 59_000_000
+
+    async def __call__(self, session) -> int:
+        return self.step
+
+
+async def enable_authenticator(client, owner: dict, clock: StepClock) -> bytes:
+    """Enroll and enable an authenticator; return its secret.
+
+    The first code spends the current step, so the clock moves on to a fresh one.
+    """
+    enrolled = await client.post(
+        f"{TOTP_PATH}/enroll", headers=owner["headers"], json={"password": ACCOUNT_PASSWORD}
+    )
+    assert enrolled.status_code == 201
+    secret = base64.b32decode(enrolled.json()["secret"])
+    code = code_at(secret, clock.step)
+    activated = await client.post(
+        f"{TOTP_PATH}/activate", headers=owner["headers"], json={"code": code}
+    )
+    assert activated.status_code == 200
+    clock.step += 1
+    return secret
+
+
+async def pending_unlock(app: FastAPI, owner: dict, device: str = FRONT_DOOR) -> UUID:
+    """A pending unlock of the owner's door, made by the real tool."""
+    factory = app.state.session_factory
+    async with factory() as session:
+        resident = await load_resident(session, UUID(owner["id"]))
+        turn_id = await session.scalar(
+            insert(AssistantTurn)
+            .values(user_id=resident.user_id, model="test", prompt_version="assistant-v1")
+            .returning(AssistantTurn.id)
+        )
+        await session.commit()
+    context = ToolContext(
+        session_factory=factory,
+        settings=app.state.assistant_settings,
+        resident=resident,
+        turn_id=turn_id,
+        embedder=None,
+    )
+    call = ToolCall(name="unlock_door", call_id="call_1", arguments=json.dumps({"device": device}))
+    outcome = await execute(context, call)
+    return outcome.action.pending_action_id
 
 
 async def demo_residence(client, owner: dict) -> dict:

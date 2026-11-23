@@ -4,7 +4,7 @@ import pytest
 
 from app.ai.contracts import Claim
 from app.models import CLAIM_FAILURES, RAG_NO_CONTEXT_REASONS
-from app.rag.verification import ClaimFailure, check_claims, normalize
+from app.rag.verification import ClaimFailure, check_claims, check_quote, normalize
 
 PASSAGES = [
     "Quiet hours run from 22:00 to 07:00 on weekdays.",
@@ -159,3 +159,27 @@ def _verdict(passage: str, statement: str, quote: str) -> ClaimFailure | None:
 )
 def test_review_edge_cases(passage, statement, quote, failure):
     assert _verdict(passage, statement, quote) is failure
+
+
+BOOKINGS_FACT = "Upcoming bookings: Gym on 2026-11-21 from 18:00 to 19:00 UTC."
+
+
+@pytest.mark.parametrize(
+    ("statement", "quote", "failure"),
+    [
+        ("Gym on 2026-11-21 from 18:00 to 19:00 UTC.", "Gym on 2026-11-21", None),
+        ("Your gym session is on 21 November at 18:00.", "Upcoming bookings: Gym", None),
+        # A time the fact does not write is refused, even when it means the same.
+        ("Your gym session starts at 6 pm.", "Upcoming bookings: Gym", "number_not_in_passage"),
+        ("No bookings.", "No upcoming bookings", "quote_not_found"),
+    ],
+)
+def test_tool_fact_claims_are_checked_like_passages(statement, quote, failure):
+    assert check_quote(statement, quote, BOOKINGS_FACT) == failure
+
+
+def test_three_word_fact_can_be_quoted_whole():
+    assert (
+        check_quote("No upcoming bookings.", "No upcoming bookings", "No upcoming bookings.")
+        is None
+    )

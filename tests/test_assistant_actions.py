@@ -1,24 +1,30 @@
 """Confirming a pending unlock: own row only, once, in time, while still a resident."""
 
 import asyncio
-import json
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import delete, func, insert, select, update
 
 import app.assistant.actions as actions
-from app.ai.provider import ToolCall
+import app.assistant.step_up as step_up
 from app.assistant.residence import load_resident
-from app.assistant.tools import ToolContext, execute
+from app.assistant.totp import code_at
 from app.config import Settings
-from app.models import AssistantToolCall, AssistantTurn, Device, Membership, PendingAction
-from tests.support.assistant import SIMULATOR, demo_residence, serve
-
-FRONT_DOOR = "Front door"
+from app.models import AssistantToolCall, Device, Membership, PendingAction
+from tests.support.assistant import (
+    FRONT_DOOR,
+    SIMULATOR,
+    TOTP_KEY,
+    StepClock,
+    demo_residence,
+    enable_authenticator,
+    pending_unlock,
+    serve,
+)
 
 
 def confirm_path(action_id) -> str:
@@ -36,43 +42,50 @@ async def simulator():
 def settings(monkeypatch, simulator) -> Settings:
     monkeypatch.setenv("OPENAI_BASE_URL", simulator + "/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "synthetic-key-never-external")
+    monkeypatch.setenv("ASSISTANT_TOTP_KEY", TOTP_KEY)
     return Settings(
         ai_enabled=True, rag_enabled=True, assistant_enabled=True, assistant_demo_enabled=True
     )
 
 
 @pytest.fixture
-def pending(app: FastAPI, client: httpx.AsyncClient, account):
-    """A demo resident with a pending front-door unlock."""
+def clock(monkeypatch) -> StepClock:
+    clock = StepClock()
+    monkeypatch.setattr(step_up, "_database_step", clock)
+    return clock
 
-    async def create() -> tuple[dict, UUID]:
+
+@pytest.fixture
+def enabled(client: httpx.AsyncClient, account, clock):
+    """A demo resident with an enabled authenticator."""
+
+    async def create() -> dict:
         owner = await account()
         await demo_residence(client, owner)
-        factory = app.state.session_factory
-        async with factory() as session:
-            resident = await load_resident(session, UUID(owner["id"]))
-            turn_id = await session.scalar(
-                insert(AssistantTurn)
-                .values(user_id=resident.user_id, model="test", prompt_version="assistant-v1")
-                .returning(AssistantTurn.id)
-            )
-            await session.commit()
-        context = ToolContext(
-            session_factory=factory,
-            settings=app.state.assistant_settings,
-            resident=resident,
-            turn_id=turn_id,
-            embedder=None,
-        )
-        outcome = await execute(
-            context,
-            ToolCall(
-                name="unlock_door", call_id="call_1", arguments=json.dumps({"device": FRONT_DOOR})
-            ),
-        )
-        return owner, outcome.action.pending_action_id
+        return {**owner, "totp": await enable_authenticator(client, owner, clock)}
 
     return create
+
+
+@pytest.fixture
+def pending(app: FastAPI, enabled):
+    """A demo resident with an enabled authenticator and a pending front-door unlock."""
+
+    async def create() -> tuple[dict, UUID]:
+        owner = await enabled()
+        return owner, await pending_unlock(app, owner)
+
+    return create
+
+
+async def confirm(client, clock: StepClock, owner: dict, action_id) -> httpx.Response:
+    """Confirm with the owner's code for the current step, then move to a fresh step."""
+    code = code_at(owner["totp"], clock.step)
+    response = await client.post(
+        confirm_path(action_id), headers=owner["headers"], json={"code": code}
+    )
+    clock.step += 1
+    return response
 
 
 async def door_locked(app: FastAPI, owner: dict) -> bool:
@@ -86,10 +99,10 @@ async def door_locked(app: FastAPI, owner: dict) -> bool:
 
 
 async def test_owner_confirms_once_and_the_door_unlocks(
-    app: FastAPI, client: httpx.AsyncClient, pending
+    app: FastAPI, client: httpx.AsyncClient, clock, pending
 ):
     owner, action_id = await pending()
-    response = await client.post(confirm_path(action_id), headers=owner["headers"])
+    response = await confirm(client, clock, owner, action_id)
 
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
@@ -112,26 +125,25 @@ async def test_owner_confirms_once_and_the_door_unlocks(
     )
     assert row.pending_action_id == action_id
 
-    again = await client.post(confirm_path(action_id), headers=owner["headers"])
+    again = await confirm(client, clock, owner, action_id)
     assert again.status_code == 409
 
 
 async def test_foreign_or_missing_action_is_not_found(
-    app: FastAPI, client: httpx.AsyncClient, account, pending
+    app: FastAPI, client: httpx.AsyncClient, clock, enabled, pending
 ):
     owner, action_id = await pending()
-    stranger = await account()
-    await demo_residence(client, stranger)
+    stranger = await enabled()
 
-    foreign = await client.post(confirm_path(action_id), headers=stranger["headers"])
-    missing = await client.post(confirm_path(uuid4()), headers=owner["headers"])
+    foreign = await confirm(client, clock, stranger, action_id)
+    missing = await confirm(client, clock, owner, uuid4())
     assert (foreign.status_code, missing.status_code) == (404, 404)
     assert foreign.json() == missing.json()
     assert await door_locked(app, owner) is True
 
 
 async def test_late_confirm_marks_the_action_expired(
-    app: FastAPI, client: httpx.AsyncClient, pending
+    app: FastAPI, client: httpx.AsyncClient, clock, pending
 ):
     owner, action_id = await pending()
     async with app.state.session_factory() as session:
@@ -145,7 +157,7 @@ async def test_late_confirm_marks_the_action_expired(
         )
         await session.commit()
 
-    response = await client.post(confirm_path(action_id), headers=owner["headers"])
+    response = await confirm(client, clock, owner, action_id)
     assert response.status_code == 409
     assert await door_locked(app, owner) is True
     async with app.state.session_factory() as session:
@@ -153,18 +165,30 @@ async def test_late_confirm_marks_the_action_expired(
             select(PendingAction.status).where(PendingAction.id == action_id)
         )
     assert status == "expired"
-    assert (await client.post(confirm_path(action_id), headers=owner["headers"])).status_code == 409
+    assert (await confirm(client, clock, owner, action_id)).status_code == 409
 
 
-async def test_concurrent_confirms_have_exactly_one_winner(
-    app: FastAPI, client: httpx.AsyncClient, pending
-):
+async def test_concurrent_claims_have_exactly_one_winner(app: FastAPI, pending):
+    """The claim itself, after step-up: four racing confirms unlock exactly once.
+
+    Over HTTP, step-up already lets one code through per step; the claim must still hold
+    when two valid codes race for one action.
+    """
     owner, action_id = await pending()
-    responses = await asyncio.gather(
-        *[client.post(confirm_path(action_id), headers=owner["headers"]) for _ in range(4)]
-    )
+    async with app.state.session_factory() as session:
+        resident = await load_resident(session, UUID(owner["id"]))
 
-    assert sorted(response.status_code for response in responses) == [200, 409, 409, 409]
+    async def claim() -> int:
+        async with app.state.session_factory() as session:
+            try:
+                await actions.confirm_action(session, resident, action_id)
+            except HTTPException as error:
+                return error.status_code
+        return 200
+
+    statuses = await asyncio.gather(*[claim() for _ in range(4)])
+
+    assert sorted(statuses) == [200, 409, 409, 409]
     async with app.state.session_factory() as session:
         confirmations = await session.scalar(
             select(func.count())
@@ -175,7 +199,7 @@ async def test_concurrent_confirms_have_exactly_one_winner(
 
 
 async def test_revoked_membership_blocks_the_confirm(
-    app: FastAPI, client: httpx.AsyncClient, pending
+    app: FastAPI, client: httpx.AsyncClient, clock, pending
 ):
     owner, action_id = await pending()
     async with app.state.session_factory() as session:
@@ -186,7 +210,7 @@ async def test_revoked_membership_blocks_the_confirm(
         )
         await session.commit()
 
-    response = await client.post(confirm_path(action_id), headers=owner["headers"])
+    response = await confirm(client, clock, owner, action_id)
     assert response.status_code == 403
     async with app.state.session_factory() as session:
         status = await session.scalar(
@@ -195,15 +219,15 @@ async def test_revoked_membership_blocks_the_confirm(
     assert status == "pending"
 
 
-async def test_confirm_requires_a_token_and_the_feature(app: FastAPI, client, pending):
+async def test_confirm_requires_a_token_and_the_feature(app: FastAPI, client, clock, pending):
     assert (await client.post(confirm_path(uuid4()))).status_code == 401
     owner, action_id = await pending()
     app.state.assistant_settings = None
-    assert (await client.post(confirm_path(action_id), headers=owner["headers"])).status_code == 503
+    assert (await confirm(client, clock, owner, action_id)).status_code == 503
 
 
 async def test_co_resident_cannot_confirm_anothers_action(
-    app: FastAPI, client: httpx.AsyncClient, account, pending
+    app: FastAPI, client: httpx.AsyncClient, clock, account, pending
 ):
     owner, action_id = await pending()
     housemate = await account()
@@ -218,8 +242,9 @@ async def test_co_resident_cannot_confirm_anothers_action(
             )
         )
         await session.commit()
+    housemate = {**housemate, "totp": await enable_authenticator(client, housemate, clock)}
 
-    response = await client.post(confirm_path(action_id), headers=housemate["headers"])
+    response = await confirm(client, clock, housemate, action_id)
     assert response.status_code == 404
     assert await door_locked(app, owner) is True
 
