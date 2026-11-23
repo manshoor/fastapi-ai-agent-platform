@@ -541,6 +541,7 @@ async def _run_query(
                 telemetry=telemetry,
                 graph=_graph(runtime.settings, options),
                 relevance_margin=options.relevance_margin,
+                neighbor_chunks=options.neighbor_chunks,
             )
 
             usage = _Usage(reasoning_effort=options.reasoning_effort)

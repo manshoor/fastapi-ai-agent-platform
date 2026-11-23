@@ -19,6 +19,9 @@ to the vector results, under the same scope and active versions:
     hop 1..n:  unread edges touching the frontier, outside the vector chunks, closest
                chunk first (at most FAN_OUT per hop)
     evidence:  the edges' chunks, not already retrieved, most links first
+    mentions:  in the slots left, chunks naming a seed or an entity the hops set out from,
+               most such entities first; extraction can miss the edge that ties them.
+               Skips passages and their neighbor windows
     passages:  vector chunks, then up to `extra_passages` graph chunks (source "graph")
 
 Vector and graph reads run in one REPEATABLE READ snapshot. Graph passages are ordinary
@@ -36,11 +39,11 @@ from langchain_core.callbacks import AsyncCallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from pydantic import ConfigDict, PrivateAttr
-from sqlalchemy import and_, func, or_, select, text, tuple_
+from sqlalchemy import and_, func, not_, or_, select, text, tuple_
 
 from app.ai.processing import SessionFactory
 from app.models import RAGChunk, RAGDocument, RAGGraphEdge, RAGGraphNode
-from app.rag.graph import question_phrases
+from app.rag.graph import match_name, question_phrases
 from app.rag.ingestion import Embedder
 
 # Shortest suffix/prefix match treated as the splitter's overlap, not a coincidence.
@@ -180,6 +183,8 @@ class _ScopedRetriever(BaseRetriever):
     max_passages: int = MAX_PASSAGES
     # Vector rows farther than this behind the closest seed no graph search.
     relevance_margin: float | None = None
+    # The radius the caller passes to `expand`: mentions skip text a window will hold.
+    neighbor_chunks: int = 0
     # Usage of the last search, for the query's usage row.
     _embedding_tokens: int | None = PrivateAttr(default=None)
 
@@ -294,11 +299,13 @@ class _ScopedRetriever(BaseRetriever):
         retrieved = {_place(row) for row in rows}
         frontier = await self._seed_keys(session, query, {_place(row) for row in seeds}, distance)
         visited = set(frontier)
+        expanded: set[str] = set()
         read: set[tuple] = set()
         links: Counter = Counter()
         for _ in range(self.graph.hops):
             if not frontier:
                 break
+            expanded |= frontier
             edges = await self._edges(session, frontier, retrieved, read, distance)
             frontier = set()
             for edge in edges:
@@ -308,21 +315,81 @@ class _ScopedRetriever(BaseRetriever):
                     if key not in visited:
                         visited.add(key)
                         frontier.add(key)
-        if not links:
-            return []
-        found = (
-            await session.execute(
-                self._columns(distance).where(
-                    *self._conditions(),
-                    tuple_(RAGChunk.document_id, RAGChunk.version, RAGChunk.ordinal).in_(
-                        list(links)
-                    ),
-                )
-            )
-        ).all()
+        found = await self._linked_chunks(session, links, distance)
         # Most links first, then closest to the question.
         found.sort(key=lambda row: (-links[_place(row)], float(row.distance)))
-        return found[:extra]
+        found = found[:extra]
+        # A mention never displaces an edge: it only fills the slots edges left.
+        left = extra - len(found)
+        if left > 0 and expanded:
+            found += await self._mentions(session, expanded, rows + found, distance, left)
+        return found
+
+    async def _linked_chunks(self, session, links: Counter, distance) -> list:
+        """The chunks the edges were read from, under the search's scope."""
+        if not links:
+            return []
+        place = tuple_(RAGChunk.document_id, RAGChunk.version, RAGChunk.ordinal)
+        rows = await session.execute(
+            self._columns(distance).where(*self._conditions(), place.in_(list(links)))
+        )
+        return list(rows.all())
+
+    async def _mentions(
+        self, session, entities: set[str], passages: list, distance, limit: int
+    ) -> list:
+        """Chunks in scope that name an expanded entity, most entities first, then closest.
+
+        Reads nodes, not edges, and leads no further: an entity such a chunk also names
+        is never followed. Skips each passage and the neighbors its window will hold
+        (same page), so a slot buys text the model does not already have.
+        """
+        # `match_name` is indexed; keys stored before they were type-free are "type:name".
+        names = {match_name(key.rpartition(":")[2]) for key in entities}
+        radius = self.neighbor_chunks
+        windows = [
+            and_(
+                RAGChunk.document_id == row.document_id,
+                RAGChunk.version == row.version,
+                RAGChunk.ordinal.between(row.ordinal - radius, row.ordinal + radius),
+                or_(
+                    RAGChunk.ordinal == row.ordinal,
+                    RAGChunk.page.is_not_distinct_from(row.page),
+                ),
+            )
+            for row in passages
+        ]
+        return list(
+            (
+                await session.execute(
+                    self._columns(distance)
+                    .join(
+                        RAGGraphNode,
+                        and_(
+                            RAGGraphNode.document_id == RAGChunk.document_id,
+                            RAGGraphNode.version == RAGChunk.version,
+                            RAGGraphNode.ordinal == RAGChunk.ordinal,
+                        ),
+                    )
+                    .where(
+                        *self._conditions(),
+                        RAGGraphNode.match_name.in_(sorted(names)),
+                        not_(or_(*windows)),
+                    )
+                    # Both primary keys, so every selected column depends on the group.
+                    .group_by(
+                        RAGChunk.document_id, RAGChunk.version, RAGChunk.ordinal, RAGDocument.id
+                    )
+                    .order_by(
+                        func.count(RAGGraphNode.match_name.distinct()).desc(),
+                        distance,
+                        RAGChunk.document_id,
+                        RAGChunk.ordinal,
+                    )
+                    .limit(limit)
+                )
+            ).all()
+        )
 
     def _nodes_in_scope(self, distance):
         """Distinct node keys in scope, closest chunk first; callers add the filter."""
