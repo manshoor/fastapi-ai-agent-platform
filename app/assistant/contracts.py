@@ -88,6 +88,9 @@ class ToolName(StrEnum):
 
 
 MEMORY_TOOLS = frozenset({ToolName.REMEMBER, ToolName.FORGET})
+# The only tools that still run once a search handed out passages. A tool added later is
+# refused there until it is listed here.
+READ_TOOLS = frozenset({ToolName.SEARCH_DOCUMENTS, ToolName.LIST_BOOKINGS})
 
 
 # Audited in place of any name outside the allowlist; the model's string is never stored.

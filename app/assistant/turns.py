@@ -73,6 +73,11 @@ BACKSTOP_SECONDS = 15
 RUNNING_TURN_GRACE_SECONDS = 15
 NO_CONTEXT_ANSWER = "I could not find that in your building's documents."
 INCOMPLETE_ANSWER = "I could not finish. The completed steps are listed."
+# Neutral on purpose: planted text can cause the refusal, so it must not urge a retry.
+REFUSED_NOTICE = (
+    "An action was not run because this reply read building documents. "
+    "If you asked for it, send it as its own message."
+)
 WRITE_TOOLS = frozenset(
     {
         ToolName.CREATE_TICKET,
@@ -429,6 +434,9 @@ async def _finish(
         status, answer, citations, code = "incomplete", INCOMPLETE_ANSWER, [], CLAIM_CODE
     else:
         status, answer, citations = "no_context", NO_CONTEXT_ANSWER, []
+    if run.context.refused_after_search:
+        # The model has no label for a denial, so the server states it.
+        answer = REFUSED_NOTICE if status == "no_context" else f"{answer} {REFUSED_NOTICE}"
     pending = await _pending_views(session_factory, run)
     await _record(runtime.telemetry, session_factory, turn_id, status, run, code, failure)
     return _response(turn_id, run, status, answer, citations, pending)
