@@ -564,3 +564,18 @@ async def test_ticket_and_unlock_limits_hold_under_concurrency(
 
     allowed = [o for o in outcomes if o.action.result == ResultCode.OK]
     assert len(allowed) == next(iter(limit.values()))
+
+
+async def test_refusal_after_a_search_tells_the_model_to_answer(
+    app: FastAPI, resident_context, simulator
+):
+    ctx, _ = await resident_context()
+    await add_ready_document(
+        app, ctx.resident.user_id, "House rules", [RULE_TEXT], building_id=ctx.resident.building_id
+    )
+    await execute(ctx, call("search_documents", question="quiet hours"))
+    outcome = await execute(ctx, call("lock_door", device=FRONT_DOOR))
+    assert outcome.output == {
+        "result": "not_permitted",
+        "reason": tools.REFUSED_AFTER_SEARCH,
+    }

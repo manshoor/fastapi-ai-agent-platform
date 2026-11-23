@@ -79,6 +79,11 @@ _WORD = re.compile(r"\w+")
 # Labels T1..T8, as for passages: a turn makes at most eight model calls.
 MAX_FACTS = 8
 FACT_PREFIX = "T"
+# Sent to the model with a refused change, so it still answers instead of giving up.
+REFUSED_AFTER_SEARCH = (
+    "No change runs after a search returned passages. Do not retry. Answer from the "
+    "passages; the resident is told that the action was not run."
+)
 
 
 @dataclass
@@ -811,7 +816,13 @@ async def _execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
         ctx.refused_after_search = True
         await _audited(ctx, tool, Decision.DENIED, ResultCode.NOT_PERMITTED)
         device = getattr(args, "device", None)
-        return _outcome(tool, Decision.DENIED, ResultCode.NOT_PERMITTED, device=device)
+        return _outcome(
+            tool,
+            Decision.DENIED,
+            ResultCode.NOT_PERMITTED,
+            device=device,
+            output={"reason": REFUSED_AFTER_SEARCH},
+        )
     return _labelled(ctx, await spec.handler(ctx, args))
 
 
