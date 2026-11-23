@@ -1,0 +1,30 @@
+# Overlay for compose.ai.yaml (optionally with compose.ai.live.yaml) ONLY.
+# Start it with scripts/ai_langfuse.py; never merge with normal, QA, load or bench files.
+# It holds a Langfuse project key in the collector's environment: never run
+# `docker compose config` or `docker inspect` against it with real values.
+services:
+  collector:
+    command:
+      - --config=/etc/otelcol-contrib/config.yaml
+      - --config=/etc/otelcol-contrib/langfuse.yaml
+    volumes:
+      - ./observability/collector.langfuse.yaml:/etc/otelcol-contrib/langfuse.yaml:ro
+    environment:
+      LANGFUSE_OTLP_AUTH: ${AI_LANGFUSE_OTLP_AUTH:?Start with scripts/ai_langfuse.py}
+      # A Docker client proxy setting must not carry the header off the machine. Both
+      # cases: Go skips an empty variable and reads the other one.
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      NO_PROXY: langfuse-web
+      http_proxy: ""
+      https_proxy: ""
+      no_proxy: langfuse-web
+    # Langfuse's web network. It is not internal, so the collector also gains egress.
+    networks:
+      - default
+      - langfuse_ingress
+
+networks:
+  langfuse_ingress:
+    external: true
+    name: ${AI_LANGFUSE_NETWORK:?Start with scripts/ai_langfuse.py}

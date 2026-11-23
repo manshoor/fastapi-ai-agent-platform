@@ -400,10 +400,12 @@ def test_private_ai_environment_preserves_normal_credentials(tmp_path, monkeypat
     assert len(values["AI_JWT_SECRET"]) == 96
     assert values["AI_DB_PASSWORD"] != values["AI_JWT_SECRET"]
     assert len(base64.b64decode(values["AI_ASSISTANT_TOTP_KEY"], validate=True)) == 32
+    assert len(base64.b64decode(values["AI_ASSISTANT_MEMORY_KEY"], validate=True)) == 32
+    assert values["AI_ASSISTANT_MEMORY_KEY"] != values["AI_ASSISTANT_TOTP_KEY"]
 
 
 @pytest.mark.parametrize("ending", ["\n", ""], ids=["newline", "no-newline"])
-def test_private_ai_environment_gains_only_a_missing_totp_key(tmp_path, monkeypatch, ending):
+def test_private_ai_environment_gains_only_missing_keys(tmp_path, monkeypatch, ending):
     import runpy
     import stat
 
@@ -421,9 +423,11 @@ def test_private_ai_environment_gains_only_a_missing_totp_key(tmp_path, monkeypa
     assert after.startswith(before)
     added = after[len(before) :].decode()
     assert added.startswith("AI_ASSISTANT_TOTP_KEY=" if ending else "\nAI_ASSISTANT_TOTP_KEY=")
-    assert added.endswith("\n") and added.count("\n") == (1 if ending else 2)
-    key = added.strip().split("=", 1)[1]
-    assert len(base64.b64decode(key, validate=True)) == 32
+    assert added.endswith("\n") and added.count("\n") == (2 if ending else 3)
+    keys = dict(line.split("=", 1) for line in added.strip().splitlines())
+    assert list(keys) == ["AI_ASSISTANT_TOTP_KEY", "AI_ASSISTANT_MEMORY_KEY"]
+    assert all(len(base64.b64decode(key, validate=True)) == 32 for key in keys.values())
+    assert len(set(keys.values())) == 2
     assert stat.S_IMODE(env.stat().st_mode) == 0o600
 
     assert initialize(Path(".ai-local"), 8002) == "unchanged"
@@ -431,6 +435,20 @@ def test_private_ai_environment_gains_only_a_missing_totp_key(tmp_path, monkeypa
 
 
 TOTP_KEY_LINE = "AI_ASSISTANT_TOTP_KEY=" + base64.b64encode(bytes(range(32))).decode()
+MEMORY_KEY_LINE = "AI_ASSISTANT_MEMORY_KEY=" + base64.b64encode(bytes(range(32, 64))).decode()
+
+
+def test_private_ai_environment_made_before_memory_gains_its_key(tmp_path, monkeypatch):
+    import runpy
+
+    initialize = runpy.run_path(str(ROOT / "scripts/init_ai_env.py"))["initialize"]
+    monkeypatch.chdir(tmp_path)
+    env = _private_env(tmp_path, f"AI_DB_PASSWORD=kept\n{TOTP_KEY_LINE}\n".encode())
+    before = env.read_bytes()
+
+    assert initialize(Path(".ai-local"), 8002) == "key_added"
+    added = env.read_bytes()[len(before) :].decode()
+    assert added.startswith("AI_ASSISTANT_MEMORY_KEY=") and added.count("\n") == 1
 
 
 def _private_env(tmp_path, content: bytes) -> Path:
@@ -452,7 +470,7 @@ def test_private_ai_environment_keeps_a_totp_key_in_any_dotenv_form(tmp_path, mo
 
     initialize = runpy.run_path(str(ROOT / "scripts/init_ai_env.py"))["initialize"]
     monkeypatch.chdir(tmp_path)
-    env = _private_env(tmp_path, f"AI_DB_PASSWORD=kept\n{line}\n".encode())
+    env = _private_env(tmp_path, f"AI_DB_PASSWORD=kept\n{line}\n{MEMORY_KEY_LINE}\n".encode())
     before = env.read_bytes()
 
     assert initialize(Path(".ai-local"), 8002) == "unchanged"
@@ -466,8 +484,21 @@ def test_private_ai_environment_keeps_a_totp_key_in_any_dotenv_form(tmp_path, mo
         b"AI_ASSISTANT_TOTP_KEY=dGVzdA==\n",
         f"{TOTP_KEY_LINE}\n{TOTP_KEY_LINE}\n".encode(),
         b"AI_DB_PASSWORD=\xff\n",
+        b"AI_ASSISTANT_MEMORY_KEY=dGVzdA==\n",
+        # One key for two purposes.
+        f"{TOTP_KEY_LINE}\n{TOTP_KEY_LINE.replace('TOTP', 'MEMORY')}\n".encode(),
+        # The same 32 bytes in another spelling: the last character's two spare bits.
+        f"{TOTP_KEY_LINE}\n{TOTP_KEY_LINE.replace('TOTP', 'MEMORY')[:-2]}9=\n".encode(),
     ],
-    ids=["empty", "too-short", "twice", "not-utf8"],
+    ids=[
+        "empty",
+        "too-short",
+        "twice",
+        "not-utf8",
+        "memory-too-short",
+        "memory-reuses-totp",
+        "memory-reuses-totp-bytes",
+    ],
 )
 def test_private_ai_environment_reports_a_totp_key_it_cannot_use(tmp_path, monkeypatch, content):
     # Compose would fail or pick one key; rerunning must not claim "unchanged" or append.

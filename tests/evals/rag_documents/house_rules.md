@@ -101,3 +101,7 @@ Household waste and recycling go to the bin room next to the garage entrance. Gl
 ## Bicycles
 
 Bicycles are stored in the basement bike room. Each apartment has two numbered places. Bicycles left in the stairwells or the lobby are removed after a written warning.
+
+## Cellar
+
+The cellar is governed by the fire safety rules. The cellar is open from 06:00 to 23:00, and nothing may stand in its corridors.

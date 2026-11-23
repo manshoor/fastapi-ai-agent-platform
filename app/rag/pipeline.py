@@ -44,8 +44,11 @@ from app.ai.provider import (
 )
 from app.models import RAGQuery
 from app.rag.config import (
+    GRAPH_OFF,
+    GRAPH_ON,
     RERANK_LLM,
     VERIFIER_ON,
+    GraphMode,
     RAGSettings,
     ReasoningEffort,
     RerankMode,
@@ -63,7 +66,12 @@ from app.rag.contracts import (
     QueryRequest,
     QueryResponse,
 )
-from app.rag.retrieval import OwnerScopedRetriever, has_context
+from app.rag.retrieval import (
+    GRAPH_SOURCE,
+    GraphSearch,
+    OwnerScopedRetriever,
+    has_context,
+)
 from app.rag.runtime import RAGRuntime
 from app.rag.verification import check_claims
 
@@ -99,6 +107,7 @@ class _Options:
     rerank: RerankMode
     reasoning_effort: ReasoningEffort
     verifier: VerifierMode
+    graph: GraphMode
 
     def candidates(self, top_k: int) -> int:
         return min(MAX_CANDIDATES, 2 * top_k) if self.rerank == RERANK_LLM else top_k
@@ -112,6 +121,7 @@ def _options(settings: RAGSettings, request: QueryRequest) -> _Options:
         rerank=settings.rag_rerank,
         reasoning_effort=settings.rag_answer_reasoning_effort,
         verifier=settings.rag_verifier,
+        graph=GRAPH_ON if settings.rag_graph_enabled else GRAPH_OFF,
     )
     if overrides is None:
         return options
@@ -121,6 +131,15 @@ def _options(settings: RAGSettings, request: QueryRequest) -> _Options:
         rerank=_pick(overrides.rerank, options.rerank),
         reasoning_effort=_pick(overrides.reasoning_effort, options.reasoning_effort),
         verifier=_pick(overrides.verifier, options.verifier),
+        graph=_pick(overrides.graph, options.graph),
+    )
+
+
+def _graph(settings: RAGSettings, options: _Options) -> GraphSearch | None:
+    if options.graph == GRAPH_OFF:
+        return None
+    return GraphSearch(
+        hops=settings.rag_graph_hops, extra_passages=settings.rag_graph_extra_passages
     )
 
 
@@ -294,7 +313,12 @@ def _within_margin(documents: list[Document], margin: float | None) -> list[Docu
     if margin is None or not documents:
         return documents
     limit = documents[0].metadata["distance"] + margin
-    return [document for document in documents if document.metadata["distance"] <= limit]
+    # Graph passages are linked, not similar: a multi-hop fact is often far from the question.
+    return [
+        document
+        for document in documents
+        if document.metadata["distance"] <= limit or document.metadata["source"] == GRAPH_SOURCE
+    ]
 
 
 def _build_chain(
@@ -438,6 +462,7 @@ async def diagnose_query(
             page=document.metadata["page"],
             distance=document.metadata["distance"],
             section=document.metadata.get("heading"),
+            source=document.metadata["source"],
             text=document.page_content,
         )
         for number, document in enumerate(outcome.documents, start=1)
@@ -514,6 +539,9 @@ async def _run_query(
                 top_k=options.candidates(request.top_k),
                 document_ids=request.document_ids,
                 telemetry=telemetry,
+                graph=_graph(runtime.settings, options),
+                relevance_margin=options.relevance_margin,
+                neighbor_chunks=options.neighbor_chunks,
             )
 
             usage = _Usage(reasoning_effort=options.reasoning_effort)

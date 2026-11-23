@@ -82,6 +82,12 @@ class ToolName(StrEnum):
     SET_THERMOSTAT = "set_thermostat"
     LOCK_DOOR = "lock_door"
     UNLOCK_DOOR = "unlock_door"
+    # Offered only while assistant memory is on.
+    REMEMBER = "remember"
+    FORGET = "forget"
+
+
+MEMORY_TOOLS = frozenset({ToolName.REMEMBER, ToolName.FORGET})
 
 
 # Audited in place of any name outside the allowlist; the model's string is never stored.
@@ -244,3 +250,65 @@ class TotpEnrollment(StrictSchema):
 
 class TotpStatus(StrictSchema):
     enabled: bool
+
+
+class MemoryScope(StrEnum):
+    # Follows the user wherever they live.
+    RESIDENT = "resident"
+    # Holds only while the user lives in the building it was saved in.
+    RESIDENCE = "residence"
+
+
+MAX_MEMORY_CHARACTERS = 300
+# A reply quotes at least three words of a memory, so a shorter one could never be cited.
+MIN_MEMORY_WORDS = 3
+
+
+def _enough_words(value: str) -> str:
+    if len(value.split()) < MIN_MEMORY_WORDS:
+        raise ValueError("A memory needs at least three words")
+    return value
+
+
+MemoryText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=3, max_length=MAX_MEMORY_CHARACTERS),
+    AfterValidator(reject_nul),
+    AfterValidator(_enough_words),
+]
+
+
+class MemoryRequest(StrictSchema):
+    text: MemoryText = Field(repr=False)
+    scope: MemoryScope
+
+
+class MemoryView(StrictSchema):
+    id: UUID
+    scope: MemoryScope
+    text: str = Field(repr=False)
+    created_at: datetime
+    expires_at: datetime
+
+
+class MemoryList(StrictSchema):
+    """Servable memories, newest first: unexpired, and residence ones of the current home."""
+
+    memories: list[MemoryView]
+
+
+# A recalled memory's label: M1..M20, one per memory a turn may recall.
+MEMORY_LABEL_PATTERN = r"^M(?:[1-9]|1[0-9]|20)$"
+MemoryLabel = Annotated[str, StringConstraints(pattern=MEMORY_LABEL_PATTERN)]
+
+
+class RememberArguments(StrictSchema):
+    # Checked server-side: a word-for-word span of the resident's current message.
+    text: MemoryText
+    scope: MemoryScope
+
+
+class ForgetArguments(StrictSchema):
+    label: MemoryLabel
+    # Checked server-side: a word-for-word span of the resident's current message.
+    request_quote: _text(MAX_MEMORY_CHARACTERS)

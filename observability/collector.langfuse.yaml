@@ -1,0 +1,26 @@
+# Add-on for observability/collector.yaml, loaded second by compose.ai.langfuse.yaml.
+# Sends the already-filtered Langfuse pipeline to a local Langfuse as well. The privacy
+# allowlist (transform/langfuse) stays in collector.yaml and is not changed here.
+# The key arrives as LANGFUSE_OTLP_AUTH from scripts/ai_langfuse.py; never write it here.
+exporters:
+  otlphttp/langfuse-local:
+    endpoint: http://langfuse-web:3000/api/public/otel
+    headers:
+      Authorization: ${env:LANGFUSE_OTLP_AUTH}
+      x-langfuse-ingestion-version: "4"
+    timeout: 3s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 2s
+      max_elapsed_time: 5s
+    sending_queue:
+      enabled: true
+      queue_size: 128
+      num_consumers: 1
+
+service:
+  pipelines:
+    traces/langfuse:
+      # A list here replaces the base list when the files merge: name both exporters.
+      exporters: [otlphttp/langfuse, otlphttp/langfuse-local]

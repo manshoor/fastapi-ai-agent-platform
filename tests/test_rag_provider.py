@@ -20,6 +20,7 @@ from app.ai.provider import (
     RAG_PROMPT_VERSION,
     OpenAIAnswerer,
     OpenAIEmbedder,
+    OpenAIGraphExtractor,
     OpenAIReranker,
     OpenAIRewriter,
     OpenAIVerifier,
@@ -607,3 +608,23 @@ async def test_unknown_effort_never_sends(simulator):
     finally:
         await answerer.aclose()
     assert captured == []
+
+
+async def test_graph_extraction_wire_contract(simulator):
+    url, _, captured = simulator
+    extractor = OpenAIGraphExtractor(settings_for(url, ai_model="pinned-graph-model"))
+    try:
+        result = await extractor.extract(["The gym is located in the basement."], limit=6)
+    finally:
+        await extractor.aclose()
+    path, wire = captured[0]
+    assert path == "/v1/responses" and wire["model"] == "pinned-graph-model"
+    assert wire["store"] is False and wire["tools"] == []
+    assert json.loads(wire["input"]) == {
+        "max_items_per_chunk": 6,
+        "chunks": [{"label": "C1", "text": "The gym is located in the basement."}],
+    }
+    assert set(wire["text"]["format"]["schema"]["required"]) == {"nodes", "edges"}
+    assert [(e.source, e.relation, e.target) for e in result.extraction.edges] == [
+        ("gym", "located_in", "basement")
+    ]

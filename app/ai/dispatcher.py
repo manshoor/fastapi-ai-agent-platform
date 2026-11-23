@@ -7,6 +7,7 @@ import signal
 from app.ai.config import AISettings
 from app.ai.kafka import close_producer, create_producer, dispatch_once
 from app.ai.processing import maintain_jobs, recover_jobs
+from app.assistant.memory import purge_tick
 from app.db import create_engine, create_session_factory
 from app.rag import ingestion, outbox
 from app.rag.config import RAGSettings
@@ -59,6 +60,8 @@ async def run_dispatcher(settings: AISettings | None = None) -> None:
                 settings=settings,
                 telemetry=telemetry,
             )
+            # Expired and moved-out memories are never served; this bounds their storage.
+            await purge_tick(session_factory)
             await maintain_jobs(
                 session_factory=session_factory,
                 settings=settings,

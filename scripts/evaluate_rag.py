@@ -23,6 +23,9 @@ Compare answer-context settings in one run (each --config is a name and its over
   ... --config base --config wide=neighbor_chunks:2 --config ranked=rerank:llm
   ... --config checked=verifier:on --config thinking=reasoning_effort:low
 
+Compare graph expansion off and on (API started with RAG_GRAPH_ENABLED=true):
+  ... --graph --case multi-hop-storage-hours --case multi-hop-guest-apartment
+
 Exit 0 when every run passes, 1 for failed runs, 2 for invalid configuration, failed
 judge controls or failed setup. Prints only case IDs, check names, rates and fixed
 codes: never questions, answers, document text or credentials.
@@ -62,6 +65,10 @@ MAX_RETRY_SECONDS = 120
 RERANK_MODES = frozenset({"off", "llm"})
 REASONING_EFFORTS = frozenset({"none", "low", "medium"})
 VERIFIER_MODES = frozenset({"off", "on"})
+GRAPH_MODES = frozenset({"off", "on"})
+# --graph: the same cases with graph expansion off, then on (the API needs
+# RAG_GRAPH_ENABLED, so documents are ingested with a graph).
+GRAPH_CONFIGS = [("vector", {"graph": "off"}), ("graph", {"graph": "on"})]
 
 
 def _one_of(values: frozenset[str]) -> Callable[[str], str]:
@@ -80,6 +87,7 @@ OVERRIDES: dict[str, Callable[[str], object]] = {
     "rerank": _one_of(RERANK_MODES),
     "reasoning_effort": _one_of(REASONING_EFFORTS),
     "verifier": _one_of(VERIFIER_MODES),
+    "graph": _one_of(GRAPH_MODES),
 }
 _NAME = re.compile(r"[a-z0-9-]{1,32}\Z")
 
@@ -140,6 +148,7 @@ def parse_args(argv=None):
     parser.add_argument("--allow-paid-requests", action="store_true")
     parser.add_argument("--case", action="append", default=[])
     parser.add_argument("--config", action="append", default=[])
+    parser.add_argument("--graph", action="store_true")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--judge", action="store_true")
@@ -163,10 +172,14 @@ def parse_args(argv=None):
         validate_loopback(args.base_url)
     except ValueError:
         parser.error("unsafe destination; select the isolated AI API on loopback")
+    if args.graph and args.config:
+        parser.error("--graph sets its own configurations; drop --config")
     try:
         args.configs = [parse_config(value) for value in args.config] or [("server", {})]
     except ValueError:
         parser.error("invalid --config; use name or name=key:value,...")
+    if args.graph:
+        args.configs = GRAPH_CONFIGS
     if len({name for name, _ in args.configs}) != len(args.configs):
         parser.error("configuration names must be unique")
     try:
@@ -309,6 +322,13 @@ def _tokens(body: dict | None) -> int | None:
     return sum(count for count in counts if count is not None) if any(counts) else None
 
 
+def _graph_passages(body: dict | None) -> int | None:
+    """Passages graph expansion added to the context (a count, never text)."""
+    if body is None:
+        return None
+    return sum(1 for passage in body["passages"] if passage["source"] == "graph")
+
+
 def _percent(value) -> str:
     return "-" if value is None else f"{value:.0%}"
 
@@ -374,6 +394,7 @@ def run_case(account: Account, case: dict, args, overrides: dict, judge) -> dict
         "judge": verdict,
         "judge_error": judge_error,
         "tokens": _tokens(body),
+        "graph_passages": _graph_passages(body),
         "latency": round(latency, 3),
     }
 
@@ -398,6 +419,7 @@ def _line(name: str, repeat: int, run: dict) -> str:
     return (
         f"{name} r{repeat} {run['case']}: {'PASS' if passed(run) else 'FAIL'}"
         f" failed={','.join(misses) or '-'} judge={judged} error={run['error'] or '-'}"
+        f" graph_passages={'-' if run.get('graph_passages') is None else run['graph_passages']}"
     )
 
 

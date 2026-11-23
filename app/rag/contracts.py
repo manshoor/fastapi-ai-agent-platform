@@ -125,6 +125,8 @@ class DiagnosticOverrides(StrictSchema):
     rerank: Literal["off", "llm"] | None = None
     reasoning_effort: Literal["none", "low", "medium"] | None = None
     verifier: Literal["off", "on"] | None = None
+    # Graph expansion for this query; "on" uses RAG_GRAPH_HOPS and RAG_GRAPH_EXTRA_PASSAGES.
+    graph: Literal["off", "on"] | None = None
 
 
 class DiagnosticsRequest(QueryRequest):
@@ -147,7 +149,34 @@ class DiagnosticPassage(StrictSchema):
     page: int | None
     distance: float
     section: str | None
+    # "vector": a nearest chunk; "graph": a chunk the knowledge graph links to them.
+    source: Literal["vector", "graph"]
     text: str
+
+
+class GraphNodeView(StrictSchema):
+    key: str
+    type: str
+    name: str
+
+
+class GraphEdgeView(StrictSchema):
+    source: str
+    relation: str
+    target: str
+    quote: str
+
+
+class DocumentGraph(StrictSchema):
+    """The active version's knowledge graph; empty when the graph is off or not built."""
+
+    document_id: UUID
+    version: int | None
+    graph_error_code: str | None
+    nodes: list[GraphNodeView]
+    edges: list[GraphEdgeView]
+    # More rows exist than the response holds.
+    truncated: bool
 
 
 class DiagnosticClaim(StrictSchema):

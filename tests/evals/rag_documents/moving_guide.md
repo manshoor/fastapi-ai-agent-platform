@@ -36,3 +36,11 @@ Each service lift booking costs €40, which is paid in the app when you book. I
 ## After moving
 
 Register your new household members with the management office. Update your name on the mailbox and the door bell through the resident app.
+
+## Storage cages
+
+The storage cages are located in the cellar. Each apartment has one numbered cage, and its key comes with the apartment keys.
+
+## Concierge
+
+The concierge service is located in the parcel room next to the main entrance. Parcels wait there for up to seven days.

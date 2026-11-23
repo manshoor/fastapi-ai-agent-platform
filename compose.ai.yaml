@@ -38,6 +38,10 @@ x-processing-environment: &processing-environment
   # Every document event goes to Kafka and to the local SQS (ElasticMQ), never real AWS.
   RAG_EVENT_SINKS: kafka,sqs
   RAG_SQS_ENDPOINT: http://sqs:9324
+  # Knowledge graph extraction and expansion: off unless the invoking shell opts in.
+  RAG_GRAPH_ENABLED: ${AI_RAG_GRAPH_ENABLED:-false}
+  # Chunks per extraction call (1..8); the default 1 gives every chunk its own call.
+  RAG_GRAPH_BATCH_SIZE: ${AI_RAG_GRAPH_BATCH_SIZE:-1}
   OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4318
   OTEL_EXPORTER_OTLP_TIMEOUT: "3"
   OTEL_BSP_SCHEDULE_DELAY: "200"
@@ -194,6 +198,9 @@ services:
       ASSISTANT_DEMO_ENABLED: "true"
       # Seals authenticator secrets for unlock step-up.
       ASSISTANT_TOTP_KEY: ${AI_ASSISTANT_TOTP_KEY:?Run scripts/init_ai_env.py once to add AI_ASSISTANT_TOTP_KEY}
+      # Assistant memory: notes sealed under their own key, never the TOTP key.
+      ASSISTANT_MEMORY_ENABLED: "true"
+      ASSISTANT_MEMORY_KEY: ${AI_ASSISTANT_MEMORY_KEY:?Run scripts/init_ai_env.py once to add AI_ASSISTANT_MEMORY_KEY}
       # Eval-only route for scripts/evaluate_rag.py: returns passages to their owner.
       RAG_DIAGNOSTICS_ENABLED: "true"
       # Room for rerank and the verifier as eval overrides: 20 s embedding + 3 x 30 s chat.

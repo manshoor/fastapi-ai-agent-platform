@@ -12,7 +12,7 @@ from sqlalchemy import delete, func, insert, select, update
 
 import app.assistant.tools as tools
 from app.ai.provider import OpenAIEmbedder, ToolCall
-from app.assistant.contracts import Decision, ResultCode, ToolName
+from app.assistant.contracts import MEMORY_TOOLS, Decision, ResultCode, ToolName
 from app.assistant.residence import load_resident
 from app.assistant.tools import ToolContext, execute
 from app.config import Settings
@@ -457,10 +457,12 @@ async def test_every_enum_value_is_accepted_by_the_audit_table(app: FastAPI, res
         await session.commit()
 
 
-def test_tool_schemas_are_strict_and_cover_the_allowlist():
-    names = [schema["name"] for schema in tools.TOOL_SCHEMAS]
-    assert names == [str(tool) for tool in ToolName]
-    for schema in tools.TOOL_SCHEMAS:
+def test_tool_schemas_are_strict_and_cover_the_allowlist(app):
+    # Memory is off in this suite: its tools are not offered.
+    schemas = tools.tool_schemas(app.state.assistant_settings)
+    names = [schema["name"] for schema in schemas]
+    assert names == [str(tool) for tool in ToolName if tool not in MEMORY_TOOLS]
+    for schema in schemas:
         parameters = schema["parameters"]
         assert schema["strict"] is True
         assert parameters["additionalProperties"] is False

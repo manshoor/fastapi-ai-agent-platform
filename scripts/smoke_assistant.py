@@ -7,6 +7,9 @@
       -> "unlock the front door"              -> pending, door still locked
       -> stranger confirm 404 -> owner wrong code 403 -> owner confirm 200 -> door unlocked
       -> house-rules question                 -> cited answer
+      -> "remember that ..."                  -> memory saved, listed by the route
+      -> "what did I tell you ..."            -> answered from the memory (M1)
+      -> "please forget ..."                  -> memory deleted; forget-all route empties
       -> account without a residence         -> 403
 
 No paid service: run it against the isolated AI stack with the provider simulator.
@@ -25,6 +28,8 @@ import httpx
 
 ROOT = Path(__file__).resolve().parent.parent
 MESSAGES = "/api/v1/assistant/messages"
+MEMORIES = "/api/v1/assistant/memories"
+NOTE = "I park my bike in bay twelve"
 RESIDENCE = "/api/v1/residence"
 DOCUMENTS = "/api/v1/rag/documents"
 RULES = "# House rules\n\nQuiet hours start at 22:00 and end at 07:00 every day."
@@ -145,6 +150,22 @@ def run_smoke(base_url: str, *, timeout_seconds: float = 60) -> None:
         assert turn["status"] == "answered", "Document question not answered"
         assert [item["document_id"] for item in turn["citations"]] == [document_id]
 
+        # Memory: saved from the resident's own words, recalled, then forgotten.
+        turn = _say(client, owner, f"Please remember that {NOTE}")
+        assert turn["status"] == "answered", "Remember turn not answered"
+        memories = expect(client.get(MEMORIES, headers=owner), 200).json()["memories"]
+        assert [memory["text"] for memory in memories] == [NOTE], "Memory not stored"
+        turn = _say(client, owner, "What did I tell you about my bike?")
+        assert turn["status"] == "answered", "Recall turn not answered"
+        assert NOTE in turn["answer"], "Recall did not show the note"
+        turn = _say(client, owner, "Please forget what I said about my bike")
+        assert turn["status"] == "answered", "Forget turn not answered"
+        assert expect(client.get(MEMORIES, headers=owner), 200).json()["memories"] == []
+        body = {"text": "The spare key is with my neighbour", "scope": "residence"}
+        expect(client.post(MEMORIES, headers=owner, json=body), 201)
+        expect(client.delete(MEMORIES, headers=owner), 204)
+        assert expect(client.get(MEMORIES, headers=owner), 200).json()["memories"] == []
+
         # No residence, no assistant.
         expect(client.post(MESSAGES, headers=_account(client), json={"message": "hi"}), 403)
 
@@ -162,7 +183,10 @@ def main() -> None:
         parser.error("unsafe smoke destination; select the isolated AI API")
     except httpx.HTTPError:
         raise SystemExit("Assistant smoke HTTP transport failed (details withheld)") from None
-    print("PASS: demo, device action, pending unlock, step-up, confirm, cited answer, 403")
+    print(
+        "PASS: demo, device action, pending unlock, step-up, confirm, cited answer, "
+        "memory remember/recall/forget, 403"
+    )
 
 
 if __name__ == "__main__":

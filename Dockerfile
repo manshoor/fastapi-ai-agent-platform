@@ -33,6 +33,9 @@ USER root
 COPY --chown=app:app tests ./tests
 COPY --chown=app:app scripts ./scripts
 COPY --chown=app:app observability/collector.verify.yaml ./observability/collector.verify.yaml
+# Read by tests/test_ai_langfuse.py.
+COPY --chown=app:app observability/collector.yaml observability/collector.langfuse.yaml ./observability/
+COPY --chown=app:app compose.ai.langfuse.yaml ./
 RUN uv sync --locked --no-editable \
     && chmod -R a+rX /opt/venv \
     && chown -R app:app /app

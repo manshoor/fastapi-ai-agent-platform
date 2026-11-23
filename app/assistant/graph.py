@@ -20,7 +20,7 @@ from app.ai.contracts import AssistantReply
 from app.ai.provider import ToolCall
 from app.assistant.config import AssistantSettings
 from app.assistant.contracts import ActionResult, ToolName
-from app.assistant.tools import TOOL_SCHEMAS, ToolContext, execute, output_text
+from app.assistant.tools import ToolContext, execute, output_text, tool_schemas
 
 BUDGET_CODE = "turn_budget"
 
@@ -57,6 +57,7 @@ def _run(config: RunnableConfig) -> TurnRun:
 def build_graph(settings: AssistantSettings):
     provider_timeout = settings.ai_provider_timeout_seconds
     embedding_timeout = settings.ai_embedding_timeout_seconds
+    schemas = tool_schemas(settings)
 
     async def model(state: _State, config: RunnableConfig) -> _State:
         run = _run(config)
@@ -67,7 +68,7 @@ def build_graph(settings: AssistantSettings):
             run.stop_code = BUDGET_CODE
             return {"route": END}
         run.model_calls += 1
-        step = await run.model.step(run.items, TOOL_SCHEMAS)
+        step = await run.model.step(run.items, schemas)
         run.response_model = step.model
         run.input_tokens += step.input_tokens or 0
         run.output_tokens += step.output_tokens or 0
@@ -122,6 +123,15 @@ def recursion_limit(settings: AssistantSettings) -> int:
     return 2 * settings.assistant_max_model_calls + 2
 
 
-def first_input(resident: dict, message: str) -> dict:
-    """The resident's context and message as data, never as instructions."""
-    return {"role": "user", "content": json.dumps({"resident": resident, "message": message})}
+def first_input(resident: dict, message: str, memories: list[str] | None = None) -> dict:
+    """The resident's context, recalled memories and message as data, never as instructions.
+
+    Memories go in as JSON strings under their own M labels, so a note's text can never
+    pose as a passage, a tool fact or a field of the context.
+    """
+    content = {"resident": resident, "message": message}
+    if memories is not None:
+        content["memories"] = [
+            {"label": f"M{index}", "text": text} for index, text in enumerate(memories, 1)
+        ]
+    return {"role": "user", "content": json.dumps(content)}

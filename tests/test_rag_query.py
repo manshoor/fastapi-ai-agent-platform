@@ -22,7 +22,14 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from app.config import Settings
-from app.models import RAG_EMBEDDING_DIMENSIONS, RAGChunk, RAGDocument, RAGQuery
+from app.models import (
+    RAG_EMBEDDING_DIMENSIONS,
+    RAGChunk,
+    RAGDocument,
+    RAGGraphEdge,
+    RAGGraphNode,
+    RAGQuery,
+)
 from app.rag.contracts import QueryRequest
 from app.rag.pipeline import NO_CONTEXT_ANSWER, answer_query
 from app.telemetry import Telemetry
@@ -179,7 +186,7 @@ async def test_answer_cites_the_matching_document(app, client, account, simulato
     assert (row.status, row.retrieved_count, row.top_k) == ("answered", 1, 1)
     assert row.finished_at is not None and row.input_tokens == 25 and row.output_tokens == 15
     assert (row.chat_calls, row.reasoning_effort, row.no_context_reason) == (1, "none", None)
-    assert row.prompt_version == "rag-answer-v2"
+    assert row.prompt_version == "rag-answer-v3"
     assert row.provider_request_id.startswith("req_sim_")
 
 
@@ -647,6 +654,49 @@ async def test_relevance_margin_drops_distant_candidates(app, client, account, s
 
     assert [passage["title"] for passage in wide["passages"]] == ["Pump manual", "Garden notes"]
     assert [passage["title"] for passage in narrow["passages"]] == ["Pump manual"]
+
+
+async def link(app: FastAPI, owner_id: UUID, document_id: UUID, source: str, target: str):
+    """One edge, and its two nodes, in the document's only chunk. Ends are "type:name";
+    the stored key is the name alone, as `app/rag/graph.py` writes it."""
+    chunk = {"document_id": document_id, "version": 1, "ordinal": 0, "owner_id": owner_id}
+    async with app.state.session_factory() as session:
+        for end in (source, target):
+            node_type, name = end.split(":")
+            node = {"node_key": name, "node_type": node_type, "name": name, "match_name": name}
+            session.add(RAGGraphNode(**chunk, **node))
+        session.add(
+            RAGGraphEdge(
+                **chunk,
+                source_key=source.split(":")[1],
+                relation="located_in" if target.startswith("location") else "governed_by",
+                target_key=target.split(":")[1],
+                quote="quoted span of the chunk",
+            )
+        )
+        await session.commit()
+
+
+async def test_graph_override_adds_linked_passages(app, client, account, settings):
+    settings.rag_diagnostics_enabled = True
+    owner = await account()
+    owner_id = UUID(owner["id"])
+    gym = await add_ready_document(app, owner_id, "Gym", "The gym is located in the basement.")
+    rules = await add_ready_document(
+        app, owner_id, "Rules", "The basement is governed by the noise rules."
+    )
+    await link(app, owner_id, gym, "facility:gym", "location:basement")
+    await link(app, owner_id, rules, "location:basement", "rule:noise rules")
+    question = "Where is the gym?"
+
+    off = await diagnose(client, owner, question=question, top_k=1, overrides={"graph": "off"})
+    on = await diagnose(client, owner, question=question, top_k=1, overrides={"graph": "on"})
+
+    assert [(p["title"], p["source"]) for p in off["passages"]] == [("Gym", "vector")]
+    assert [(p["title"], p["source"]) for p in on["passages"]] == [
+        ("Gym", "vector"),
+        ("Rules", "graph"),
+    ]
 
 
 def room_for_rerank(app: FastAPI, monkeypatch) -> None:

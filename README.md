@@ -209,9 +209,9 @@ uv run --locked python scripts/smoke_ai.py
 
 The default stack uses a **local provider simulator**, not OpenAI or a paid model. The smoke creates real accounts/items, submits through HTTP, waits for Kafka/worker completion, verifies ownership and no auto-apply, then explicitly PATCHes the suggestion. It prints no bearer tokens or content. Port 8002 must be free; normal port 8000 and benchmark port 8001 are rejected by the AI initializer/smoke.
 
-The initializer creates a separate `.ai-local/.env` with random credentials and mode `0600`, plus private `0700` directories. Existing credentials are preserved; unsafe ownership, modes, links, and normal/escaping paths are rejected rather than repaired. For an existing file it appends only a missing `AI_ASSISTANT_TOTP_KEY` (the assistant's authenticator sealing key) and leaves every other line alone; an empty, malformed or repeated key is reported, not repaired. Until the key exists, `compose.ai.yaml` commands stop with an error naming the initializer. `.ai-*/` is excluded from version control and Docker build context. Settings read process environment only, never dotenv implicitly.
+The initializer creates a separate `.ai-local/.env` with random credentials and mode `0600`, plus private `0700` directories. Existing credentials are preserved; unsafe ownership, modes, links, and normal/escaping paths are rejected rather than repaired. For an existing file it appends only a missing `AI_ASSISTANT_TOTP_KEY` (the assistant's authenticator sealing key) or `AI_ASSISTANT_MEMORY_KEY` (its memory sealing key) and leaves every other line alone; an empty, malformed or repeated key, or one memory key equal to the TOTP key, is reported, not repaired. Until both keys exist, `compose.ai.yaml` commands stop with an error naming the initializer. `.ai-*/` is excluded from version control and Docker build context. Settings read process environment only, never dotenv implicitly.
 
-`compose.ai.yaml` is standalone: **never merge it with normal, benchmark, or QA Compose**; the [TLS edge](#optional-tls-edge) overlay is the only file layered on it. It uses database `app_ai`, Redis DB 2, and project-owned PostgreSQL/Kafka volumes. Only the API publishes `127.0.0.1:8002` (with the edge overlay, only the edge publishes, on 8443); dependencies and simulator/telemetry control endpoints have no host ports. An API-only ingress network enables loopback publication; all dependency traffic stays on the internal network. The local image uses the test target to include simulators and operational scripts. This remains a development deployment, not production TLS, abuse protection, or Kafka HA.
+`compose.ai.yaml` is standalone: **never merge it with normal, benchmark, or QA Compose**; only the [TLS edge](#optional-tls-edge) and [Langfuse](#send-the-ai-stacks-traces-to-local-langfuse) overlays are layered on it. It uses database `app_ai`, Redis DB 2, and project-owned PostgreSQL/Kafka volumes. Only the API publishes `127.0.0.1:8002` (with the edge overlay, only the edge publishes, on 8443); dependencies and simulator/telemetry control endpoints have no host ports. An API-only ingress network enables loopback publication; all dependency traffic stays on the internal network (the Langfuse overlay is the one exception: its collector also joins Langfuse's web network). The local image uses the test target to include simulators and operational scripts. This remains a development deployment, not production TLS, abuse protection, or Kafka HA.
 
 Stop only this stack, retaining its volumes:
 
@@ -320,6 +320,52 @@ input/output content. No model call was made. Evidence:
 `artifacts/ingestion-f072fadff3cb41aea82525bc4d5ef528/result.json`.
 The same observations survived an explicit down/resume cycle. Verification services
 were then stopped with their volumes and private credentials preserved.
+
+#### Send the AI stack's traces to local Langfuse
+
+```bash
+uv run --locked python scripts/ai_langfuse.py --langfuse-state .langfuse-verification
+uv run --locked python scripts/smoke_assistant.py
+uv run --locked python scripts/smoke_rag.py
+```
+
+Open http://127.0.0.1:8005, sign in with the login in the state directory's
+`state.json` (read it yourself), and go to **Tracing → Traces**. The launcher resumes
+the saved Langfuse and waits for it, then recreates the AI collector with
+`compose.ai.langfuse.yaml` and starts the API and workers. `--live` adds
+`compose.ai.live.yaml` (billable model calls); `--edge` adds `compose.edge.yaml` and
+starts the edge (run `scripts/init_edge_tls.py` first). It prints no key. If a step
+fails, the error names it (`collector` or `services`).
+
+```
+api / workers --OTLP--> collector: transform/langfuse (allowlist, observation types)
+                           -> otlp stand-in receiver          (unchanged)
+                           -> langfuse-web:3000/api/public/otel (observability/collector.langfuse.yaml)
+```
+
+- You see `assistant.turn` (agent), `assistant.tool` (tool), `rag.query` (chain),
+  `rag.retrieve` (retriever), generations and embeddings with model, tokens, timing
+  and IDs. Input and output stay empty; there are no user or session fields.
+- The collector joins Langfuse's non-internal `api_ingress` network, so it also gains
+  outbound access, and its environment holds the project key. Never run
+  `docker compose config` or `docker inspect` against this stack with real values.
+- The collector's OTLP receiver and health port become reachable from `langfuse-web`.
+  Proxy variables are blanked in the collector, so a Docker client proxy setting cannot
+  carry the key off the machine.
+- If Langfuse goes away, the exporter retries for at most 5 s and drops spans; the API
+  and the stand-in receiver keep working. LangSmith stays on the stand-in receiver.
+- Any later `up` of these services without the overlay (for example the plain
+  `compose.ai.yaml` command) recreates the collector without the Langfuse export, and
+  without `--edge` the launcher recreates the API without the edge. Use the launcher
+  again to restore it.
+
+Tear down the AI stack first (the collector is attached to Langfuse's network), then
+Langfuse; volumes stay:
+
+```bash
+docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml down
+uv run --locked python scripts/langfuse_local.py down --directory .langfuse-verification
+```
 
 #### Cloud LangSmith
 
@@ -446,10 +492,11 @@ connector-sync --------+--> rag_documents (new version) + rag_outbox, one transa
            rag-dispatcher-sqs ---+--> SQS rag-document-events.fifo ---> rag-worker-sqs
                 both workers: claim (first wins, the duplicate settles)
                   created/updated: parse (sandboxed: PDF + OCR, Word, HTML) -> chunk -> embed
+                                   (+ graph extraction per batch, RAG_GRAPH_ENABLED)
                                    -> swap to the new version in one transaction
                   deleted: purge the tombstone
 query  --> API: auth -> query slot -> admit (rate limit) -> embed question -> owner-scoped pgvector KNN
-                 -> neighbor windows (+ optional rerank) -> claims, each with a quote
+                 (+ graph-linked chunks) -> neighbor windows (+ optional rerank) -> claims, each with a quote
                  -> server checks every quote and number (+ optional verifier) -> 200
 ```
 
@@ -473,6 +520,7 @@ All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
 | `PUT /api/v1/rag/documents/{id}/content` | 202; 200 for the same content or a replay | Multipart `file` only, same types and limits, `Idempotency-Key`. Starts the next version; queries read the current `active_version` until the new one is ready. 409 while a version is in progress. |
 | `GET /api/v1/rag/documents` | 200 | Owner's uploaded documents, newest first (connector documents are not listed). |
 | `GET /api/v1/rag/documents/{id}` | 200 | Status, `version`, `active_version`, `update_error_code`, `source_kind`, chunk and page counts, error code, timestamps. Never the content. |
+| `GET /api/v1/rag/documents/{id}/graph` | 200 | Distinct nodes and edges of the active version (at most 1,000 each, `truncated`), and `graph_error_code`. Owner only; empty while no version is active. |
 | `DELETE /api/v1/rag/documents/{id}` | 204 | One transaction removes the chunks and the source and leaves a tombstone (404 to every reader) plus a `doc.deleted` event; the worker purges the row and **its idempotency record**, so the same key can then create a new document. |
 | `POST /api/v1/rag/query` | 200 | JSON `question` (1–2,000 chars), `top_k` (1–8, default 4), optional `document_ids` (1–20). Returns `status` (`answered`/`no_context`), `answer`, `citations[{document_id,title,ordinal,page,snippet,quotes}]`. `quotes` are the checked, word-for-word spans the answer relies on. |
 
@@ -538,7 +586,7 @@ Real sources need their own egress overlay and private env file; the fake creden
 
 ### Answer grounding
 
-Retrieval can find the right passage while the model still misreads it. So the answer is built only from claims the server can check (prompt `rag-answer-v2`):
+Retrieval can find the right passage while the model still misreads it. So the answer is built only from claims the server can check (prompt `rag-answer-v3`):
 
 ```
 model -> claims[{statement, citation P<n>, quote}]   (no claims -> no_context: no_claims)
@@ -566,17 +614,62 @@ answer = statements joined; citations = cited passages with their quotes
 
 `RAG_QUERY_DEADLINE_SECONDS` (default 60, at most 120) must exceed the embedding timeout plus one provider timeout per chat call; rerank and the verifier each add one. With the default 20 s and 30 s timeouts that is 80 s for one of them and 110 s for both. Startup fails otherwise. `compose.ai.yaml` sets 115 s so the eval can try either.
 
+### Knowledge graph (GraphRAG)
+
+Off unless `RAG_GRAPH_ENABLED=true`. Each extraction batch is one paid chat call at ingest (prompt `graph-extract-v1`), so the graph costs money only while documents are ingested; queries make no extra call.
+
+```
+ingest, per batch of RAG_GRAPH_BATCH_SIZE chunks (after the embed call, no transaction open)
+  model -> nodes{chunk C<n>, type, name} + edges{source, relation, target, quote}
+  server keeps:  type and triple in the ontology (building-ontology-v1)
+                 name: in its chunk on word edges, no email or phone number
+                 edge: quote of 3+ words in its chunk naming both ends; two distinct keys
+  -> rag_graph_nodes / rag_graph_edges, stored with the batch's chunks (same fence)
+query (after vector search, one REPEATABLE READ snapshot, same scope and active versions)
+  seeds:    nodes the question names (whole words), then nodes of the vector hits
+            within the relevance margin; at most 50
+  hops:     RAG_GRAPH_HOPS, each reads at most 50 unread edges outside the vector hits
+  evidence: their chunks, most links first, then closest; up to RAG_GRAPH_EXTRA_PASSAGES
+  mentions: slots the edges left go to chunks naming a seed or an entity the hops set out
+            from, most such entities first, then closest; no further hop from there
+            and no text a neighbor window already holds
+```
+
+- **Grounded, not trusted.** Graph passages are ordinary chunk text, so every answer quote is still checked against what the model received. The graph only decides which extra chunks are sent; it is never a source of its own. The relation, its direction and the node types are the model's reading of the quote; retrieval follows edges as undirected links.
+- **Scope.** Nodes and edges belong to one chunk of one version and cascade with it, so swaps, retries, deletes and purges remove them. Entities merge across documents only at query time, by `node_key` (the name's normalized words, without its type: a live model typed "cellar" as a location in one document and a facility in another), inside one owner's or one building's documents. Rows stored before this change keep `type:name` keys and share no edges with newer rows until their document gets a new version (a mention can still reach them by name).
+- **Failures.** A rejected, invalid or cut-short extraction stores no graph for that batch and records `graph_error_code` (`graph_rejected`, `graph_invalid`, `graph_incomplete`); the document is still served. A transient provider failure (timeout, rate limit, 5xx) retries the whole document like an embedding failure and can use up its three attempts.
+- **Privacy.** People are kept out by the prompt only; the server refuses names that look like an email address or phone number. Spans carry counts only (`node_count`, `edge_count`, `graph_dropped`, `graph_passages`), never names or quotes.
+- **Limits.** Graph passages fill only the slots left under 8: with `top_k` 8 (or rerank with `top_k` 4 or more) the graph adds nothing. In the assistant, graph passages use the turn's 8 passage labels. A graph passage can repeat text the neighbor window already holds. Existing documents get a graph on their next version; there is no backfill.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `RAG_GRAPH_ENABLED` | `false` | Extraction at ingest and expansion at query time. Adds one provider timeout to the lease floor. |
+| `RAG_GRAPH_BATCH_SIZE` | `1` | Chunks per extraction call (1–8); also the stored batch size while the graph is on. With 4, a live model filled the first chunk of each call and left the rest empty, so the default gives each chunk its own paid call. `compose.ai.yaml` reads it from `AI_RAG_GRAPH_BATCH_SIZE`. |
+| `RAG_GRAPH_MAX_ITEMS_PER_CHUNK` | `8` | Nodes and edges kept per chunk (1–24). Larger values can exceed `AI_MAX_OUTPUT_TOKENS`. |
+| `RAG_GRAPH_HOPS` | `1` | Edge hops from the seeds (1–2). |
+| `RAG_GRAPH_EXTRA_PASSAGES` | `2` | Graph passages after the vector passages (0–4). |
+
 ### RAG evaluation
 
-`POST /api/v1/rag/query/diagnostics` is an eval-only route. It is 404 (before authentication) and hidden from the schema unless `RAG_DIAGNOSTICS_ENABLED=true`, which only `compose.ai.yaml` sets. It runs the normal query (same owner scope, rate limit and usage row) and also returns, to the owner only, the passages sent to the model, each claim with its check result, verifier verdicts, the refusal reason and usage. It takes optional `overrides`: `neighbor_chunks`, `relevance_margin`, `rerank`, `reasoning_effort`, `verifier`. An override set that does not fit the deadline is 422.
+`POST /api/v1/rag/query/diagnostics` is an eval-only route. It is 404 (before authentication) and hidden from the schema unless `RAG_DIAGNOSTICS_ENABLED=true`, which only `compose.ai.yaml` sets. It runs the normal query (same owner scope, rate limit and usage row) and also returns, to the owner only, the passages sent to the model, each claim with its check result, verifier verdicts, the refusal reason and usage. It takes optional `overrides`: `neighbor_chunks`, `relevance_margin`, `rerank`, `reasoning_effort`, `verifier`, `graph`. Each passage carries its `source` (`vector` or `graph`). An override set that does not fit the deadline is 422.
 
-`tests/evals/rag_v1.jsonl` holds 32 golden cases over the five documents in `tests/evals/rag_documents/` (single fact, numeric, condition, multi-passage, heading, split across chunks, distractor, not covered, injection). Each case is scored on retrieval, citations, status, facts and forbidden strings, so a wrong answer after a correct retrieval is counted on its own (`wrong_given_hit`). CI checks the data and the scorer only; the simulator cannot judge answers.
+`tests/evals/rag_v1.jsonl` holds 34 golden cases over the five documents in `tests/evals/rag_documents/` (single fact, numeric, condition, multi-passage, heading, split across chunks, distractor, not covered, injection, multi-hop). A multi-hop case needs two facts from two documents that share one entity (storage cages -> cellar -> opening hours). Each case is scored on retrieval, citations, status, facts and forbidden strings, so a wrong answer after a correct retrieval is counted on its own (`wrong_given_hit`). CI checks the data and the scorer only; the simulator cannot judge answers.
 
 Live, paid, after explicit authorisation, against the AI stack started with `compose.ai.live.yaml`:
 
 ```bash
 uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --repeat 3 --config base --config checked=verifier:on --output artifacts/rag-eval.json
 uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --judge --judge-model MODEL
+```
+
+`--graph` runs every selected case twice, as configurations `vector` (`graph:off`) and `graph` (`graph:on`). Start the stack with `AI_RAG_GRAPH_ENABLED=true` in the invoking shell (it sets `RAG_GRAPH_ENABLED` for the API and workers; default off) so the fixture documents are ingested with a graph; extraction is paid too:
+
+```bash
+AI_RAG_GRAPH_ENABLED=true docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml -f compose.ai.live.yaml up --build -d --wait api worker rag-worker rag-worker-sqs dispatcher rag-dispatcher-sqs
+```
+
+```bash
+uv run --locked python scripts/evaluate_rag.py --allow-paid-requests --graph --case multi-hop-storage-hours --case multi-hop-guest-apartment
 ```
 
 `--judge` first runs six judge controls with known verdicts and exits 2 if the judge gets one wrong. The script accepts loopback destinations only (not ports 8000 or 8001) and prints case IDs, check names, rates and fixed codes; `--output` saves scores without text, mode 0600. Against the simulator it exits 1 by design: it only checks the wiring.
@@ -625,7 +718,7 @@ All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
 | `POST /api/v1/residence/demo` | 201: a demo building, apartment `1A`, two thermostats, two door locks, an alarm, two bookings; the caller becomes resident and manager | 404 when the demo flag is off (before authentication); 409 already a resident |
 | `POST /api/v1/rag/documents?building_id=` | As for RAG uploads; the document belongs to the building | 404 unless the caller manages that building |
 
-The final reply is claims, checked like RAG answers (prompt `assistant-v3`): each passage claim needs a quote from a passage handed out this turn, and the reply shows its statement. Each successful device, ticket or booking result gets a label `T1`–`T8` and a `fact` the server writes from checked values. A tool claim cites that label and quotes the fact, and the reply shows the fact in place of the model's sentence, so a reply cannot misstate a tool result. A later result for the same device replaces its earlier fact; a denial has no fact. `citations[]` items carry `quotes`. `status` is `answered` (every claim checked), `no_context` (fixed text: nothing grounded the answer, or a claim failed with nothing committed), or `incomplete` (fixed text: the turn stopped after committing a change, including a failed claim after a write, `error_code` `claim_unverified`; `actions` lists what happened). The failed check is stored in `assistant_turns.claim_failure`. `actions[]` items are `{tool, decision, result, device, ticket_id, pending_action_id}`, built by the server from tool results, never from model text.
+The final reply is claims, checked like RAG answers (prompt `assistant-v4`): each passage claim needs a quote from a passage handed out this turn, and the reply shows its statement. Each successful device, ticket or booking result gets a label `T1`–`T8` and a `fact` the server writes from checked values. A tool claim cites that label and quotes the fact, and the reply shows the fact in place of the model's sentence, so a reply cannot misstate a tool result. A later result for the same device replaces its earlier fact; a denial has no fact. While memory is on, a memory claim cites a recalled note `M1`–`M20` and quotes at least three of its words; the reply shows the whole note as `You told me: "…".`, never the model's sentence, so a fragment cannot drop a "not" or cut a number ([Assistant memory](#assistant-memory)). `citations[]` items carry `quotes`. `status` is `answered` (every claim checked), `no_context` (fixed text: nothing grounded the answer, or a claim failed with nothing committed), or `incomplete` (fixed text: the turn stopped after committing a change, including a failed claim after a write, `error_code` `claim_unverified`; `actions` lists what happened). The failed check is stored in `assistant_turns.claim_failure`. `actions[]` items are `{tool, decision, result, device, ticket_id, pending_action_id}`, built by the server from tool results, never from model text.
 
 ### Tools and rules
 
@@ -637,11 +730,13 @@ The final reply is claims, checked like RAG answers (prompt `assistant-v3`): eac
 | `set_thermostat` | `device`, `celsius` (16–26, steps of 0.5) | Sets the target | 10 device actions per user per hour |
 | `lock_door` | `device` | Locks the door | shares the device-action limit |
 | `unlock_door` | `device` | Creates a 60 s pending unlock; never unlocks | 3 per user per hour |
+| `remember` (memory on) | `text`, `scope` (`resident` or `residence`) | Saves `text`, which must be whole words of the current message | 50 active, 10 writes per user per 24 h, shared with the route |
+| `forget` (memory on) | `label` (`M1`–`M20`), `request_quote` | Deletes that recalled note; `request_quote` must be words of the message that ask to forget | none |
 
 - **Identity from the server.** The model supplies only tool names and values. User, apartment and building come from the caller's token and membership. Extra arguments are rejected.
 - **Checked, audited writes.** Each write runs in one transaction: per-user lock, membership share lock, limit count on the database clock, a write guarded by apartment, device name and kind, and an `assistant_tool_calls` audit row. Unknown tool names are audited as `unknown`.
 - **Only the resident confirms, with a code.** No tool can confirm an unlock, and confirm needs an authenticator code ([Unlock step-up](#unlock-step-up)). The alarm exists but no tool can reach it, and the model never sees it.
-- **Untrusted text.** The message, tool results and passages are data, never instructions. A hijacked model can at worst create an unconfirmed unlock request.
+- **Untrusted text.** The message, recalled memories, tool results and passages are data, never instructions. A memory never authorizes an action. A hijacked model can at worst create an unconfirmed unlock request, or save or forget a note within the rules below.
 - **No content stored or traced.** Turns and audit rows hold counts, IDs and fixed codes; ticket summaries live only in `tickets`. The graph runs with LangSmith tracing disabled; spans `assistant.turn` (Langfuse `agent`) and `assistant.tool` (Langfuse and LangSmith `tool`) carry IDs and counts only.
 - Defaults: 10 turns per 60 s per user. One running turn per user across all API processes: another gets 429 `A turn is already running` (`Retry-After: 1`). A turn's lease ends with the turn, or 30 s after its deadline if its process died. At most 64 running turns per API process (`ASSISTANT_CONCURRENCY`, up to 256), then 503 at once; turns hold no database connection while they wait on the provider.
 
@@ -654,7 +749,43 @@ Enroll once with the account password, add the returned secret (or `otpauth_uri`
 - A matching code is spent and committed before the action is claimed, so a 404 or 409 after the match cannot reuse it.
 - A confirm without an enabled authenticator, or with a wrong code, writes a `denied` audit row (`step_up_required`, `step_up_failed`) with no action or device id: the action is not yet proven to be the caller's. `step_up_required` denials are not counted as failures; the edge's `assistant` zone limits their rate.
 - Secrets are sealed with AES-256-GCM under `ASSISTANT_TOTP_KEY` (32 bytes as base64, required when the assistant is on), with the user id as associated data, so a row copied to another user does not open. Secrets, codes and passwords are never logged, traced or stored in plain text. `compose.ai.yaml` reads the key from `AI_ASSISTANT_TOTP_KEY`, `compose.ai.test.yaml` sets a test-only key, and the benchmark runner generates `BENCH_ASSISTANT_TOTP_KEY` per run.
-- Not included: reset, disable and recovery codes. A lost authenticator blocks that user's unlock confirms until an operator deletes their `totp_credentials` row; a lost or changed `ASSISTANT_TOTP_KEY` does this for every enrolled user (500 `Authenticator unavailable`). Downgrading migration 0006 drops all enrollments and failure counts, and refuses while step-up audit rows exist.
+- Not included: reset, disable and recovery codes. A lost authenticator blocks that user's unlock confirms until an operator deletes their `totp_credentials` row; a lost or changed `ASSISTANT_TOTP_KEY` does this for every enrolled user (500 `Authenticator unavailable`). Assistant memory is sealed the same way under its own `ASSISTANT_MEMORY_KEY` (`AI_ASSISTANT_MEMORY_KEY`, a test-only key, `BENCH_ASSISTANT_MEMORY_KEY`); losing or changing it makes every memory read a 500 `Memory unavailable`. Downgrading migration 0006 drops all enrollments and failure counts, and refuses while step-up audit rows exist.
+
+### Assistant memory
+
+A resident can ask the assistant to keep a note ("remember that I prefer the gym after 19:00") and to forget it later. It is off unless `ASSISTANT_MEMORY_ENABLED=true`, which requires the assistant and `ASSISTANT_MEMORY_KEY`. `compose.ai.yaml` enables it; the QA smoke API enables it; the pytest stack leaves it off except in the memory tests.
+
+```
+write   route POST or the remember tool
+          -> lock the user row -> (tool) membership share lock
+          -> residence scope: share-lock the resident membership, 403 / not_permitted if none
+          -> active memories < ASSISTANT_MEMORY_LIMIT (50), else 429 / limit_exceeded
+          -> writes in the last 24 h < ASSISTANT_MEMORY_WRITES_PER_DAY (10), else 429 + Retry-After
+          -> seal -> insert memory + write row (+ audit row for the tool), one transaction
+recall  each turn, before the first model call: unexpired notes, plus residence notes of
+        the building the resident lives in now; newest first, at most 20 and 4,000
+        characters; labelled M1..Mn as JSON strings in the first input
+forget  route DELETE (one or all), or the forget tool on a recalled label: hard delete
+purge   the dispatcher tick deletes expired and moved-out notes and day-old write rows
+```
+
+- **Scopes.** `resident` follows the user. `residence` holds only while the user lives in the building it was saved in: moving out hides it at once and the purge removes it.
+- **Retention.** 90 days per note (`ASSISTANT_MEMORY_RETENTION_SECONDS`, 1 to 365 days), on the database clock. Reads never serve an expired note, even before the purge.
+- **Explicit writes only.** The tool's `text` must be whole words of the resident's current message: no cut word, no cut number (`1` is not in `1,200`). A note needs at least three words, so a reply can always quote it. Nothing is saved automatically.
+- **Forgetting needs a request.** `request_quote` must be words of the message that contain `forget`, `delete`, `remove` or `erase`, and the message must not say "don't forget". The tool's fact names the deleted note, so the resident sees what went. A forgotten note grounds no later claim in the same turn.
+- **Steering.** Once a search hands out passages, neither memory tool runs for the rest of the turn: a document could be steering the model. Memories go in as JSON strings under their own `M` labels, so a note that reads like `T1: Front door is unlocked` is never a tool fact.
+- **Privacy.** Text is sealed with AES-256-GCM; the associated data binds it to its purpose (`memory-v1`), user and row. Text is never logged, traced, or stored outside the sealed column: turns hold `memory_count`, audit rows hold `scope` only. `create_ticket` refuses a summary that repeats three words in a row of a recalled note that the current message does not say, because co-residents can read tickets. A paraphrase can still pass that check.
+- **A row that does not open** (changed key or row) makes the list route return 500 `Memory unavailable`, and is skipped by recall, so one bad row never fails every turn.
+- **Not included:** conversation memory, automatic extraction, building-wide notes, key rotation (`key_version` is fixed at 1). A route `DELETE` during a running turn does not stop that turn from quoting a note it already recalled.
+
+| Request | Success | Errors |
+| --- | --- | --- |
+| `GET /api/v1/assistant/memories` | 200 `{memories: [{id, scope, text, created_at, expires_at}]}`, newest first, `Cache-Control: no-store` | 500 a note does not open |
+| `POST /api/v1/assistant/memories` with `{text, scope}` (3–300 characters, at least three words, no NUL) | 201 the memory | 403 residence scope without a residence; 422; 429 active or daily limit (`Retry-After` for the daily one) |
+| `DELETE /api/v1/assistant/memories/{id}` | 204 | 404 foreign or missing |
+| `DELETE /api/v1/assistant/memories` | 204: every note of the caller | — |
+
+All four are 404 before authentication while memory is off, and none is in the OpenAPI schema. Downgrading migration 0012 refuses while any memory exists; 0013 refuses while memory tool audit rows exist.
 
 ### Assistant evaluations
 
@@ -896,3 +1027,15 @@ Final local observations (generator and target on the **same laptop**):
 Recorded final CSV prefixes are `artifacts/local-final` and `artifacts/distributed-final` (fixture `artifacts/load-final.csv`); the repeatable example above uses `load-smoke.csv` and `smoke`. These small runs prove local workflow/harness operation only. **No million-row seed, 15,000-user tier, or 30,000-user tier was executed.** No production capacity, availability SLO, or authentication throughput claim follows from these observations.
 
 Assistant hardening pass (`feature/assistant-hardening`): **1,058 passing main-suite tests (63 skipped) and 1,121 passing AI-suite tests**; Ruff and `alembic check` clean; the Alembic round trip passed, and the 0006 downgrade refuses while step-up audit rows exist. `scripts/smoke_assistant.py` (step-up flow) and `scripts/smoke_edge.py` passed against the isolated AI QA stack; the edge with the normal and AI-local stacks was checked with `docker compose config` only. The paid live assistant eval passed 21/21 before and again after the step-up change (no judge). The CRUD `benchmark_smoke.py` still passes (335 measured requests, 0 failures, p95 13 ms, p99 14 ms); assistant benchmark results are in [Assistant load benchmark](#assistant-load-benchmark).
+
+GraphRAG and memory pass (`feature/graph-memory`): **1,313 passing main-suite tests (87 skipped) and 1,400 passing AI-suite tests**; Ruff and `alembic check` clean. Migrations 0011, 0012 and 0013 round-trip, and each downgrade refuses while its data exists (graph rows or a graph error code, memories, memory tool audit rows). `scripts/smoke_assistant.py` (now with remember, recall and forget) and `scripts/smoke_rag.py` passed against the isolated AI QA stack with the simulator. No paid model call was made: the `evaluate_rag.py --graph` comparison and live memory behaviour are not measured.
+
+Paid graph eval (2026-11-22, `gpt-5.6-terra`, one repeat, the two multi-hop cases): `vector` and `graph` scored the same, 0/2 runs passing each, retrieval hit 50%, answer correct 50%, mean 1,262 tokens, with identical tokens per case, so expansion added no passage. Extraction stored 71 nodes and 13 edges over the 5 fixture documents with no extraction error, but none of the edges the cases need (storage cage to cellar, cellar to opening hours, guest apartment to the service that runs it). The limit is extraction recall, not expansion. With n = 1 per case this is a wiring and direction check, not a quality measure.
+
+Diagnostic rerun the same day with `AI_RAG_GRAPH_BATCH_SIZE=1`: every chunk of every fixture document got nodes (before, mostly only the first chunk of each 4-chunk call), and the bridging edges appeared (storage cages located in the cellar, guest apartment operated by the concierge service). The graph configuration added a passage on the storage case (graph passages 1 vs 0; mean tokens 1,724 vs 1,472), but both cases still failed: the two documents typed "cellar" differently, and node keys then included the type. Fixed: one chunk per call is now the default and node keys are type-free. The citations check fails with the graph off too; that is a separate problem.
+
+Confirming run with the fix (defaults: one chunk per call, type-free keys): `graph` reached retrieval hit 100% and answer correct 100%, against 50% and 50% for `vector`; it added one passage on each case (mean tokens 2,052 vs 1,472). `multi-hop-guest-apartment` passed with the graph and failed without it. `multi-hop-storage-hours` gave the right hours both ways but failed its citations check: the answer cited the cellar hours, not the passage that puts the storage cages in the cellar. That is the answer prompt, not the graph. One repeat per case: a direction, not a quality measure.
+
+With prompt `rag-answer-v3` (cite each linking fact): `multi-hop-storage-hours` passed in both configurations, citing both the storage-cage and the cellar-hours passages. `multi-hop-guest-apartment` failed in both: this run's extraction stored "guest apartment operated by concierge service" but no edge from the concierge service in the moving guide (the model linked the parcel room to the main entrance instead). The moving guide held a concierge node (its chunk was not checked), but expansion then followed edges only, so it was not reached. Mentions were added after this run.
+
+Run with mentions (2026-11-23, same two cases, one repeat): `graph` passed both cases, `vector` one (`multi-hop-guest-apartment` failed). Retrieval hit and answer correct were 100% against 50%; mean tokens 1,996 against 1,538; one graph passage per case. This run does not show that mentions help: extraction stored "concierge service located in parcel room" this time, so the edge alone links the chunk. It shows no regression on these cases.

@@ -27,6 +27,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.rag.ontology import MAX_NAME_CHARACTERS, NodeType, Relation
+
 # Fixed by the vector(1536) column; changing it needs a migration and re-embedding.
 RAG_EMBEDDING_DIMENSIONS = 1536
 
@@ -208,6 +210,10 @@ RAG_CONTENT_TYPES = (
 )
 
 
+# Why a version's knowledge graph is missing or partial (app/rag/ingestion.py).
+RAG_GRAPH_ERRORS = ("graph_rejected", "graph_invalid", "graph_incomplete")
+
+
 def _sql_in(values: tuple[str, ...]) -> str:
     return ",".join(f"'{value}'" for value in values)
 
@@ -239,6 +245,9 @@ class RAGDocument(Base):
     external_id: Mapped[str | None] = mapped_column(String(256))
     # Why the newest version failed while an older one stays active.
     update_error_code: Mapped[str | None] = mapped_column(String(64))
+    # Why the active version's knowledge graph is missing or partial; null when complete
+    # or when graph extraction is off.
+    graph_error_code: Mapped[str | None] = mapped_column(String(64))
     # Idempotency of the latest content update.
     update_key_hash: Mapped[str | None] = mapped_column(String(64))
     update_fingerprint: Mapped[str | None] = mapped_column(String(64))
@@ -283,6 +292,10 @@ class RAGDocument(Base):
         CheckConstraint(
             "update_error_code IS NULL OR (status = 'ready' AND active_version IS NOT NULL)",
             name="ck_rag_documents_update_error",
+        ),
+        CheckConstraint(
+            f"graph_error_code IS NULL OR graph_error_code IN ({_sql_in(RAG_GRAPH_ERRORS)})",
+            name="ck_rag_documents_graph_error",
         ),
         CheckConstraint(
             "(update_key_hash IS NULL) = (update_fingerprint IS NULL)",
@@ -432,6 +445,84 @@ class RAGChunk(Base):
             postgresql_with={"m": 16, "ef_construction": 64},
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+    )
+
+
+class RAGGraphNode(Base):
+    """A node one chunk states (`app/rag/graph.py`). Merged across documents by node_key
+    at query time, within one owner's or one building's documents."""
+
+    __tablename__ = "rag_graph_nodes"
+
+    document_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    node_type: Mapped[str] = mapped_column(String(32))
+    name: Mapped[str] = mapped_column(String(MAX_NAME_CHARACTERS))
+    # The name's words only (graph.match_name): questions name nodes in this form.
+    match_name: Mapped[str] = mapped_column(String(160))
+
+    __table_args__ = (
+        # The chunk's delete (swap, retry, purge) removes its graph rows with it.
+        ForeignKeyConstraint(
+            ["document_id", "version", "ordinal"],
+            ["rag_chunks.document_id", "rag_chunks.version", "rag_chunks.ordinal"],
+            ondelete="CASCADE",
+            name="fk_rag_graph_nodes_chunk",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "owner_id"],
+            ["rag_documents.id", "rag_documents.owner_id"],
+            ondelete="CASCADE",
+            name="fk_rag_graph_nodes_document_owner",
+        ),
+        CheckConstraint(
+            f"node_type IN ({_sql_in(tuple(NodeType))})", name="ck_rag_graph_nodes_type"
+        ),
+        CheckConstraint(
+            f"char_length(name) BETWEEN 1 AND {MAX_NAME_CHARACTERS}",
+            name="ck_rag_graph_nodes_name",
+        ),
+        Index("ix_rag_graph_nodes_match", "match_name"),
+    )
+
+
+class RAGGraphEdge(Base):
+    """source -relation-> target, with the quote of its chunk that states it."""
+
+    __tablename__ = "rag_graph_edges"
+
+    document_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ordinal: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    relation: Mapped[str] = mapped_column(String(32), primary_key=True)
+    target_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    owner_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    quote: Mapped[str] = mapped_column(String(300))
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["document_id", "version", "ordinal"],
+            ["rag_chunks.document_id", "rag_chunks.version", "rag_chunks.ordinal"],
+            ondelete="CASCADE",
+            name="fk_rag_graph_edges_chunk",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "owner_id"],
+            ["rag_documents.id", "rag_documents.owner_id"],
+            ondelete="CASCADE",
+            name="fk_rag_graph_edges_document_owner",
+        ),
+        CheckConstraint(
+            f"relation IN ({_sql_in(tuple(Relation))})", name="ck_rag_graph_edges_relation"
+        ),
+        CheckConstraint("char_length(quote) BETWEEN 1 AND 300", name="ck_rag_graph_edges_quote"),
+        CheckConstraint("source_key <> target_key", name="ck_rag_graph_edges_distinct"),
+        Index("ix_rag_graph_edges_source", "source_key"),
+        Index("ix_rag_graph_edges_target", "target_key"),
     )
 
 
@@ -812,6 +903,8 @@ class AssistantTurn(Base):
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     embedding_tokens: Mapped[int | None] = mapped_column(Integer)
+    # Memories recalled into the turn: a count, never their text.
+    memory_count: Mapped[int] = mapped_column(Integer, server_default="0")
     error_code: Mapped[str | None] = mapped_column(String(64))
     claim_failure: Mapped[str | None] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -841,6 +934,7 @@ class AssistantTurn(Base):
             f"AND claim_failure IN ({_sql_in(CLAIM_FAILURES)}))",
             name="ck_assistant_turns_claim_failure",
         ),
+        CheckConstraint("memory_count >= 0", name="ck_assistant_turns_memory_count"),
         Index("ix_assistant_turns_user_created", "user_id", "created_at"),
     )
 
@@ -936,7 +1030,7 @@ class AssistantToolCall(Base):
         ),
         CheckConstraint(
             "tool IN ('search_documents','list_bookings','create_ticket','set_thermostat',"
-            "'lock_door','unlock_door','unknown')",
+            "'lock_door','unlock_door','remember','forget','unknown')",
             name="ck_assistant_tool_calls_tool",
         ),
         CheckConstraint(
@@ -952,7 +1046,7 @@ class AssistantToolCall(Base):
         # Typed values only: any other key (a question, a summary) is rejected.
         CheckConstraint(
             "jsonb_typeof(details) = 'object' "
-            "AND (details - ARRAY['celsius','category','passage_count']) = '{}'::jsonb",
+            "AND (details - ARRAY['celsius','category','passage_count','scope']) = '{}'::jsonb",
             name="ck_assistant_tool_calls_details",
         ),
         Index("ix_assistant_tool_calls_user_created", "user_id", "created_at"),
@@ -1004,4 +1098,71 @@ class AuthFailure(Base):
     __table_args__ = (
         CheckConstraint("kind IN ('password','totp')", name="ck_auth_failures_kind"),
         Index("ix_auth_failures_user_kind_created", "user_id", "kind", "created_at"),
+    )
+
+
+MEMORY_SCOPES = ("resident", "residence")
+# Memory text is 3 to 300 characters: at most 1,200 UTF-8 bytes, plus the 16-byte tag.
+MAX_MEMORY_CIPHERTEXT_BYTES = 300 * 4 + 16
+
+
+class AssistantMemory(Base):
+    """A note the resident asked the assistant to keep, sealed by the API (AES-256-GCM).
+
+    `resident` follows the user; `residence` holds only while the user lives in
+    `building_id`. Rows past `expires_at` or a move-out are never served, then purged.
+    """
+
+    __tablename__ = "assistant_memories"
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    scope: Mapped[str] = mapped_column(String(16))
+    building_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("buildings.id", ondelete="CASCADE")
+    )
+    ciphertext: Mapped[bytes] = mapped_column(LargeBinary)
+    nonce: Mapped[bytes] = mapped_column(LargeBinary)
+    key_version: Mapped[int] = mapped_column(SmallInteger, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(f"scope IN ({_sql_in(MEMORY_SCOPES)})", name="ck_assistant_memories_scope"),
+        CheckConstraint(
+            "(scope = 'residence') = (building_id IS NOT NULL)",
+            name="ck_assistant_memories_building",
+        ),
+        CheckConstraint("octet_length(nonce) = 12", name="ck_assistant_memories_nonce"),
+        CheckConstraint(
+            f"octet_length(ciphertext) BETWEEN 19 AND {MAX_MEMORY_CIPHERTEXT_BYTES}",
+            name="ck_assistant_memories_ciphertext",
+        ),
+        CheckConstraint("key_version = 1", name="ck_assistant_memories_key_version"),
+        CheckConstraint("expires_at > created_at", name="ck_assistant_memories_expiry"),
+        Index("ix_assistant_memories_user_expires", "user_id", "expires_at"),
+        Index("ix_assistant_memories_expires", "expires_at"),
+    )
+
+
+class AssistantMemoryWrite(Base):
+    """One memory write, kept for a day: forgetting a memory does not give its write back."""
+
+    __tablename__ = "assistant_memory_writes"
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("clock_timestamp()")
+    )
+
+    __table_args__ = (
+        Index("ix_assistant_memory_writes_user_created", "user_id", "created_at"),
+        Index("ix_assistant_memory_writes_created", "created_at"),
     )
