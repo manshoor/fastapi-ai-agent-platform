@@ -79,9 +79,9 @@ async def run_worker(settings: RAGSettings | None = None) -> None:
             stop=stop,
             telemetry=telemetry,
             handler=handler,
-            topic=settings.kafka_rag_request_topic,
+            topic=settings.kafka_rag_event_topic,
         )
-        consumer.subscribe([settings.kafka_rag_request_topic], listener=processor)
+        consumer.subscribe([settings.kafka_rag_event_topic], listener=processor)
         async with asyncio.timeout(15):
             await consumer.start()
         await consume(consumer=consumer, processor=processor, stop=stop)

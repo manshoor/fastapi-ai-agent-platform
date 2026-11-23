@@ -29,7 +29,7 @@ from app.db import create_engine, create_session_factory
 from app.health import router as health_router
 from app.items import router as items_router
 from app.rag.config import RAGSettings
-from app.rag.router import UPLOAD_PATH
+from app.rag.router import UPDATE_PATH, UPLOAD_PATH
 from app.rag.router import router as rag_router
 from app.rag.runtime import RAGRuntime
 from app.security import PasswordService
@@ -110,7 +110,7 @@ class BoundedBodyMiddleware:
     """Buffers small bodies before routing; streams the upload route under its own ceiling.
 
     Ordinary route:   receive all (<= 32 KiB) -> app
-    Upload route:     app -> auth -> endpoint reads body -> counting receive -> 413 on excess
+    Upload, update:   app -> auth -> endpoint reads body -> counting receive -> 413 on excess
     """
 
     def __init__(self, app: ASGIApp, limit: int = BODY_LIMIT_BYTES) -> None:
@@ -122,9 +122,11 @@ class BoundedBodyMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # The upload route is never buffered before authentication.
+        # The upload and update routes are never buffered before authentication.
         ceiling = None
-        if scope["method"] == "POST" and scope["path"] == UPLOAD_PATH:
+        if (scope["method"] == "POST" and scope["path"] == UPLOAD_PATH) or (
+            scope["method"] == "PUT" and UPDATE_PATH.fullmatch(scope["path"])
+        ):
             ceiling = getattr(scope["app"].state, "rag_upload_ceiling", None)
         limit = ceiling if ceiling is not None else self.limit
 

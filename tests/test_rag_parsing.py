@@ -42,7 +42,7 @@ async def test_pdf_pages_are_extracted_in_order(spawned):
     assert [page for page, _ in parsed.pages] == [1, 2]
     assert "pumps" in parsed.pages[0][1] and "(filters)" in parsed.pages[1][1]
     args, kwargs, process = spawned[0]
-    assert args[1:4] == ("-I", "-m", "app.rag.pdf_extract")
+    assert args[1:5] == ("-I", "-m", "app.rag.extract", "pdf")
     assert kwargs["start_new_session"] is True
     assert process.returncode == 0
 

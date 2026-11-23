@@ -13,7 +13,7 @@ from app.ai.processing import HandleResult
 from app.ai.provider import Embeddings, ProviderFailure
 from app.models import RAG_EMBEDDING_DIMENSIONS, RAGChunk, RAGDocument, RAGOutbox, User
 from app.rag.config import RAGSettings
-from app.rag.contracts import ContentType, IngestError, IngestEvent
+from app.rag.contracts import ContentType, DocumentEvent, DocumentEventType, IngestError
 from app.rag.documents import submit_document
 from app.rag.ingestion import claim_document, process_ingest, recover_documents, store_batch
 from app.rag.uploads import Upload
@@ -44,8 +44,9 @@ class ControlledEmbedder:
         return Embeddings([unit_vector(text) for text in texts], "simulated-embedding", len(texts))
 
 
-@pytest.fixture
-async def runtime(app, settings):
+# Named fixture: other modules import it without shadowing their "runtime" arguments.
+@pytest.fixture(name="runtime")
+async def rag_runtime(app, settings):
     rag = RAGSettings.model_validate(
         {
             **settings.model_dump(),
@@ -63,7 +64,7 @@ async def runtime(app, settings):
         await session.commit()
         owner_id = user.id
 
-    async def submit(data: bytes, content_type=ContentType.TEXT) -> IngestEvent:
+    async def submit(data: bytes, content_type=ContentType.TEXT) -> DocumentEvent:
         async with factory() as session:
             response, _ = await submit_document(
                 session=session,
@@ -75,20 +76,28 @@ async def runtime(app, settings):
             )
         return await event_for(response.id)
 
-    async def event_for(document_id: UUID, attempt: int = 1) -> IngestEvent:
+    async def event_for(document_id: UUID, attempt: int = 1, version: int = 1) -> DocumentEvent:
+        """The persisted created, updated or deleted event for one version and attempt."""
         async with factory() as session:
             outbox = await session.scalar(
-                select(RAGOutbox).where(
+                select(RAGOutbox)
+                .where(
                     RAGOutbox.document_id == document_id,
-                    RAGOutbox.event_kind == "requested",
+                    RAGOutbox.event_kind != "dead_letter",
+                    RAGOutbox.version == version,
                     RAGOutbox.attempt == attempt,
                 )
+                .order_by(RAGOutbox.created_at.desc())
+                .limit(1)
             )
-            return IngestEvent(
+            return DocumentEvent(
                 version=1,
                 event_id=outbox.id,
+                type=DocumentEventType(f"doc.{outbox.event_kind}"),
                 document_id=document_id,
+                document_version=outbox.version,
                 attempt=attempt,
+                source_kind="upload",
                 created_at=outbox.created_at,
             )
 
@@ -127,7 +136,7 @@ async def runtime(app, settings):
             )
             await session.commit()
 
-    async def ingest(event: IngestEvent, embedder) -> HandleResult:
+    async def ingest(event: DocumentEvent, embedder) -> HandleResult:
         return await process_ingest(
             session_factory=factory, settings=rag, event=event, embedder=embedder
         )
@@ -190,7 +199,7 @@ async def test_parse_failure_is_terminal_with_dead_letter(runtime):
     document = await runtime.read(event.document_id)
     assert (document.status, document.error_code) == ("failed", IngestError.NO_TEXT)
     assert document.source is None and embedder.calls == []
-    assert await runtime.outbox(event.document_id) == [("requested", 1), ("dead_letter", 1)]
+    assert await runtime.outbox(event.document_id) == [("created", 1), ("dead_letter", 1)]
 
 
 async def test_retryable_embedding_failure_starts_next_attempt(runtime):
@@ -206,7 +215,7 @@ async def test_retryable_embedding_failure_starts_next_attempt(runtime):
     assert document.source is not None and document.lease_token is None
     # The first batch was stored, then removed with the failed attempt.
     assert await runtime.chunks(event.document_id) == []
-    assert await runtime.outbox(event.document_id) == [("requested", 1), ("requested", 2)]
+    assert await runtime.outbox(event.document_id) == [("created", 1), ("created", 2)]
 
 
 async def test_rejected_embedding_fails_without_retry(runtime):
@@ -215,7 +224,7 @@ async def test_rejected_embedding_fails_without_retry(runtime):
     assert await runtime.ingest(event, embedder) is HandleResult.HANDLED
     document = await runtime.read(event.document_id)
     assert (document.status, document.error_code) == ("failed", IngestError.EMBEDDING_REJECTED)
-    assert await runtime.outbox(event.document_id) == [("requested", 1), ("dead_letter", 1)]
+    assert await runtime.outbox(event.document_id) == [("created", 1), ("dead_letter", 1)]
 
 
 async def test_last_attempt_failure_exhausts_attempts(runtime):
@@ -255,7 +264,7 @@ async def test_stale_worker_cannot_write_after_recovery(runtime):
     assert await runtime.chunks(event.document_id) == []
     document = await runtime.read(event.document_id)
     assert (document.status, document.attempt) == ("pending", 2)
-    assert await runtime.outbox(event.document_id) == [("requested", 1), ("requested", 2)]
+    assert await runtime.outbox(event.document_id) == [("created", 1), ("created", 2)]
 
 
 async def test_delete_during_ingestion_writes_nothing(runtime):

@@ -77,7 +77,7 @@ async def test_upload_stores_pending_document_and_outbox_event(
         event = await session.scalar(select(RAGOutbox))
         assert (event.document_id, event.event_kind, event.attempt) == (
             document.id,
-            "requested",
+            "created",
             1,
         )
 
@@ -108,6 +108,7 @@ async def test_replay_of_finished_document_returns_200(
     async with app.state.session_factory() as session:
         document = await session.get(RAGDocument, UUID(created["id"]))
         document.status, document.source, document.chunk_count = "ready", None, 1
+        document.active_version = 1
         document.finished_at = func.now()
         await session.commit()
     replay = await upload(client, owner, key=key)
@@ -138,8 +139,12 @@ async def test_list_get_delete_are_owner_scoped(app: FastAPI, client: httpx.Asyn
     deleted = await client.delete(f"{URL}/{first['id']}", headers=owner["headers"])
     assert deleted.status_code == 204
     assert (await client.get(f"{URL}/{first['id']}", headers=owner["headers"])).status_code == 404
+    listed = await client.get(URL, headers=owner["headers"])
+    assert [item["id"] for item in listed.json()["items"]] == [second["id"]]
+    # Three created events and the delete's event; the tombstone waits for its purge.
     async with app.state.session_factory() as session:
-        assert await session.scalar(select(func.count()).select_from(RAGOutbox)) == 2
+        kinds = await session.scalars(select(RAGOutbox.event_kind).order_by(RAGOutbox.created_at))
+        assert list(kinds) == ["created", "created", "created", "deleted"]
 
 
 async def test_owner_quotas_hold_under_concurrent_uploads(
@@ -186,7 +191,7 @@ async def test_owner_quotas_hold_under_concurrent_uploads(
 @pytest.mark.parametrize(
     ("name", "data", "status"),
     [
-        ("notes.html", b"<p>hi</p>", 415),
+        ("notes.exe", b"MZ", 415),
         ("notes", b"no suffix", 415),
         ("notes.md", b"x" * (TEXT_LIMIT + 1), 413),
         ("report.pdf", b"%PDF-" + b"x" * PDF_LIMIT, 413),
@@ -195,7 +200,7 @@ async def test_owner_quotas_hold_under_concurrent_uploads(
         ("notes.txt", SECRET.encode() + b"\x00", 422),
         ("report.pdf", SECRET.encode(), 422),
     ],
-    ids=["html", "no-suffix", "text-size", "pdf-size", "empty", "utf8", "nul", "pdf-header"],
+    ids=["exe", "no-suffix", "text-size", "pdf-size", "empty", "utf8", "nul", "pdf-header"],
 )
 async def test_invalid_files_are_rejected_without_echo(
     app: FastAPI, client: httpx.AsyncClient, account, name, data, status
@@ -421,3 +426,53 @@ async def test_disabled_rag_returns_503_and_crud_still_works(monkeypatch):
             assert disabled.status_code == 503
             created = await http.post("/api/v1/items", headers=auth, json={"title": "Still"})
             assert created.status_code == 201
+
+
+async def put_content(client, owner, document_id, *, key=None, data=b"New pump notes.", form=None):
+    return await client.put(
+        f"{URL}/{document_id}/content",
+        headers=headers(owner, key),
+        data=form or {},
+        files={"file": ("notes.md", data)},
+    )
+
+
+async def test_content_update_route(app: FastAPI, client: httpx.AsyncClient, account):
+    owner, stranger = await account(), await account()
+    created = (await upload(client, owner)).json()
+    async with app.state.session_factory() as session:
+        document = await session.get(RAGDocument, UUID(created["id"]))
+        document.status, document.source, document.chunk_count = "ready", None, 1
+        document.active_version, document.finished_at = 1, func.now()
+        await session.commit()
+
+    # Only the file: a title field is refused, and the title stays.
+    with_title = await put_content(client, owner, created["id"], form={"title": "New"})
+    assert with_title.status_code == 400
+    foreign = await put_content(client, stranger, created["id"])
+    missing = await put_content(client, owner, uuid4())
+    assert foreign.status_code == missing.status_code == 404
+    assert foreign.json() == missing.json()
+
+    key = uuid4().hex
+    updated = await put_content(client, owner, created["id"], key=key)
+    assert updated.status_code == 202
+    body = updated.json()
+    assert (body["version"], body["active_version"], body["status"]) == (2, 1, "pending")
+    assert body["title"] == created["title"] and body["source_kind"] == "upload"
+    assert updated.headers["location"] == body["status_url"]
+    assert (await put_content(client, owner, created["id"], key=key)).status_code == 202
+    busy = await put_content(client, owner, created["id"], data=b"Third notes.")
+    assert busy.status_code == 409
+    async with app.state.session_factory() as session:
+        kinds = await session.execute(
+            select(RAGOutbox.event_kind, RAGOutbox.version).order_by(RAGOutbox.created_at)
+        )
+        assert [tuple(row) for row in kinds] == [("created", 1), ("updated", 2)]
+
+
+async def test_content_update_body_is_bounded(client: httpx.AsyncClient, account):
+    owner = await account()
+    created = (await upload(client, owner)).json()
+    response = await put_content(client, owner, created["id"], data=b"x" * (TEXT_LIMIT + 1))
+    assert response.status_code == 413

@@ -73,11 +73,16 @@ def _merged(windows: list[tuple[Document, int, int]]) -> list[tuple[Document, in
 
 
 def _ready(embedding_model: str) -> list:
-    return [RAGDocument.status == "ready", RAGDocument.embedding_model == embedding_model]
+    """Chunks of each document's active version only; a version being ingested is unseen."""
+    return [
+        RAGDocument.active_version.is_not(None),
+        RAGChunk.version == RAGDocument.active_version,
+        RAGDocument.embedding_model == embedding_model,
+    ]
 
 
 def _searchable(owner_id: UUID, embedding_model: str, document_ids: list[UUID] | None):
-    """Chunks this owner may search: own, from ready documents, same embedding model."""
+    """Chunks this owner may search: own, active version, same embedding model."""
     conditions = [
         RAGChunk.owner_id == owner_id,
         RAGDocument.owner_id == owner_id,
@@ -89,7 +94,7 @@ def _searchable(owner_id: UUID, embedding_model: str, document_ids: list[UUID] |
 
 
 def _building_searchable(building_id: UUID, embedding_model: str) -> list:
-    """Chunks of one building's ready documents. The chunk FK pins chunk owner = document owner."""
+    """Active chunks of one building's documents. The chunk FK pins chunk owner = document owner."""
     return [
         RAGDocument.building_id == building_id,
         RAGChunk.owner_id == RAGDocument.owner_id,
@@ -171,6 +176,8 @@ class _ScopedRetriever(BaseRetriever):
                 page_content=row.content,
                 metadata={
                     "document_id": row.document_id,
+                    # Expansion reads only this version: after a swap it keeps the anchor.
+                    "version": row.version,
                     "title": row.title,
                     "ordinal": row.ordinal,
                     "page": row.page,
@@ -197,6 +204,7 @@ class _ScopedRetriever(BaseRetriever):
         ranges = [
             and_(
                 RAGChunk.document_id == anchor.metadata["document_id"],
+                RAGChunk.version == anchor.metadata["version"],
                 RAGChunk.ordinal.between(first, last),
             )
             for anchor, first, last in windows
@@ -241,6 +249,7 @@ class _ScopedRetriever(BaseRetriever):
                     await session.execute(
                         select(
                             RAGChunk.document_id,
+                            RAGChunk.version,
                             RAGDocument.title,
                             RAGChunk.ordinal,
                             RAGChunk.page,

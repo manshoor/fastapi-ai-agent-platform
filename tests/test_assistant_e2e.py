@@ -32,7 +32,7 @@ async def runtime(app):
     prefix = f"rag.qa.{uuid4().hex}"
     overrides = {
         "RAG_ENABLED": "true",
-        "KAFKA_RAG_REQUEST_TOPIC": f"{prefix}.requests",
+        "KAFKA_RAG_EVENT_TOPIC": f"{prefix}.events",
         "KAFKA_RAG_DEAD_LETTER_TOPIC": f"{prefix}.dead-letter",
         "KAFKA_RAG_GROUP_ID": prefix,
     }
@@ -40,7 +40,7 @@ async def runtime(app):
         app,
         settings_type=RAGSettings,
         overrides=overrides,
-        topics=[f"{prefix}.requests", f"{prefix}.dead-letter"],
+        topics=[f"{prefix}.events", f"{prefix}.dead-letter"],
         roles=["dispatcher", "rag-worker"],
     ) as children:
         yield children

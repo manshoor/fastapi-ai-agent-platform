@@ -439,9 +439,15 @@ Implementation verification: 543 tests passed in the isolated AI topology, inclu
 RAG (retrieval-augmented generation) answers a question from the owner's own uploaded documents, with citations. It is off unless `RAG_ENABLED=true` **and** `AI_ENABLED=true`; it reuses the AI stack's Kafka, provider, and Collector. `compose.ai.yaml` and `compose.ai.test.yaml` enable it and add a `rag-worker` service.
 
 ```
-upload --> API: auth -> bounded multipart read -> rag_documents(pending) + rag_outbox, one transaction -> 202
-                 dispatcher --> Kafka rag.document-ingest.requested.v1 --> rag-worker
-                 rag-worker: lease -> parse (PDF in a sandboxed child process) -> chunk -> embed -> rag_chunks -> ready
+upload / PUT content --+
+connector-sync --------+--> rag_documents (new version) + rag_outbox, one transaction
+                                 | insert trigger: one delivery row per registered sink
+           dispatcher -----------+--> Kafka rag.document-events.v1 ------> rag-worker
+           rag-dispatcher-sqs ---+--> SQS rag-document-events.fifo ---> rag-worker-sqs
+                both workers: claim (first wins, the duplicate settles)
+                  created/updated: parse (sandboxed: PDF + OCR, Word, HTML) -> chunk -> embed
+                                   -> swap to the new version in one transaction
+                  deleted: purge the tombstone
 query  --> API: auth -> query slot -> admit (rate limit) -> embed question -> owner-scoped pgvector KNN
                  -> neighbor windows (+ optional rerank) -> claims, each with a quote
                  -> server checks every quote and number (+ optional verifier) -> 200
@@ -451,11 +457,11 @@ Start and smoke the local stack (simulator only, no paid calls):
 
 ```bash
 python3 scripts/init_ai_env.py
-docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d --wait api worker rag-worker dispatcher
+docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml up --build -d --wait api worker rag-worker dispatcher rag-dispatcher-sqs rag-worker-sqs
 uv run --locked python scripts/smoke_rag.py
 ```
 
-The smoke uploads a Markdown file and a generated PDF, waits for `ready`, checks that the answer cites the right document, that a second account sees nothing, and that deletion turns the answer into `no_context`. It prints no tokens or content.
+The smoke uploads Markdown, PDF, Word and HTML files (and a scanned PDF when `pdftoppm` is on the host), waits for `ready`, and checks that the answer cites the right document and that a second account sees nothing. It then replaces one document's content and waits for version 2 to be served. Last, it deletes every document, checks each is 404 at once, and checks that the answer becomes `no_context`. It prints no tokens or content.
 
 ### RAG HTTP contract
 
@@ -463,10 +469,11 @@ All routes need `Authorization: Bearer` and return `Cache-Control: no-store`.
 
 | Route | Success | Notes |
 | --- | --- | --- |
-| `POST /api/v1/rag/documents` | 202; 200 on replay of a finished upload | Multipart `title` (1–200 chars) + one `file` (`.txt`, `.md`, `.pdf`). `Idempotency-Key` header. `Location` header. |
-| `GET /api/v1/rag/documents` | 200 | Owner's documents, newest first. |
-| `GET /api/v1/rag/documents/{id}` | 200 | Status, chunk and page counts, error code, timestamps. Never the content. |
-| `DELETE /api/v1/rag/documents/{id}` | 204 | Removes the document, its chunks, outbox rows **and its idempotency record**: the same key can then create a new document. |
+| `POST /api/v1/rag/documents` | 202; 200 on replay of a finished upload | Multipart `title` (1–200 chars) + one `file` (`.txt`, `.md`, `.pdf`, `.docx`, `.html`/`.htm`). `Idempotency-Key` header. `Location` header. |
+| `PUT /api/v1/rag/documents/{id}/content` | 202; 200 for the same content or a replay | Multipart `file` only, same types and limits, `Idempotency-Key`. Starts the next version; queries read the current `active_version` until the new one is ready. 409 while a version is in progress. |
+| `GET /api/v1/rag/documents` | 200 | Owner's uploaded documents, newest first (connector documents are not listed). |
+| `GET /api/v1/rag/documents/{id}` | 200 | Status, `version`, `active_version`, `update_error_code`, `source_kind`, chunk and page counts, error code, timestamps. Never the content. |
+| `DELETE /api/v1/rag/documents/{id}` | 204 | One transaction removes the chunks and the source and leaves a tombstone (404 to every reader) plus a `doc.deleted` event; the worker purges the row and **its idempotency record**, so the same key can then create a new document. |
 | `POST /api/v1/rag/query` | 200 | JSON `question` (1–2,000 chars), `top_k` (1–8, default 4), optional `document_ids` (1–20). Returns `status` (`answered`/`no_context`), `answer`, `citations[{document_id,title,ordinal,page,snippet,quotes}]`. `quotes` are the checked, word-for-word spans the answer relies on. |
 
 Upload errors: 401 before any body byte is read; 400 malformed multipart or disconnect; 408 slow body; 409 key reused with other content; 413 too large; 415 wrong type; 422 bad title, empty file, invalid UTF-8, NUL, or bad PDF header; 429 owner quota or another upload by the same owner in progress; 503 disabled, busy, or global backlog full.
@@ -481,11 +488,53 @@ Query errors: 429 owner rate limit (`Retry-After`); 503 disabled, busy, or provi
 - Worker writes are fenced by status, attempt, lease token, lease generation, and database-clock expiry. A document deleted mid-ingestion stops the worker without writes.
 - Uploaded bytes are deleted when ingestion ends (`ready` or `failed`). Chunk text stays until the owner deletes the document. `rag_queries` keeps usage metadata only, never question or answer text.
 - The LCEL chain runs under `langsmith.tracing_context(enabled=False)`, so `LANGSMITH_TRACING` in the environment cannot export content. Telemetry carries IDs, counts, models, and fixed codes only; the Collector maps embedding, retriever, and chain observation types.
-- PDF parsing runs in a child process with CPU, memory, and file-size limits, a scrubbed environment, and a wall timeout. The Linux container is the supported runtime; on macOS the limits cannot be set, so PDF parsing fails closed.
+- PDF, Word and HTML parsing runs in one child process (`app/rag/extract.py`) with CPU, memory, and file-size limits, a scrubbed environment, and a wall timeout. The Linux container is the supported runtime; on macOS the limits cannot be set, so parsing fails closed.
+- Word: paragraphs and tables in order, headings become the heading path, images ignored; more than 1,000 ZIP entries or 50 MiB uncompressed is refused before parsing. HTML: UTF-8 only, `lxml` with no network or entity resolution, `script`, `style`, `noscript`, `template` and comments dropped.
+- OCR (`RAG_OCR_ENABLED`, default on): a PDF page with fewer than 20 extracted characters is rendered by `pdftoppm` and read by `tesseract`, through pipes only, inside the child's limits. At most `RAG_OCR_MAX_PAGES` (25) pages, `RAG_OCR_PAGE_SECONDS` (20) each, all within the parse timeout; pages past either stay unread. A scan with no text after OCR fails as `no_text`.
+- Versions: a document serves `active_version` while the next one is ingested; the swap to the new version and the removal of the old chunks are one fenced transaction. A failed update keeps the old version served and reports `update_error_code`. One version is in flight per document.
+- Delete keeps its privacy timing: chunks and source go in the delete transaction. The tombstone is purged by the worker when it consumes `doc.deleted`, or by recovery after an hour if the event is lost.
 
-Defaults: text 1 MiB; PDF 5 MiB, 300 pages, 30 s, 1 GiB; 1,000,000 extracted characters; chunks of 1,200 characters with 200 overlap, at most 1,200 per document; 64 chunks per embedding request. 50 documents and 5 unsettled per owner; 100 unsettled globally; one upload per owner and 4 uploads and 4 queries per API process; 10 queries per 60 s per owner. Embeddings use `text-embedding-3-small` (1,536 dimensions) in pgvector 0.8.7 with an HNSW cosine index. Pools: API 10 + dispatcher 2 + worker 4 + rag-worker 4 = 20 of PostgreSQL's 100.
+Defaults: text and HTML 1 MiB; PDF and Word 5 MiB; PDF 300 pages, 30 s, 1 GiB; 1,000,000 extracted characters; chunks of 1,200 characters with 200 overlap, at most 1,200 per document; 64 chunks per embedding request. 50 documents and 5 unsettled per owner; 100 unsettled globally; one upload per owner and 4 uploads and 4 queries per API process; 10 queries per 60 s per owner. Embeddings use `text-embedding-3-small` (1,536 dimensions) in pgvector 0.8.7 with an HNSW cosine index. Pools: API 10 + dispatcher 2 + worker 4 + rag-worker 4 + rag-dispatcher-sqs 2 + rag-worker-sqs 4 + connector-sync 2 = 28 of PostgreSQL's 100.
 
-With `compose.ai.live.yaml`, the rag-worker pays for document embeddings and the API pays for question embeddings and answers. The same paid-use authorisation applies.
+With `compose.ai.live.yaml`, `rag-worker` and `rag-worker-sqs` pay for document embeddings (either may claim a document first) and the API pays for question embeddings and answers. The same paid-use authorisation applies.
+
+### Document events and sinks
+
+Every document change writes one `rag_outbox` row: `doc.created`, `doc.updated`, `doc.deleted`, or a dead letter. The event (`DocumentEvent` v1) carries its id, type, document id and version, attempt, `source_kind` and time; never a title, text or connector detail.
+
+| Sink | Where | Publisher | Consumer |
+| --- | --- | --- | --- |
+| Kafka | `rag.document-events.v1` (6 partitions, key = document id); DLQ `rag.document-events.dead-letter.v1` | `dispatcher` | `rag-worker` |
+| SQS (local ElasticMQ 1.6.14) | FIFO `rag-document-events.fifo`, group = document id; DLQ `rag-document-events-dlq.fifo` | `rag-dispatcher-sqs` (`python -m app.rag.sinks`) | `rag-worker-sqs` (`python -m app.rag.sqs_worker`) |
+
+- Sinks are registered in `rag_event_sinks` (`kafka` by the migration, `sqs` by its dispatcher on start). An insert trigger gives every new outbox row one `rag_outbox_deliveries` row per registered sink, so no write path can miss one and a sink registered later never replays history.
+- Each sink claims, sends and acknowledges its own delivery rows, and each publisher is its own process: one broker down never holds back the other. A still-pending ingest event is redispatched per sink.
+- Both workers claim through the same fence (status, version, attempt, lease), so the first claim wins and the duplicate settles with no writes. The SQS worker deletes a message only after the outcome is committed, puts a deferred one back in 5 s, extends visibility while it works, handles at most `AI_CONCURRENCY` at once, and sends malformed messages to the DLQ with fixed fields only. There is no redrive policy.
+- `RAG_EVENT_SINKS` is `kafka` (default) or `kafka,sqs` (`compose.ai.yaml`). With `sqs`, `RAG_SQS_ENDPOINT` is required; the client uses fixed local credentials, no AWS config or credential files, no proxy environment and no retries. Real AWS SQS is not tested.
+- A registered sink stays registered. To stop SQS for good, stop its services and run `DELETE FROM rag_event_sinks WHERE sink = 'sqs'`; its unpublished deliveries are removed when their documents are.
+
+### Database and API connectors
+
+`connector-sync` (`python -m app.rag.connectors`, Compose profile `connectors`) pulls records into building documents owned by a manager of that building. Connectors are operator config only (`RAG_CONNECTORS_FILE`, read once at start; no route creates them). `docker/connectors/connectors.example.yaml` shows both kinds; its placeholder ids make every run fail with `owner_not_manager` until you set a real building and manager.
+
+| Kind | Source | Bounds |
+| --- | --- | --- |
+| `postgres` | One `SELECT` (no `;` or comments) returning `external_id`, `title`, `content`; DSN from the variable named by `dsn_env` | `READ ONLY` transaction, 10 s statement timeout, `max_records` (≤ 5,000), per-row and 64 MiB total text, bounded read-ahead |
+| `http_json` | `GET url`, items at `items_path`, field names for id, title and content, `none`/`page`/`cursor` paging, optional `Authorization` from `auth_header_env` | https unless the host is in `allowed_hosts`; no redirects or proxy environment; 10 s per request, 120 s per fetch, 5 MiB per response (gzip inflated under the cap, other encodings refused), `max_pages` (≤ 100) |
+
+- One runner per connector across processes (PostgreSQL advisory lock); each run checks that the owner still manages the building. New id: document and `doc.created`. Changed content: next version and `doc.updated`. Same content: nothing (a title change is applied in place; a version that ran out of time or attempts is retried). Duplicate ids in one fetch: the first wins.
+- Only a complete, non-empty fetch with no cap hit deletes: documents whose ids were not seen get a tombstone and `doc.deleted`. A partial, failed, malformed or empty fetch deletes nothing, so the sync can never remove a source's last record. Documents left in another building or owner by an earlier config are removed at the start of a run.
+- Connector documents are refused (409) by the document update and delete routes, do not count toward owner upload quotas, and are capped in progress by `RAG_CONNECTOR_UNSETTLED_LIMIT` (20).
+- `rag_connector_runs` keeps counts and fixed error codes only; logs keep the connector name and exception type. Nothing stores or logs content, queries, URLs or DSNs.
+- Known limits: page mode can miss a record that shifts pages during a fetch (its document is removed and re-created next run); documents of a removed connector stay until an operator acts; postgres DSNs are not forced to TLS; run rows are not pruned.
+
+Local fakes on the internal `connector_sources` network: `source-db` (seeded `notices`, a read-only role) and `source-api` (`tests/support/source_api.py`, paged, with `/control/records/{id}` to change records). The connector smoke runs inside the stack, creates its own manager and connectors, changes and restores the fakes:
+
+```bash
+docker compose --env-file .ai-local/.env -p fastapi-ai-local -f compose.ai.yaml --profile connectors run --build --rm -e SOURCE_DB_ADMIN_DSN=postgresql://source_admin:local-fake-source-only@source-db:5432/notices connector-sync python scripts/smoke_connectors.py
+```
+
+Real sources need their own egress overlay and private env file; the fake credentials above are for the local fakes only.
 
 ### Answer grounding
 

@@ -1,14 +1,17 @@
 """Exercise isolated RAG upload, ingestion and query over real HTTP, with no paid service.
 
-    register two accounts -> upload Markdown + PDF -> wait for ready
+    register two accounts -> upload Markdown, PDF, Word, HTML (+ a scanned PDF when
+      pdftoppm is on this host) -> wait for ready
       -> owner query cites the right document -> stranger sees nothing
-      -> delete -> the same query has no context
+      -> new content (PUT) -> version 2 becomes active, still answered
+      -> delete -> 404 at once -> the same query has no context
 
 Prints no bearer tokens, document text or answers.
 """
 
 import argparse
 import importlib.util
+import shutil
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -21,6 +24,12 @@ QUERY = "/api/v1/rag/query"
 SETTLED = frozenset({"ready", "failed"})
 PUMP = "# Pump manual\n\nThe synthetic pump runs at 40 litres per minute when the valve is open."
 GARDEN = "Water the synthetic tomato plants every morning during the summer."
+PUMP_V2 = "# Pump manual\n\nThe upgraded synthetic pump runs at 55 litres per minute."
+HTML = (
+    "<html><head><title>Lift notes</title><script>secret()</script></head><body>"
+    "<h1>Lift</h1><p>The synthetic lift is serviced every Wednesday morning.</p></body></html>"
+)
+SCAN = "The synthetic boiler room key hangs in the caretaker office."
 
 
 def _load(name: str, relative: str):
@@ -33,6 +42,7 @@ def _load(name: str, relative: str):
 
 _smoke_ai = _load("smoke_ai", "scripts/smoke_ai.py")
 _pdfs = _load("smoke_pdfs", "tests/support/pdfs.py")
+_docx = _load("smoke_docx", "tests/support/docx_files.py")
 expect = _smoke_ai.expect
 
 
@@ -54,11 +64,17 @@ def _upload(client: httpx.Client, owner: dict, title: str, name: str, data: byte
     return expect(response, 202).json()["id"]
 
 
-def _wait_ready(client: httpx.Client, owner: dict, document_id: str, deadline: float) -> dict:
+def _wait_ready(
+    client: httpx.Client, owner: dict, document_id: str, deadline: float, version: int = 1
+) -> dict:
+    """Until the given version is the one served; a failed version fails the smoke."""
     while True:
         document = expect(client.get(f"{DOCUMENTS}/{document_id}", headers=owner), 200).json()
-        if document["status"] in SETTLED:
-            assert document["status"] == "ready", f"Ingestion failed: {document['error_code']}"
+        assert document["status"] != "failed", f"Ingestion failed: {document['error_code']}"
+        assert document["update_error_code"] is None, (
+            f"Update failed: {document['update_error_code']}"
+        )
+        if document["status"] in SETTLED and document["active_version"] == version:
             return document
         if time.monotonic() >= deadline:
             raise AssertionError("Ingestion deadline exceeded")
@@ -76,11 +92,19 @@ def run_smoke(base_url: str, *, timeout_seconds: float = 60) -> None:
         expect(client.get("/health/ready"), 200)
         owner, stranger = _account(client), _account(client)
 
-        # Upload one Markdown and one PDF document, then wait for the worker.
+        # Upload every accepted format, then wait for the workers (Kafka and SQS).
         pump = _upload(client, owner, "Pump manual", "pump.md", PUMP.encode())
         garden = _upload(client, owner, "Garden notes", "garden.pdf", _pdfs.text_pdf([GARDEN]))
+        word = _upload(client, owner, "Word manual", "manual.docx", _docx.word_file())
+        lift = _upload(client, owner, "Lift notes", "lift.html", HTML.encode())
+        uploaded = [pump, garden, word, lift]
+        if shutil.which("pdftoppm"):
+            # The scan builder renders pages with pdftoppm on this host.
+            uploaded.append(
+                _upload(client, owner, "Scanned note", "scan.pdf", _pdfs.scanned_pdf([SCAN]))
+            )
         deadline = time.monotonic() + timeout_seconds
-        for document_id in (pump, garden):
+        for document_id in uploaded:
             document = _wait_ready(client, owner, document_id, deadline)
             assert document["chunk_count"] >= 1, "Ready document has no chunks"
 
@@ -98,9 +122,21 @@ def run_smoke(base_url: str, *, timeout_seconds: float = 60) -> None:
         assert _ask(client, stranger, question)["status"] == "no_context"
         assert _ask(client, stranger, question, document_ids=[pump])["status"] == "no_context"
 
-        # Deleting removes the chunks from search.
-        for document_id in (pump, garden):
+        # New content: version 2 is ingested while version 1 is still served.
+        headers = {**owner, "Idempotency-Key": f"smoke-{uuid4().hex}"}
+        updated = client.put(
+            f"{DOCUMENTS}/{pump}/content",
+            headers=headers,
+            files={"file": ("pump.md", PUMP_V2.encode())},
+        )
+        assert expect(updated, 202).json()["version"] == 2
+        _wait_ready(client, owner, pump, time.monotonic() + timeout_seconds, 2)
+        assert _ask(client, owner, question, document_ids=[pump])["status"] == "answered"
+
+        # Deleting hides a document at once (a doc.deleted event purges it later).
+        for document_id in uploaded:
             expect(client.delete(f"{DOCUMENTS}/{document_id}", headers=owner), 204)
+            expect(client.get(f"{DOCUMENTS}/{document_id}", headers=owner), 404)
         assert _ask(client, owner, question)["status"] == "no_context"
 
 
@@ -117,7 +153,7 @@ def main() -> None:
         parser.error("unsafe smoke destination; select the isolated AI API")
     except httpx.HTTPError:
         raise SystemExit("RAG smoke HTTP transport failed (details withheld)") from None
-    print("PASS: upload, ingestion, cited answer, owner isolation, delete")
+    print("PASS: formats, ingestion, cited answer, owner isolation, update, delete")
 
 
 if __name__ == "__main__":
