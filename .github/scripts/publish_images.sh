@@ -69,7 +69,11 @@ add_platform() {
     '[.[] | select((.RepoTags // []) | index($tag))] | select(length == 1) | .[0].Config') ||
     fail "$archive does not hold exactly one $reference"
   config="$work/$image-$platform.config"
-  tar -xOf "$archive" "$config_path" > "$config"
+  # `docker save` names every blob by its digest. Anything else could be a tar option.
+  if [[ ! "$config_path" =~ ^blobs/sha256/[0-9a-f]{64}$ ]]; then
+    fail "$archive names an unexpected config for $reference"
+  fi
+  tar -xOf "$archive" -- "$config_path" > "$config"
   jq -e --arg arch "$platform" --arg commit "$commit" '
     .os == "linux" and .architecture == $arch
     and .config.Labels["org.opencontainers.image.revision"] == $commit' "$config" > /dev/null ||
@@ -78,6 +82,10 @@ add_platform() {
   # Compress now, so the digests below are final.
   skopeo copy --quiet --format v2s2 --dest-compress \
     "docker-archive:$archive:$reference" "dir:$single" >&2
+  # skopeo picks its own archive entry: it must be the one checked above.
+  if [[ "$(jq -er .config.digest "$single/manifest.json")" != "$(digest_of "$config")" ]]; then
+    fail "$reference in $archive is not the checked image"
+  fi
   manifest=$(digest_of "$single/manifest.json")
   mv "$single/manifest.json" "$folder/${manifest#sha256:}.manifest.json"
   mv "$single/version" "$folder/version"
