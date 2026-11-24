@@ -185,6 +185,9 @@ jobs:
             registry:3.1.1@sha256:325b4b29b041e82803abeb703e201655e4e23ab83264ec1a7c9ddb0a5b14a6e0
           curl --fail --silent --show-error --retry 15 --retry-delay 1 --retry-all-errors \
             http://localhost:5000/v2/
+      # The throwaway registry takes any login: this tests the login command itself.
+      - name: Log in to the throwaway registry
+        run: printf '%s' unused | skopeo login --tls-verify=false --username ci --password-stdin localhost:5000
       - name: Publish to the throwaway registry
         id: publish
         run: .github/scripts/publish_images.sh "$REGISTRY" "$GITHUB_SHA" archives >> "$GITHUB_OUTPUT"
