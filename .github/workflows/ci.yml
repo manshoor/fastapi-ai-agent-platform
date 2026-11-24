@@ -201,6 +201,8 @@ jobs:
             for arch in amd64 arm64; do
               docker pull --quiet --platform "linux/$arch" "$REGISTRY/$image"
               test "$(docker image inspect --format '{{.Architecture}}' "$REGISTRY/$image")" = "$arch"
+              # The runner's image store keeps one platform per index digest.
+              docker image rm "$REGISTRY/$image" > /dev/null
             done
           done
       - name: Stop the registry
