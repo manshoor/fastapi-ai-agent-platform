@@ -28,6 +28,12 @@ USER app
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-keep-alive", "2", "--timeout-graceful-shutdown", "15"]
 
+# The fake OpenAI server for the Kubernetes demo, published beside the app image.
+FROM runtime AS simulator
+COPY --chown=app:app tests/support/provider_simulator.py ./tests/support/provider_simulator.py
+EXPOSE 8080
+CMD ["python", "tests/support/provider_simulator.py", "--host", "0.0.0.0", "--port", "8080"]
+
 FROM runtime AS test
 USER root
 COPY --chown=app:app tests ./tests
@@ -36,6 +42,8 @@ COPY --chown=app:app observability/collector.verify.yaml ./observability/collect
 # Read by tests/test_ai_langfuse.py.
 COPY --chown=app:app observability/collector.yaml observability/collector.langfuse.yaml ./observability/
 COPY --chown=app:app compose.ai.langfuse.yaml ./
+# Read by tests/test_delivery.py.
+COPY --chown=app:app .github ./.github
 RUN uv sync --locked --no-editable \
     && chmod -R a+rX /opt/venv \
     && chown -R app:app /app

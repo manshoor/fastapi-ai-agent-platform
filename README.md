@@ -2,7 +2,7 @@
 
 A local, runnable API with built-in accounts, PostgreSQL persistence, async SQLAlchemy, and Redis detail caching with **at most five seconds of cache staleness** under the assumptions below. An opt-in, isolated [durable item-rewrite stack](#durable-item-rewriting) adds Apache Kafka, an async OpenAI worker, and local OpenTelemetry verification. Python 3.13, uv, Docker Compose, and a reproducible Locust harness are included. The requested 15,000–30,000 concurrent-user target is **not verified capacity**.
 
-> **Local development/measurement only.** PostgreSQL is deliberately pinned to the user-selected prerelease `postgres:19rc1-bookworm`. Accept its prerelease risks; do not treat this stack as a production deployment. HTTP binds to loopback. The optional [TLS edge](#optional-tls-edge) adds local TLS and per-address request limits; it is not a production reverse proxy or abuse protection. There is no deployment automation.
+> **Local development/measurement only.** PostgreSQL is deliberately pinned to the user-selected prerelease `postgres:19rc1-bookworm`. Accept its prerelease risks; do not treat this stack as a production deployment. HTTP binds to loopback. The optional [TLS edge](#optional-tls-edge) adds local TLS and per-address request limits; it is not a production reverse proxy or abuse protection. CI publishes [container images](#container-images); nothing deploys them.
 
 ## Start the stack
 
@@ -193,6 +193,40 @@ docker compose start db
 # Allow readiness to recover, then prove fresh writes/reads/deletes again:
 curl --fail http://127.0.0.1:8000/health/ready
 uv run --locked python scripts/smoke.py
+```
+
+## Container images
+
+Every `main` commit whose CI passes is published to GHCR (GitHub's registry) as public images for `linux/amd64` and `linux/arm64`. A `main` run replaced by a newer one while it waits publishes nothing, so that commit has no image.
+
+| Image | Contents |
+| --- | --- |
+| `ghcr.io/manshoor/fastapi-ai-agent-platform` | The app: API, migrations, dispatchers, workers, connectors |
+| `ghcr.io/manshoor/fastapi-ai-agent-platform-postgres` | PostgreSQL 19 rc1 with pgvector |
+| `ghcr.io/manshoor/fastapi-ai-agent-platform-simulator` | The fake OpenAI server (`Dockerfile` target `simulator`), for demos only |
+
+The only tag is `sha-<40-hex commit>`; there is no `latest`. Pin the digest too.
+
+- `image` builds natively on each platform with no shared cache and a read-only token, imports every entry point, runs `scripts/smoke.py` on the built images through `compose.image.yaml`, checks the simulator, and saves those exact images for one day.
+- `publish-check` (pull requests) runs `.github/scripts/publish_images.sh` against a throwaway registry and pulls both platforms.
+- `publish` (`main` pushes only) needs `lint`, `test`, `ai-qa` and `image`. It is the only job with write permissions, and it builds nothing. The same script pushes the saved images, checks that each pushed config digest equals the archive's, and `actions/attest` signs a build record for each index digest.
+
+Re-running a failed `publish` within a day reuses the saved images. After that, re-run all jobs: the images are rebuilt and tested again, so their digests change.
+
+Check that an image came from this repository's `main` at a commit (needs `gh` signed in):
+
+```bash
+commit=...  # 40 hex characters
+gh attestation verify "oci://ghcr.io/manshoor/fastapi-ai-agent-platform:sha-$commit" \
+  --repo manshoor/fastapi-ai-agent-platform \
+  --signer-workflow manshoor/fastapi-ai-agent-platform/.github/workflows/ci.yml \
+  --source-ref refs/heads/main --source-digest "$commit" --deny-self-hosted-runners
+```
+
+To run local images with Compose, set `APP_IMAGE` and `POSTGRES_IMAGE`. The overlay never builds or pulls them, so pull or build them first:
+
+```bash
+docker compose -f compose.yaml -f compose.image.yaml up -d --wait api
 ```
 
 ## Durable item rewriting

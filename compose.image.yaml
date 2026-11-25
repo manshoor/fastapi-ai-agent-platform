@@ -1,0 +1,18 @@
+# Overlay for compose.yaml: run prebuilt images instead of building. CI smoke-tests
+# the exact images it later publishes this way.
+# APP_IMAGE=... POSTGRES_IMAGE=... docker compose -f compose.yaml -f compose.image.yaml up -d
+services:
+  db:
+    image: ${POSTGRES_IMAGE:?Set POSTGRES_IMAGE to a prebuilt PostgreSQL image}
+    build: !reset null
+    pull_policy: never
+
+  migrate:
+    image: ${APP_IMAGE:?Set APP_IMAGE to a prebuilt app image}
+    build: !reset null
+    pull_policy: never
+
+  api:
+    image: ${APP_IMAGE:?Set APP_IMAGE to a prebuilt app image}
+    build: !reset null
+    pull_policy: never
