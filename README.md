@@ -245,7 +245,7 @@ Docker Compose is the supported way to run the app. This demo shows the publishe
 - `manifests` renders `deploy/app`, runs `scripts/check_deploy.py`, and re-checks every image pin's signed build record.
 - `cluster` runs `scripts/gitops_cluster.py up` at the PR head, then `scripts/smoke_gitops.py`: Synced and Healthy at that commit, `scripts/smoke.py` through a loopback port-forward, Argo CD undoing a manual scale to 0, and a failing migration that must leave the API pods alone. It proves amd64 only.
 
-A pull request from a fork fails `cluster`: Argo CD reads only this repository.
+A pull request from a fork runs its own code in these jobs, with a read-only token and no secrets.
 
 Check the manifests without a cluster:
 
@@ -261,9 +261,11 @@ uv run --locked python scripts/promote_images.py rollback <commit>  # app, simul
 uv run --locked python scripts/promote_images.py verify
 ```
 
-Add `--postgres` to `promote` to move PostgreSQL too. `rollback` never moves `migrate`: an older image cannot run `alembic upgrade` on a newer schema. So a migration must stay usable by the previous app version.
+Add `--postgres` to `promote` to move PostgreSQL too. `rollback` never moves `migrate`, and `verify` refuses a `migrate` or `postgres` pin older than where the branch left `main` (on `main`, than the commit before): an older image cannot run `alembic upgrade` on a newer schema. So a migration must stay usable by the previous app version.
 
-`gitops_cluster.py` needs `kind` and `kubectl`. It creates and deletes only the cluster `fastapi-gitops`, always names that context, and refuses a server that is not on this machine. Like any `kind create`, it makes that context the current one. It creates the Secrets over stdin and never replaces them; git holds none, and the Argo CD project does not allow any. `down` deletes the cluster and its data.
+`gitops_cluster.py` needs `kind` and `kubectl`. It creates and deletes only the cluster `fastapi-gitops`, always names that context, and refuses a Docker endpoint that is not a local socket and an API server that is not on this machine. It keeps its own kubeconfig in `.gitops-local/` (private, never committed), so your current context does not change; use `kubectl --kubeconfig .gitops-local/kubeconfig`. It creates the Secrets over stdin and never replaces them; git holds none, and the Argo CD project does not allow any. `down` deletes the cluster and its data.
+
+Argo CD's manifest is checked against an exact SHA-256, but the images it names are tags, not digests.
 
 This is a demo: PostgreSQL is a prerelease, there is one database pod, no TLS and no network rules yet.
 
