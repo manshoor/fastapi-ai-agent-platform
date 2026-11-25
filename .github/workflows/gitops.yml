@@ -14,7 +14,14 @@ on:
       - scripts/gitops_cluster.py
       - scripts/promote_images.py
       - scripts/smoke.py
+      - scripts/smoke_ai.py
+      - scripts/smoke_assistant.py
       - scripts/smoke_gitops.py
+      - scripts/smoke_rag.py
+      # Loaded by those smokes.
+      - app/assistant/totp.py
+      - tests/support/docx_files.py
+      - tests/support/pdfs.py
       - .github/workflows/gitops.yml
   pull_request:
     paths: *paths
@@ -88,12 +95,19 @@ jobs:
           curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/bin/kind" "$KIND_URL"
           echo "$KIND_SHA256  $RUNNER_TEMP/bin/kind" | sha256sum --check --strict
           chmod +x "$RUNNER_TEMP/bin/kind"
+      # For the OCR smoke's scanned page.
+      - name: Install poppler
+        timeout-minutes: 2
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends poppler-utils
+          command -v pdftoppm
       # Step limits: the job limit would cancel the job and skip the logs below.
       - name: Start the cluster
-        timeout-minutes: 7
+        timeout-minutes: 5
         run: uv run --locked python scripts/gitops_cluster.py up --revision "$REVISION"
       - name: Smoke-test the cluster
-        timeout-minutes: 16
+        timeout-minutes: 17
         run: uv run --locked python scripts/smoke_gitops.py --revision "$REVISION"
       # Never Secrets.
       - name: Show pods, events and logs
@@ -103,10 +117,10 @@ jobs:
           kube=(kubectl --kubeconfig .gitops-local/kubeconfig --context kind-fastapi-gitops)
           "${kube[@]}" get pods --all-namespaces --output wide || true
           "${kube[@]}" --namespace argocd get application fastapi-demo --output yaml || true
-          "${kube[@]}" --namespace fastapi-demo get deployments,statefulsets,jobs,services,persistentvolumeclaims --output wide || true
+          "${kube[@]}" --namespace fastapi-demo get deployments,statefulsets,jobs,services,persistentvolumeclaims,networkpolicies --output wide || true
           "${kube[@]}" --namespace fastapi-demo describe pods || true
           "${kube[@]}" get events --all-namespaces --sort-by .lastTimestamp || true
-          for name in db redis migrate api; do
+          for name in db redis kafka provider migrate topic-init api dispatcher worker rag-worker; do
             "${kube[@]}" --namespace fastapi-demo logs --selector "app.kubernetes.io/name=$name" --all-containers --prefix --tail 100 || true
           done
           for name in argocd-application-controller argocd-repo-server; do
@@ -114,5 +128,5 @@ jobs:
           done
       - name: Delete the cluster
         if: always()
-        timeout-minutes: 2
+        timeout-minutes: 1
         run: uv run --locked python scripts/gitops_cluster.py down

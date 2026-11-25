@@ -3,6 +3,8 @@
 import copy
 import importlib.util
 import json
+import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -137,6 +139,38 @@ def test_port_forward_output_gives_the_port():
     assert not smoke.FORWARDING.match("Forwarding from 0.0.0.0:40123 -> 8000\n")
 
 
+def test_the_ai_smokes_need_the_ocr_tool(monkeypatch):
+    # smoke_rag.py would skip OCR silently.
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: None)
+    monkeypatch.setattr(smoke, "_run_smokes", lambda _: pytest.fail("ran without OCR"))
+    with pytest.raises(smoke.SmokeError, match="pdftoppm"):
+        smoke._check_ai()
+
+
+def test_smokes_share_one_port_forward_and_stop_at_a_failure(monkeypatch):
+    commands = []
+
+    @contextmanager
+    def forward():
+        yield "http://127.0.0.1:40123"
+
+    def run(command, check, timeout):
+        commands.append((Path(command[1]).name, command[2:], timeout))
+        return subprocess.CompletedProcess(command, len(commands) == 2)
+
+    monkeypatch.setattr(smoke, "_port_forward", forward)
+    monkeypatch.setattr(smoke.subprocess, "run", run)
+    with pytest.raises(smoke.SmokeError, match="smoke_rag.py failed"):
+        smoke._run_smokes(smoke.AI_SMOKES)
+    url = ["--base-url", "http://127.0.0.1:40123"]
+    assert commands == [("smoke_ai.py", url, 60), ("smoke_rag.py", url, 90)]
+
+
+def test_every_smoke_exists():
+    for script in {**smoke.CORE_SMOKES, **smoke.AI_SMOKES}:
+        assert (ROOT / "scripts" / script).is_file()
+
+
 def test_waiting_gives_up(monkeypatch):
     monkeypatch.setattr(smoke, "POLL_SECONDS", 0)
     with pytest.raises(smoke.SmokeError, match="timed out"):
@@ -181,6 +215,7 @@ def test_the_waits_fit_their_step_and_the_job():
     limits = [
         minutes[name]
         for name in (
+            "Install poppler",
             "Start the cluster",
             "Smoke-test the cluster",
             "Show pods, events and logs",
@@ -192,8 +227,9 @@ def test_the_waits_fit_their_step_and_the_job():
     assert sum(limits) <= job["timeout-minutes"] - 3
     waits = (
         smoke.SYNC_SECONDS
-        + smoke.FORWARD_SECONDS
-        + smoke.SMOKE_SECONDS
+        + 2 * smoke.FORWARD_SECONDS
+        + sum(smoke.CORE_SMOKES.values())
+        + sum(smoke.AI_SMOKES.values())
         + smoke.HEAL_SECONDS
         + smoke.FAIL_SECONDS
         + smoke.START_SECONDS

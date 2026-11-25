@@ -566,7 +566,13 @@ GITOPS_PATHS = [
     "scripts/gitops_cluster.py",
     "scripts/promote_images.py",
     "scripts/smoke.py",
+    "scripts/smoke_ai.py",
+    "scripts/smoke_assistant.py",
     "scripts/smoke_gitops.py",
+    "scripts/smoke_rag.py",
+    "app/assistant/totp.py",
+    "tests/support/docx_files.py",
+    "tests/support/pdfs.py",
     ".github/workflows/gitops.yml",
 ]
 INSTALL_KUBECTL = """\
@@ -581,6 +587,11 @@ curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/bi
 echo "$KIND_SHA256  $RUNNER_TEMP/bin/kind" | sha256sum --check --strict
 chmod +x "$RUNNER_TEMP/bin/kind"
 """
+INSTALL_POPPLER = """\
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends poppler-utils
+command -v pdftoppm
+"""
 SETUP_RUNS = [None, None, "uv python install 3.13", "uv sync --locked", INSTALL_KUBECTL]
 MANIFESTS_RUNS = [
     *SETUP_RUNS,
@@ -592,6 +603,7 @@ DUMP_STEP = "Show pods, events and logs"
 CLUSTER_RUNS = [
     *SETUP_RUNS,
     INSTALL_KIND,
+    INSTALL_POPPLER,
     'uv run --locked python scripts/gitops_cluster.py up --revision "$REVISION"',
     'uv run --locked python scripts/smoke_gitops.py --revision "$REVISION"',
     DUMP_STEP,
@@ -605,7 +617,8 @@ DUMP_LINE = re.compile(
     r"|\"\$\{kube\[@\]\}\" (--namespace [\w-]+ )?"
     r"(get pods --all-namespaces --output wide"
     r"|get application fastapi-demo --output yaml"
-    r"|get deployments,statefulsets,jobs,services,persistentvolumeclaims --output wide"
+    r"|get deployments,statefulsets,jobs,services,persistentvolumeclaims,networkpolicies"
+    r" --output wide"
     r"|describe pods"
     r"|get events --all-namespaces --sort-by \.lastTimestamp"
     r"|logs --selector \"app\.kubernetes\.io/name=\$name\" --all-containers --prefix --tail \d+"
@@ -715,6 +728,8 @@ GITOPS_EDITS = [
     ("verify-shell", rule_gitops_steps, VERIFY, VERIFY + "        shell: bash {0} || true\n"),
     ("no-verify", rule_gitops_steps, VERIFY, "        run: 'true'\n"),
     ("check-or-true", rule_gitops_steps, CHECK, "        run: true || python check_deploy.py"),
+    ("no-poppler", rule_gitops_steps, "          command -v pdftoppm\n", ""),
+    ("no-smoke-path", rule_gitops_triggers, "      - scripts/smoke_rag.py\n", ""),
     ("job-if", rule_gitops_steps, "  manifests:\n", "  manifests:\n    if: false\n"),
     ("job-ignored", rule_gitops_steps, "  cluster:\n", "  cluster:\n    continue-on-error: true\n"),
     ("shell-env", rule_gitops_steps, "\nenv:\n", "\nenv:\n  BASH_ENV: x.sh\n"),
@@ -743,8 +758,8 @@ GITOPS_EDITS = [
     (
         "dump-yaml",
         rule_gitops_dump,
-        "persistentvolumeclaims --output wide",
-        "persistentvolumeclaims --output yaml",
+        "networkpolicies --output wide",
+        "networkpolicies --output yaml",
     ),
     ("dump-env", rule_gitops_dump, "          kube=(", "          env\n          kube=("),
     ("dump-chain", rule_gitops_dump, "describe pods || true", "describe pods || true; env"),
