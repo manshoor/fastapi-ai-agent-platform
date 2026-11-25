@@ -229,6 +229,46 @@ To run local images with Compose, set `APP_IMAGE` and `POSTGRES_IMAGE`. The over
 docker compose -f compose.yaml -f compose.image.yaml up -d --wait api
 ```
 
+## GitOps demo
+
+Docker Compose is the supported way to run the app. This demo shows the published images run by Argo CD (a tool that makes a Kubernetes cluster match a git folder) in a throwaway kind cluster (Kubernetes inside Docker). CI creates and deletes that cluster; nothing is deployed to a real server.
+
+| Path | Contents |
+| --- | --- |
+| `deploy/app/` | Kustomize files: `db` and `redis`, then the `migrate` Job, then two `api` pods with the AI features off |
+| `deploy/app/images/` | Image pins (commit tag and digest), written only by `scripts/promote_images.py` |
+| `deploy/argocd/` | The Argo CD project (six allowed kinds, this repository, one namespace) and Application |
+| `deploy/kind/cluster.yaml` | The cluster, with its node image pinned by digest |
+
+`.github/workflows/gitops.yml` runs when these files or their scripts change, with a read-only token:
+
+- `manifests` renders `deploy/app`, runs `scripts/check_deploy.py`, and re-checks every image pin's signed build record.
+- `cluster` runs `scripts/gitops_cluster.py up` at the PR head, then `scripts/smoke_gitops.py`: Synced and Healthy at that commit, `scripts/smoke.py` through a loopback port-forward, Argo CD undoing a manual scale to 0, and a failing migration that must leave the API pods alone. It proves amd64 only.
+
+A pull request from a fork runs its own code in these jobs, with a read-only token and no secrets.
+
+Check the manifests without a cluster:
+
+```bash
+kubectl kustomize deploy/app | uv run --locked python scripts/check_deploy.py
+```
+
+Move the pins to a published commit, then open a pull request (needs `git` and a signed-in `gh`; fetch `main` first):
+
+```bash
+uv run --locked python scripts/promote_images.py promote <commit>   # app, migrate, simulator
+uv run --locked python scripts/promote_images.py rollback <commit>  # app, simulator only
+uv run --locked python scripts/promote_images.py verify
+```
+
+Add `--postgres` to `promote` to move PostgreSQL too. `rollback` never moves `migrate`, and `verify` refuses a `migrate` or `postgres` pin older than where the branch left `main` (on `main`, than the commit before): an older image cannot run `alembic upgrade` on a newer schema. So a migration must stay usable by the previous app version.
+
+`gitops_cluster.py` needs `kind` and `kubectl`. It creates and deletes only the cluster `fastapi-gitops`, always names that context, and refuses a Docker endpoint that is not a local socket and an API server that is not on this machine. It keeps its own kubeconfig in `.gitops-local/` (private, never committed), so your current context does not change; use `kubectl --kubeconfig .gitops-local/kubeconfig`. It creates the Secrets over stdin and never replaces them; git holds none, and the Argo CD project does not allow any. `down` deletes the cluster and its data.
+
+Argo CD's manifest is checked against an exact SHA-256, but the images it names are tags, not digests.
+
+This is a demo: PostgreSQL is a prerelease, there is one database pod, no TLS and no network rules yet.
+
 ## Durable item rewriting
 
 Rewriting is disabled in the normal application unless `AI_ENABLED=true`. Enabling the API alone does not start business loops: the API, outbox dispatcher, and Kafka worker are separate processes. PostgreSQL remains authoritative; Redis is not used for jobs or input snapshots. Apply the new Alembic migration before running any updated image, including the normal test image.

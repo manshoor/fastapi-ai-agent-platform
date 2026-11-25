@@ -1,0 +1,28 @@
+# The GitOps demo, synced by Argo CD (see README "GitOps demo"). One file per service;
+# a new service is one more file here. Waves: 0 db, redis -> 1 migrate -> 2 api.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: fastapi-demo
+
+resources:
+  - db.yaml
+  - redis.yaml
+  - migrate.yaml
+  - api.yaml
+
+# Image pins, written only by scripts/promote_images.py.
+components:
+  - images
+
+# Non-secret settings only. Secrets are created by scripts/gitops_cluster.py.
+configMapGenerator:
+  - name: database-settings
+    literals:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=app
+      - DB_USER=app
+  - name: api-settings
+    literals:
+      - REDIS_URL=redis://redis:6379/0
+      - AUTH_TOKEN_TTL_SECONDS=900

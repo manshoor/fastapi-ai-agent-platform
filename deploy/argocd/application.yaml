@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fastapi-demo
+  namespace: argocd
+spec:
+  project: fastapi-demo
+  source:
+    repoURL: https://github.com/manshoor/fastapi-ai-agent-platform.git
+    # scripts/gitops_cluster.py up --revision replaces this with a commit.
+    targetRevision: main
+    path: deploy/app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fastapi-demo
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # An old ConfigMap outlives the pods that use it.
+      - PruneLast=true
+    # A failed sync of one commit is never retried later, so retry a little here.
+    retry:
+      limit: 2
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 30s

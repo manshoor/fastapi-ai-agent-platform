@@ -44,6 +44,8 @@ COPY --chown=app:app observability/collector.yaml observability/collector.langfu
 COPY --chown=app:app compose.ai.langfuse.yaml ./
 # Read by tests/test_delivery.py.
 COPY --chown=app:app .github ./.github
+# Read by the GitOps script tests.
+COPY --chown=app:app deploy ./deploy
 RUN uv sync --locked --no-editable \
     && chmod -R a+rX /opt/venv \
     && chown -R app:app /app
