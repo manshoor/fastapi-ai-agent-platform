@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dispatcher
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  replicas: 1
+  # Never two at once: the connection budget counts one.
+  strategy:
+    type: Recreate
+  # A worker that cannot start exits at once; one that lasts this long counts as running.
+  minReadySeconds: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dispatcher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dispatcher
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 50
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # No liveness probe: a Kafka outage must not restart-loop it.
+        - name: dispatcher
+          image: app
+          command: ["python", "-m", "app.ai.dispatcher"]
+          envFrom:
+            - configMapRef:
+                name: database-settings
+            - configMapRef:
+                name: ai-settings
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+            - name: DB_POOL_SIZE
+              value: "2"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

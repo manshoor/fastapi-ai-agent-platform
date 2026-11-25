@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-worker
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  replicas: 1
+  # Never two at once: the connection budget counts one.
+  strategy:
+    type: Recreate
+  # A worker that cannot start exits at once; one that lasts this long counts as running.
+  minReadySeconds: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rag-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rag-worker
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 50
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # No liveness probe: a Kafka outage must not restart-loop it.
+        - name: rag-worker
+          image: app
+          command: ["python", "-m", "app.rag.worker"]
+          envFrom:
+            - configMapRef:
+                name: database-settings
+            - configMapRef:
+                name: ai-settings
+            - configMapRef:
+                name: provider-settings
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: password
+            - name: DB_POOL_SIZE
+              value: "4"
+            # Not a secret: the simulator takes any key.
+            - name: OPENAI_API_KEY
+              value: local-simulator-only-not-a-real-key
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # Two parser children (AI_CONCURRENCY) of at most 1 GiB each, plus the worker.
+              memory: 2560Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

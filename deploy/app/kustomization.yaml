@@ -1,5 +1,6 @@
 # The GitOps demo, synced by Argo CD (see README "GitOps demo"). One file per service;
-# a new service is one more file here. Waves: 0 db, redis -> 1 migrate -> 2 api.
+# a new service is one more file here. Waves: 0 db, redis, kafka, provider
+# -> 1 migrate, topic-init -> 2 api, dispatcher, worker, rag-worker.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: fastapi-demo
@@ -7,8 +8,14 @@ namespace: fastapi-demo
 resources:
   - db.yaml
   - redis.yaml
+  - kafka.yaml
+  - provider.yaml
   - migrate.yaml
+  - topic-init.yaml
   - api.yaml
+  - dispatcher.yaml
+  - worker.yaml
+  - rag-worker.yaml
 
 # Image pins, written only by scripts/promote_images.py.
 components:
@@ -26,3 +33,37 @@ configMapGenerator:
     literals:
       - REDIS_URL=redis://redis:6379/0
       - AUTH_TOKEN_TTL_SECONDS=900
+      - ASSISTANT_ENABLED=true
+      - ASSISTANT_DEMO_ENABLED=true
+      - ASSISTANT_MEMORY_ENABLED=true
+  - name: ai-settings
+    literals:
+      - AI_ENABLED=true
+      - AI_POLL_SECONDS=0.25
+      - RAG_ENABLED=true
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+  - name: provider-settings
+    literals:
+      - OPENAI_BASE_URL=http://provider:8080/v1
+  # As in compose.ai.yaml, but the voter is localhost: the broker must not wait on itself.
+  - name: kafka-settings
+    literals:
+      - CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
+      - KAFKA_LOG_RETENTION_HOURS=24
+      - KAFKA_LOG_RETENTION_BYTES=268435456
+      - KAFKA_LOG_SEGMENT_BYTES=67108864
+      - KAFKA_LOG_DIRS=/var/lib/kafka/data
+      - KAFKA_HEAP_OPTS=-Xms256m -Xmx512m

@@ -1,0 +1,61 @@
+# Runs in every sync, between Kafka and the workers.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: topic-init
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # Argo CD retries the sync instead.
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: topic-init
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        # The image's appuser.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: topic-init
+          image: apache/kafka:4.1.2@sha256:5cc2a2fd93fa2687b44015eee04fb2c3edd9e526bd64bf8bec5ff1e268772e0e
+          command: ["/bin/bash", "-ec"]
+          # As in compose.ai.yaml.
+          args:
+            - |
+              for topic in ai.item-rewrite.requested.v1 ai.item-rewrite.dead-letter.v1 rag.document-events.v1 rag.document-events.dead-letter.v1; do
+                /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic "$topic" --partitions 6 --replication-factor 1 --config retention.ms=86400000 --config retention.bytes=268435456 --config max.message.bytes=65536
+                /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic "$topic" | grep -F 'PartitionCount: 6' > /dev/null || { echo 'Topic requires exactly six partitions' >&2; exit 1; }
+              done
+          env:
+            # The tools write logs; the root is read-only.
+            - name: LOG_DIR
+              value: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
