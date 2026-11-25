@@ -1,0 +1,21 @@
+# Written by scripts/promote_images.py. Do not edit by hand.
+# One name per pin, so `migrate` can stay ahead of `app` after a rollback.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+images:
+  - name: app
+    newName: ghcr.io/manshoor/fastapi-ai-agent-platform
+    newTag: sha-e36f4d0d9deac73b18dc2725fd73e71ccc79676a
+    digest: sha256:f0a982ffe230a11b3fcc2ce80cd99e66009cb3ed3e32e88206cb7f32005f3219
+  - name: migrate
+    newName: ghcr.io/manshoor/fastapi-ai-agent-platform
+    newTag: sha-e36f4d0d9deac73b18dc2725fd73e71ccc79676a
+    digest: sha256:f0a982ffe230a11b3fcc2ce80cd99e66009cb3ed3e32e88206cb7f32005f3219
+  - name: postgres
+    newName: ghcr.io/manshoor/fastapi-ai-agent-platform-postgres
+    newTag: sha-e36f4d0d9deac73b18dc2725fd73e71ccc79676a
+    digest: sha256:a719495f45caf0f469ee569bc85badd03e5b73cc24c884ae8826e19d534539bb
+  - name: simulator
+    newName: ghcr.io/manshoor/fastapi-ai-agent-platform-simulator
+    newTag: sha-e36f4d0d9deac73b18dc2725fd73e71ccc79676a
+    digest: sha256:47050cb80d6d4f3c4a130026c5458c22dd4e713d223f87641895122583b759a8
