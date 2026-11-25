@@ -269,6 +269,18 @@ CONFIG_KEYS = {
 }
 # The suffix kustomize adds to a generated ConfigMap's name.
 CONFIG_HASH = re.compile(r"-[2456789bcdfghkmt]{10}$")
+# Receiver -> its port and the workloads that may call it. Nothing else is open but DNS.
+PATHS: dict[str, tuple[int, tuple[str, ...]]] = {
+    "db": (5432, ("api", "migrate", "dispatcher", "worker", "rag-worker")),
+    "redis": (6379, ("api",)),
+    "kafka": (9092, ("topic-init", "dispatcher", "worker", "rag-worker")),
+    "provider": (8080, ("api", "worker", "rag-worker")),
+}
+DNS_PODS = {
+    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}},
+    "podSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+}
+DNS_PORTS = [{"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}]
 PROBE_KEYS = ("startupProbe", "readinessProbe", "livenessProbe")
 PROBE_HANDLERS = {"exec", "httpGet", "tcpSocket", "grpc"}
 # A worker has no probe: a Kafka outage must not restart-loop it.
@@ -705,6 +717,52 @@ def rule_topics(docs: Docs) -> Problems:
         yield "topic-init: the Job retries by itself"
 
 
+def _selector(name: str) -> dict:
+    return {"podSelector": {"matchLabels": {NAME_LABEL: name}}}
+
+
+def _tcp(port: int) -> list[dict]:
+    return [{"protocol": "TCP", "port": port}]
+
+
+def expected_policies() -> dict[str, dict]:
+    """The spec of every NetworkPolicy, from PATHS."""
+    policies = {
+        "default-deny": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]},
+        "dns": {
+            "podSelector": {},
+            "policyTypes": ["Egress"],
+            "egress": [{"to": [DNS_PODS], "ports": DNS_PORTS}],
+        },
+    }
+    for receiver, (port, senders) in PATHS.items():
+        callers = [_selector(sender) for sender in senders]
+        policies[f"to-{receiver}"] = {
+            **_selector(receiver),
+            "policyTypes": ["Ingress"],
+            "ingress": [{"from": callers, "ports": _tcp(port)}],
+        }
+        for sender in senders:
+            policy = policies.setdefault(
+                f"from-{sender}", {**_selector(sender), "policyTypes": ["Egress"], "egress": []}
+            )
+            policy["egress"].append({"to": [_selector(receiver)], "ports": _tcp(port)})
+    return policies
+
+
+def rule_network(docs: Docs) -> Problems:
+    """Exactly default-deny, DNS and PATHS: policies add up, so one more opens a path."""
+    found = [doc for doc in docs if doc.get("kind") == "NetworkPolicy"]
+    expected = expected_policies()
+    names = sorted(_name(doc) for doc in found)
+    if names != sorted(expected):
+        yield f"network policies are {names}, expected {sorted(expected)}"
+        return
+    for doc in found:
+        if doc["spec"] != expected[_name(doc)]:
+            yield f"NetworkPolicy {_name(doc)}: not the expected paths"
+
+
 def _kustomization(folder: Path) -> Problems:
     """What the kustomization itself may say."""
     base = yaml.safe_load((folder / KUSTOMIZATION).read_text())
@@ -767,6 +825,7 @@ RULES: list[Callable[[Docs], Problems]] = [
     rule_workers,
     rule_kafka,
     rule_topics,
+    rule_network,
 ]
 
 

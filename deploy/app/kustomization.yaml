@@ -6,6 +6,7 @@ kind: Kustomization
 namespace: fastapi-demo
 
 resources:
+  - network.yaml
   - db.yaml
   - redis.yaml
   - kafka.yaml

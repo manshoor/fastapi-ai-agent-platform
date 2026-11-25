@@ -95,6 +95,9 @@ LABELS = "Deployment/provider/spec/template/metadata/labels"
 PROVIDER = "ConfigMap/provider-settings/data"
 VOTERS = "ConfigMap/kafka-settings/data/KAFKA_CONTROLLER_QUORUM_VOTERS"
 FAKE = {"name": "OPENAI_API_KEY", "value": checker.FAKE_KEY}
+DENY = "NetworkPolicy/default-deny"
+TO_DB = "NetworkPolicy/to-db/spec"
+DNS_TO = "NetworkPolicy/dns/spec/egress/0/to/0"
 INIT = [{"name": "i", "image": f"{APP_IMAGE}:sha-{'a' * 40}@{DIGEST}"}]
 POOL = [{"name": "db_pool_size", "value": "11"}]
 POOL_REFERENCE = [{"name": "DB_POOL_SIZE", "valueFrom": {"fieldRef": {"fieldPath": "a"}}}]
@@ -318,6 +321,29 @@ BAD_EDITS = [
     ("no-topics", "rule_topics", "Job/topic-init/metadata/name", "other"),
     ("sqs", "rule_known_texts", "ConfigMap/ai-settings/data/RAG_EVENT_SINKS", "kafka,sqs"),
     ("config-prefix", "rule_known_texts", f"{BOX}/envFrom", PREFIX),
+    ("no-deny", "rule_network", f"{DENY}/kind", "ConfigMap"),
+    ("deny-one-way", "rule_network", f"{DENY}/spec/policyTypes", ["Ingress"]),
+    ("deny-some", "rule_network", f"{DENY}/spec/podSelector", {"matchLabels": {"a": "b"}}),
+    ("allow-all", "rule_network", f"{DENY}/spec/ingress", [{}]),
+    ("allow-out", "rule_network", f"{DENY}/spec/egress", [{}]),
+    ("empty-rule", "rule_network", f"{TO_DB}/ingress", [{}]),
+    ("no-from", "rule_network", f"{TO_DB}/ingress/0/from", ...),
+    ("no-ports", "rule_network", f"{TO_DB}/ingress/0/ports", ...),
+    ("any-pod", "rule_network", f"{TO_DB}/ingress/0/from/0", {"podSelector": {}}),
+    ("any-namespace", "rule_network", f"{TO_DB}/ingress/0/from/0", {"namespaceSelector": {}}),
+    ("extra-sender", "rule_network", f"{TO_DB}/ingress/0/from/5", {"podSelector": {"a": "b"}}),
+    ("half-path", "rule_network", f"{TO_DB}/ingress/0/from/4", ...),
+    ("port-range", "rule_network", f"{TO_DB}/ingress/0/ports/0/endPort", 65535),
+    ("no-to", "rule_network", "NetworkPolicy/from-api/spec/egress/0/to", ...),
+    (
+        "internet",
+        "rule_network",
+        "NetworkPolicy/from-api/spec/egress/3",
+        {"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]},
+    ),
+    ("extra-policy", "rule_network", "NetworkPolicy/to-redis/metadata/name", "to-other"),
+    ("wide-dns", "rule_network", f"{DNS_TO}/namespaceSelector", {}),
+    ("any-dns-pod", "rule_network", f"{DNS_TO}/podSelector", ...),
     ("node-port", "rule_services", "Service/api/spec/type", "NodePort"),
     ("external-ip", "rule_services", "Service/api/spec/externalIPs", ["1.2.3.4"]),
     ("pruned-db", "rule_annotations", "StatefulSet/db/metadata/annotations", {}),
@@ -383,6 +409,27 @@ def test_the_fake_key_is_the_only_literal_credential(good):
     }
     key = "local-simulator-only-not-a-real-key"
     assert literals == {(n, "OPENAI_API_KEY", key) for n in ("api", "worker", "rag-worker")}
+
+
+def test_the_paths_are_the_planned_ones():
+    paths = {
+        (r, port, sender) for r, (port, senders) in checker.PATHS.items() for sender in senders
+    }
+    assert paths == {
+        ("db", 5432, "api"),
+        ("db", 5432, "migrate"),
+        ("db", 5432, "dispatcher"),
+        ("db", 5432, "worker"),
+        ("db", 5432, "rag-worker"),
+        ("redis", 6379, "api"),
+        ("kafka", 9092, "topic-init"),
+        ("kafka", 9092, "dispatcher"),
+        ("kafka", 9092, "worker"),
+        ("kafka", 9092, "rag-worker"),
+        ("provider", 8080, "api"),
+        ("provider", 8080, "worker"),
+        ("provider", 8080, "rag-worker"),
+    }
 
 
 def test_an_empty_render_is_rejected():
