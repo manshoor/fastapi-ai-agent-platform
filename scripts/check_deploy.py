@@ -2,15 +2,45 @@
 
     kubectl kustomize deploy/app | python scripts/check_deploy.py
 
-Reads YAML on stdin, needs no cluster, prints every broken rule and exits 1 on any.
+Reads YAML on stdin and the files in deploy/app, needs no cluster, prints every broken
+rule and exits 1 on any.
 """
 
+import importlib.util
 import re
 import sys
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import yaml
 
+
+def _load_promote():
+    # A sibling script, not a package: load it by path.
+    path = Path(__file__).resolve().parent / "promote_images.py"
+    spec = importlib.util.spec_from_file_location("promote_images", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+promote = _load_promote()
+
+APP = Path(__file__).resolve().parents[1] / "deploy" / "app"
+KUSTOMIZATION = "kustomization.yaml"
+PINS = "images/kustomization.yaml"
+# Nothing else: patches, transformers or image overrides could change any pin.
+KUSTOMIZATION_KEYS = {
+    "apiVersion",
+    "kind",
+    "namespace",
+    "resources",
+    "components",
+    "configMapGenerator",
+}
+GENERATOR_KEYS = {"name", "literals"}
+LOCAL_RESOURCE = re.compile(r"[a-z][a-z-]*\.yaml")
 NAMESPACE = "fastapi-demo"
 # The same six kinds as deploy/argocd/project.yaml.
 KINDS = {
@@ -22,16 +52,21 @@ KINDS = {
     ("networking.k8s.io/v1", "NetworkPolicy"),
 }
 WORKLOAD_KINDS = {"Deployment", "StatefulSet", "Job"}
+WAVED_KINDS = WORKLOAD_KINDS | {"Service"}
 # Every workload and its sync wave; a Service shares its workload's wave.
 WAVES = {"db": "0", "redis": "0", "migrate": "1", "api": "2"}
 WAVE = "argocd.argoproj.io/sync-wave"
 SYNC_OPTIONS = "argocd.argoproj.io/sync-options"
 HOOK = "argocd.argoproj.io/hook"
 HOOK_DELETE = "argocd.argoproj.io/hook-delete-policy"
-# The published image of each workload built here.
-REGISTRY = "ghcr.io/manshoor/fastapi-ai-agent-platform"
-OWN_IMAGES = {"api": REGISTRY, "migrate": REGISTRY, "db": f"{REGISTRY}-postgres"}
-OWN_TAG = re.compile(r":sha-[0-9a-f]{40}@sha256:[0-9a-f]{64}")
+# Besides the wave. Anything more, such as a hook or Replace=true, could delete data.
+EXTRA_ANNOTATIONS = {
+    ("StatefulSet", "db"): {SYNC_OPTIONS: "Prune=false,Delete=false"},
+    ("Job", "migrate"): {HOOK: "Sync", HOOK_DELETE: "BeforeHookCreation"},
+}
+# Workload -> its pin in deploy/app/images/.
+PIN_NAMES = {"api": "app", "migrate": "migrate", "db": "postgres"}
+REDIS = "redis:7.4.11@sha256:44960b3100c48159a66d28c18b0588c193492e25f7551d60e51dd464fc3eca5b"
 PINNED = re.compile(r"[\w./-]+(:[\w.-]+)?@sha256:[0-9a-f]{64}")
 # Secret -> the workloads that may read it.
 SECRET_READERS = {"db-credentials": {"db", "migrate", "api"}, "api-secrets": {"api"}}
@@ -42,14 +77,22 @@ CONTAINER_SECURITY = {
     "readOnlyRootFilesystem": True,
     "capabilities": {"drop": ["ALL"]},
 }
-POD_SECURITY_KEYS = {"runAsNonRoot", "runAsUser", "runAsGroup", "fsGroup", "seccompProfile"}
+POD_IDS = ("runAsUser", "runAsGroup", "fsGroup")
+POD_SECURITY_KEYS = {"runAsNonRoot", "seccompProfile", *POD_IDS}
 HOST_KEYS = ("hostNetwork", "hostPID", "hostIPC", "hostUsers", "hostAliases")
 VOLUME_TYPES = {"emptyDir", "configMap", "persistentVolumeClaim"}
 CLAIM_KEYS = {"apiVersion", "kind", "metadata", "spec"}
 CLAIM_SPEC_KEYS = {"accessModes", "volumeMode", "resources"}
 DATA_PATH = "/var/lib/postgresql"
 MAX_CONNECTIONS = ["-c", "max_connections=100"]
+DB_REPLICAS = 1
+MIGRATE_COMMAND = ["alembic", "upgrade", "head"]
 API_REPLICAS = 2
+API_PROBES = {"readinessProbe": "/health/ready", "livenessProbe": "/health/live"}
+# The connection budget: (2 replicas + 1 surge) x 10 connections.
+API_MAX_SURGE = 1
+POOL_SETTING = "DB_POOL_SIZE"
+POOL_SIZE = re.compile(r"[1-9]|10")
 
 Docs = list[dict]
 Problems = Iterator[str]
@@ -105,22 +148,34 @@ def rule_workloads(docs: Docs) -> Problems:
         yield f"workloads are {names}, expected {sorted(WAVES)}"
 
 
-def rule_waves(docs: Docs) -> Problems:
+def rule_annotations(docs: Docs) -> Problems:
     for doc in docs:
-        if doc.get("kind") not in WORKLOAD_KINDS | {"Service"}:
-            continue
-        if _annotations(doc).get(WAVE) != WAVES.get(_name(doc)):
-            yield f"{doc['kind']} {_name(doc)}: wrong sync wave"
+        expected = dict(EXTRA_ANNOTATIONS.get((doc.get("kind"), _name(doc)), {}))
+        if doc.get("kind") in WAVED_KINDS:
+            expected[WAVE] = WAVES.get(_name(doc))
+        if _annotations(doc) != expected:
+            yield f"{doc.get('kind')} {_name(doc)}: annotations are not the expected ones"
+
+
+def rule_containers(docs: Docs) -> Problems:
+    for name, _, pod in _workloads(docs):
+        if len(_containers(pod)) != 1:
+            yield f"{name}: not exactly one container"
 
 
 def rule_images(docs: Docs) -> Problems:
+    try:
+        pins = promote.parse_pins((APP / PINS).read_text())
+    except promote.PromoteError as error:
+        yield str(error)
+        return
+    expected = {"redis": REDIS}
+    for name, pin_name in PIN_NAMES.items():
+        pin = pins[pin_name]
+        expected[name] = f"{promote.IMAGES[pin_name]}:sha-{pin.commit}@{pin.digest}"
     for name, container in _all_containers(docs):
-        image = container.get("image", "")
-        if not PINNED.fullmatch(image):
-            yield f"{name}: image is not pinned by digest"
-        own = OWN_IMAGES.get(name)
-        if own and not (image.startswith(own) and OWN_TAG.fullmatch(image[len(own) :])):
-            yield f"{name}: image is not {own} at a commit and digest"
+        if container.get("image") != expected.get(name):
+            yield f"{name}: image is not its pin"
 
 
 def rule_pod_security(docs: Docs) -> Problems:
@@ -128,9 +183,10 @@ def rule_pod_security(docs: Docs) -> Problems:
         security = pod.get("securityContext") or {}
         if security.get("runAsNonRoot") is not True:
             yield f"{name}: runAsNonRoot is not set"
-        user = security.get("runAsUser")
-        if type(user) is not int or user <= 0:
-            yield f"{name}: runAsUser is not a non-root number"
+        for key in POD_IDS:
+            value = security.get(key)
+            if type(value) is not int or value <= 0:
+                yield f"{name}: {key} is not a non-root number"
         if security.get("seccompProfile") != {"type": "RuntimeDefault"}:
             yield f"{name}: seccomp profile is not RuntimeDefault"
         if set(security) - POD_SECURITY_KEYS:
@@ -207,9 +263,10 @@ def rule_database(docs: Docs) -> Problems:
     if db is None:
         yield "db: no StatefulSet"
         return
-    options = set(_annotations(db).get(SYNC_OPTIONS, "").split(","))
-    if not {"Prune=false", "Delete=false"} <= options:
-        yield "db: Argo CD may remove it"
+    if db["spec"].get("replicas") != DB_REPLICAS:
+        yield f"db: replicas is not {DB_REPLICAS}"
+    if "persistentVolumeClaimRetentionPolicy" in db["spec"]:
+        yield "db: its claims may be deleted"
     container = db["spec"]["template"]["spec"]["containers"][0]
     if container.get("args", [])[-2:] != MAX_CONNECTIONS:
         yield "db: max_connections is not 100"
@@ -234,9 +291,9 @@ def rule_migrate(docs: Docs) -> Problems:
     if job is None:
         yield "migrate: no Job"
         return
-    annotations = _annotations(job)
-    if annotations.get(HOOK) != "Sync" or annotations.get(HOOK_DELETE) != "BeforeHookCreation":
-        yield "migrate: not a Sync hook that replaces its last run"
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    if container.get("command") != MIGRATE_COMMAND or "args" in container:
+        yield f"migrate: the command is not {' '.join(MIGRATE_COMMAND)}"
     if job["spec"].get("backoffLimit") != 0:
         yield "migrate: the Job retries by itself"
 
@@ -248,15 +305,87 @@ def rule_api(docs: Docs) -> Problems:
         return
     if api["spec"].get("replicas") != API_REPLICAS:
         yield f"api: replicas is not {API_REPLICAS}"
-    strategy = api["spec"].get("strategy") or {}
-    if (strategy.get("rollingUpdate") or {}).get("maxUnavailable") != 0:
+    if _rolling(api).get("maxUnavailable") != 0:
         yield "api: maxUnavailable is not 0"
+    container = api["spec"]["template"]["spec"]["containers"][0]
+    for probe, path in API_PROBES.items():
+        if (container.get(probe) or {}).get("httpGet") != {"path": path, "port": "http"}:
+            yield f"api: {probe} does not read {path}"
 
+
+def _rolling(deployment: dict) -> dict:
+    return (deployment["spec"].get("strategy") or {}).get("rollingUpdate") or {}
+
+
+def rule_connections(docs: Docs) -> Problems:
+    api = _one(docs, "Deployment", "api")
+    if api is None:
+        yield "api: no Deployment"
+        return
+    surge = _rolling(api).get("maxSurge")
+    if type(surge) is not int or surge > API_MAX_SURGE:
+        yield f"api: maxSurge is not at most {API_MAX_SURGE}"
+    # The image's own command runs one Uvicorn worker.
+    for container in _containers(api["spec"]["template"]["spec"]):
+        if "command" in container or "args" in container:
+            yield "api: replaces the image's command"
+
+    # Settings ignore case.
+    settings = []
+    for name, container in _all_containers(docs):
+        settings += [(v["name"], v.get("value")) for v in container.get("env") or []]
+        if any("prefix" in source for source in container.get("envFrom") or []):
+            yield f"{name}: envFrom renames settings"
+    for doc in docs:
+        if doc.get("kind") == "ConfigMap":
+            settings += (doc.get("data") or {}).items()
+    for key, value in settings:
+        if key.upper() == POOL_SETTING and not POOL_SIZE.fullmatch(str(value)):
+            yield f"{POOL_SETTING} is not 1 to 10"
+
+
+def _kustomization(folder: Path) -> Problems:
+    """What the kustomization itself may say."""
+    base = yaml.safe_load((folder / KUSTOMIZATION).read_text())
+    if not isinstance(base, dict) or not set(base) <= KUSTOMIZATION_KEYS:
+        yield f"{KUSTOMIZATION}: only {', '.join(sorted(KUSTOMIZATION_KEYS))} are allowed"
+        return
+    if base.get("namespace") != NAMESPACE or base.get("components") != ["images"]:
+        yield f"{KUSTOMIZATION}: unexpected namespace or components"
+    for generated in base.get("configMapGenerator") or []:
+        if not set(generated) <= GENERATOR_KEYS:
+            yield f"{KUSTOMIZATION}: a ConfigMap may only have {sorted(GENERATOR_KEYS)}"
+    resources = base.get("resources") or []
+    if not all(LOCAL_RESOURCE.fullmatch(resource) for resource in resources):
+        yield f"{KUSTOMIZATION}: a resource is not a file in this folder"
+        return
+
+    # No other file: Argo CD reads overrides from .argocd-source*.yaml.
+    expected = {KUSTOMIZATION, PINS, *resources}
+    files = {str(p.relative_to(folder)) for p in folder.rglob("*") if not p.is_dir()}
+    if files != expected:
+        yield f"deploy/app holds unexpected or missing files: {sorted(files ^ expected)}"
+    if any(path.is_symlink() for path in folder.rglob("*")):
+        yield "deploy/app holds a link"
+    promote.parse_pins((folder / PINS).read_text())
+
+
+def rule_source(folder: Path) -> Problems:
+    """What could change the render without showing in a manifest rule."""
+    try:
+        yield from _kustomization(folder)
+    except (*MALFORMED, OSError, promote.PromoteError) as error:
+        yield f"deploy/app: {type(error).__name__}"
+
+
+# What reading an unexpected document shape raises.
+MALFORMED = (yaml.YAMLError, AttributeError, IndexError, KeyError, TypeError, ValueError)
 
 RULES: list[Callable[[Docs], Problems]] = [
     rule_kinds,
     rule_workloads,
-    rule_waves,
+    rule_annotations,
+    rule_containers,
     rule_images,
     rule_pod_security,
     rule_pod_access,
@@ -269,16 +398,27 @@ RULES: list[Callable[[Docs], Problems]] = [
     rule_claims,
     rule_migrate,
     rule_api,
+    rule_connections,
 ]
 
 
 def check(docs: Docs) -> list[str]:
-    return [problem for rule in RULES for problem in rule(docs)]
+    problems = []
+    for rule in RULES:
+        try:
+            problems += rule(docs)
+        except MALFORMED:
+            problems.append(f"{rule.__name__}: malformed manifest")
+    return problems
 
 
 def main() -> int:
-    docs = [doc for doc in yaml.safe_load_all(sys.stdin) if doc is not None]
-    problems = check(docs)
+    try:
+        docs = [doc for doc in yaml.safe_load_all(sys.stdin) if doc is not None]
+    except yaml.YAMLError:
+        print("the input is not YAML", file=sys.stderr)
+        return 1
+    problems = [*rule_source(APP), *check(docs)]
     for problem in problems:
         print(problem, file=sys.stderr)
     if problems:

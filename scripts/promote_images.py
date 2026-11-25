@@ -9,7 +9,8 @@ promote   moves app, migrate and simulator (and postgres if asked) to a commit t
 rollback  moves app and simulator back. Never migrate or postgres: an older image cannot
           run `alembic upgrade` on a newer schema, so migrations must stay usable by the
           previous app version.
-verify    re-checks every pin, and that app is not newer than migrate.
+verify    re-checks every pin, that app is not newer than migrate, and that migrate and
+          postgres are not older than where this branch left main.
 
 Needs `git` and a signed-in `gh`. Every digest comes from a verified build record.
 """
@@ -25,7 +26,8 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-PINS_FILE = ROOT / "deploy" / "app" / "images" / "kustomization.yaml"
+PINS_PATH = "deploy/app/images/kustomization.yaml"
+PINS_FILE = ROOT / PINS_PATH
 REPOSITORY = "manshoor/fastapi-ai-agent-platform"
 WORKFLOW = f"{REPOSITORY}/.github/workflows/ci.yml"
 SOURCE_REF = "refs/heads/main"
@@ -39,6 +41,8 @@ IMAGES = {
 }
 PROMOTED = ("app", "migrate", "simulator")
 ROLLED_BACK = ("app", "simulator")
+NEVER_BACK = ("migrate", "postgres")
+MAIN = "origin/main"
 COMMIT = re.compile(r"[0-9a-f]{40}")
 TAG = re.compile(r"sha-([0-9a-f]{40})")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -72,6 +76,13 @@ Pins = dict[str, Pin]
 
 
 def parse_pins(text: str) -> Pins:
+    try:
+        return _parse_pins(text)
+    except (yaml.YAMLError, AttributeError, KeyError, TypeError):
+        raise PromoteError("the pins file is malformed") from None
+
+
+def _parse_pins(text: str) -> Pins:
     document = yaml.safe_load(text)
     if not isinstance(document, dict) or set(document) != {"apiVersion", "kind", "images"}:
         raise PromoteError("the pins file is not the one this script writes")
@@ -126,6 +137,24 @@ def is_ancestor(older: str, newer: str) -> bool:
     if result.returncode not in (ANCESTOR, NOT_ANCESTOR):
         raise PromoteError("git does not know one of the commits; fetch main first")
     return result.returncode == ANCESTOR
+
+
+def _git(*arguments: str) -> str:
+    result = _run(["git", *arguments])
+    if result.returncode:
+        raise PromoteError(f"git {arguments[0]} failed; fetch main with its history first")
+    return result.stdout
+
+
+def _base_pins() -> Pins | None:
+    """The pins where this branch left main, or None if main had none yet."""
+    base = _git("merge-base", "HEAD", MAIN).strip()
+    # On main itself: compare with the commit before.
+    if base == _git("rev-parse", "HEAD").strip():
+        base = "HEAD^1"
+    if not _git("ls-tree", "--name-only", base, "--", PINS_PATH).strip():
+        return None
+    return parse_pins(_git("show", f"{base}:{PINS_PATH}"))
 
 
 def record_digest(records: object, image: str) -> str:
@@ -189,6 +218,10 @@ def verify(pins: Pins) -> None:
         raise PromoteError("app and simulator are pinned to different commits")
     if not is_ancestor(pins["app"].commit, pins["migrate"].commit):
         raise PromoteError("app is newer than migrate")
+    base = _base_pins()
+    for name in NEVER_BACK if base else ():
+        if not is_ancestor(base[name].commit, pins[name].commit):
+            raise PromoteError(f"{name} moved back")
     for name, pin in pins.items():
         # By digest: a tag could move.
         if verified_digest(IMAGES[name], f"@{pin.digest}", pin.commit) != pin.digest:

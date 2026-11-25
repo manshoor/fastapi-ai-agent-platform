@@ -48,13 +48,31 @@ def record(image: str, value: str) -> dict:
     return {"verificationResult": {"statement": {"subject": [subject]}}}
 
 
+HEAD = "1" * 40
+
+
 @pytest.fixture
-def tools(monkeypatch) -> list[list[str]]:
+def base() -> dict:
+    """The merge base with main, and the pins file there (None: not there yet)."""
+    return {"commit": "2" * 40, "code": 0, "text": script.render_pins(pins(OLD, OLD, OLD))}
+
+
+@pytest.fixture
+def tools(monkeypatch, base) -> list[list[str]]:
     """git knows LINE and a side commit off OLD; gh knows every fake digest."""
     calls: list[list[str]] = []
 
     def run(command):
         calls.append(command)
+        if command[:3] == ["git", "ls-tree", "--name-only"]:
+            found = "" if base["text"] is None else script.PINS_PATH + "\n"
+            return subprocess.CompletedProcess(command, 0, found, "")
+        if command[:2] == ["git", "show"]:
+            return subprocess.CompletedProcess(command, 0, base["text"], "")
+        if command[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(command, base["code"], f"{HEAD}\n", "")
+        if command == ["git", "merge-base", "HEAD", "origin/main"]:
+            return subprocess.CompletedProcess(command, base["code"], f"{base['commit']}\n", "")
         if command[0] == "git":
             older, newer = command[-2:]
             if not {older, newer} <= {*LINE, SIDE}:
@@ -170,6 +188,42 @@ def test_verify_refuses_another_digest(tools):
     changed = {**pins(), "postgres": script.Pin(MID, "sha256:" + "9" * 64)}
     with pytest.raises(script.PromoteError, match="postgres is pinned to another digest"):
         script.verify(changed)
+
+
+@pytest.mark.parametrize("moved", ["migrate", "postgres"])
+def test_verify_refuses_moving_migrate_or_postgres_back(tools, base, moved):
+    base["text"] = script.render_pins(pins())
+    with pytest.raises(script.PromoteError, match=f"{moved} moved back"):
+        script.verify(pins(**{"app": OLD, moved: OLD}))
+
+
+def test_verify_refuses_a_hand_edit_of_every_pin(tools, base):
+    base["text"] = script.render_pins(pins())
+    with pytest.raises(script.PromoteError, match="moved back"):
+        script.verify(pins(OLD, OLD, OLD))
+
+
+def test_verify_accepts_a_rollback_and_a_promotion(tools, base):
+    base["text"] = script.render_pins(pins())
+    script.verify(pins(app=OLD))
+    script.verify(pins(NEW, NEW, NEW))
+
+
+def test_verify_accepts_the_first_pins(tools, base):
+    base["text"] = None
+    script.verify(pins())
+
+
+def test_verify_on_main_compares_with_the_commit_before(tools, base):
+    base["commit"] = HEAD
+    script.verify(pins())
+    assert ["git", "ls-tree", "--name-only", "HEAD^1", "--", script.PINS_PATH] in tools
+
+
+def test_verify_needs_the_history(tools, base):
+    base["code"] = 128
+    with pytest.raises(script.PromoteError, match="fetch main"):
+        script.verify(pins())
 
 
 # Build records
