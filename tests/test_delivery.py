@@ -14,12 +14,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_DIR = ROOT / ".github" / "workflows"
 CI = WORKFLOW_DIR / "ci.yml"
+GITOPS = WORKFLOW_DIR / "gitops.yml"
 SCRIPT = ".github/scripts/publish_images.sh"
 GATES = ("lint", "test", "ai-qa", "image")
 
 PINNED = re.compile(r"[\w.-]+(/[\w.-]+)+@[0-9a-f]{40}")
 VERSIONED = re.compile(r"[\w.-]+(/[\w.-]+)+@[0-9a-f]{40} # v\d+\.\d+\.\d+")
-READ_ONLY = {"contents": "read"}
+READ_LEVELS = {"read", "none"}
 # The pinned actions/attest README lists the last three.
 PUBLISH_PERMISSIONS = {
     "contents": "read",
@@ -46,6 +47,11 @@ BUILD_COMMAND = re.compile(
     r"\bdocker (image )?(build|buildx|builder|commit|tag|load|import|pull)\b"
     r"|\b(compose|\$COMPOSE|buildx) (build|bake|pull)\b|\$COMPOSE build\b|--build\b"
 )
+SECRET_WORD = re.compile(r"\bsecrets\b", re.IGNORECASE)
+SECRET_REFERENCE = re.compile(
+    r"\bsecrets\s*[.\[]|\bsecrets[\"']?\s*:\s*[\"']?inherit\b", re.IGNORECASE
+)
+SECRET_KEY = re.compile(r"secrets", re.IGNORECASE)
 # The only expression a shell command may hold; anything else could carry event text.
 RUN_EXPRESSIONS = {"matrix.arch"}
 
@@ -81,10 +87,57 @@ def _action(step: dict) -> str:
 # Rules for every workflow
 
 
+def _only_reads(permissions: object) -> bool:
+    # `read-all` and `write-all` are strings, not maps.
+    return isinstance(permissions, dict) and all(
+        isinstance(level, str) and level in READ_LEVELS for level in permissions.values()
+    )
+
+
 def rule_read_only(workflow: dict, name: str = "ci.yml") -> None:
-    assert workflow["permissions"] == READ_ONLY
-    writers = {job for job, body in workflow["jobs"].items() if "permissions" in body}
-    assert writers == ({"publish"} if name == "ci.yml" else set())
+    # A missing key means the repository default, which may write.
+    assert _only_reads(workflow.get("permissions"))
+    for job, body in workflow["jobs"].items():
+        # The one job that may write; rule_publish_gate fixes its exact permissions.
+        if (name, job) == ("ci.yml", "publish"):
+            continue
+        assert "permissions" not in body or _only_reads(body["permissions"]), job
+
+
+def _strings(node: object) -> Iterator[str]:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _strings(key)
+            yield from _strings(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _strings(item)
+    elif isinstance(node, str):
+        yield node
+
+
+def _mappings(node: object) -> Iterator[dict]:
+    if isinstance(node, dict):
+        yield node
+        node = list(node.values())
+    if isinstance(node, list):
+        for item in node:
+            yield from _mappings(item)
+
+
+def rule_no_secrets(workflow: dict) -> None:
+    # The bare word is fine in a name or a command; reading a secret is not. Expression
+    # names ignore case.
+    for text in _strings(workflow):
+        assert not SECRET_REFERENCE.search(text), text
+        # Also whole-object use, such as toJSON(secrets). To the end of the text: an
+        # expression's own strings may hold "}}".
+        assert not SECRET_WORD.search(text.partition("${{")[2]), text
+    for mapping in _mappings(workflow):
+        # A job passing secrets on (`secrets: inherit`) or a workflow asking for them.
+        assert not [key for key in mapping if SECRET_KEY.fullmatch(str(key))], mapping
+        # `if:` is an expression even without the braces.
+        assert not SECRET_WORD.search(str(mapping.get("if", "")))
 
 
 def rule_pins(workflow: dict) -> None:
@@ -103,11 +156,12 @@ def rule_no_event_text(workflow: dict) -> None:
 
 
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda path: path.name)
-def test_every_workflow_is_read_only_pinned_and_free_of_event_text(path):
+def test_every_workflow_is_read_only_pinned_and_free_of_event_text_and_secrets(path):
     workflow = _load(path)
     rule_read_only(workflow, path.name)
     rule_pins(workflow)
     rule_no_event_text(workflow)
+    rule_no_secrets(workflow)
 
 
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda path: path.name)
@@ -117,11 +171,6 @@ def test_every_pin_names_its_version(path):
     assert len(found) == len(parsed)
     for reference in found:
         assert VERSIONED.fullmatch(reference), reference
-
-
-@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda path: path.name)
-def test_no_stored_secret_is_used(path):
-    assert not re.search(r"\bsecrets\b", re.sub(r"#.*", "", path.read_text()))
 
 
 def test_both_workflow_suffixes_are_covered(tmp_path):
@@ -227,6 +276,7 @@ CI_RULES: list[Callable[[dict], None]] = [
     rule_read_only,
     rule_pins,
     rule_no_event_text,
+    rule_no_secrets,
     rule_triggers,
     rule_publish_gate,
     rule_publish_steps,
@@ -257,6 +307,73 @@ BAD_EDITS = [
         rule_read_only,
         "  lint:\n",
         "  lint:\n    permissions:\n      packages: write\n",
+    ),
+    ("read-all", rule_read_only, "permissions:\n  contents: read", "permissions: read-all"),
+    ("no-permissions", rule_read_only, "permissions:\n  contents: read\n", ""),
+    ("null-permissions", rule_read_only, "permissions:\n  contents: read", "permissions:"),
+    (
+        "extra-write",
+        rule_read_only,
+        "permissions:\n  contents: read",
+        "permissions:\n  contents: read\n  packages: write",
+    ),
+    (
+        "admin-level",
+        rule_read_only,
+        "permissions:\n  contents: read",
+        "permissions:\n  contents: admin",
+    ),
+    (
+        "job-mixed-levels",
+        rule_read_only,
+        "  lint:\n",
+        "  lint:\n    permissions: {contents: read, id-token: write}\n",
+    ),
+    ("job-write-all", rule_read_only, "  lint:\n", "  lint:\n    permissions: write-all\n"),
+    ("secret-env", rule_no_secrets, LINT_RUN, LINT_RUN + "        env: {A: '${{ secrets.A }}'}\n"),
+    ("secret-run", rule_no_secrets, LINT_RUN, "      - run: echo ${{ secrets.A }}\n"),
+    ("secret-index", rule_no_secrets, LINT_RUN, "      - run: echo ${{ secrets['A'] }}\n"),
+    ("secret-case", rule_no_secrets, LINT_RUN, "      - run: echo ${{ SECRETS.A }}\n"),
+    ("secret-space", rule_no_secrets, LINT_RUN, "      - run: echo ${{ secrets . A }}\n"),
+    ("secret-all", rule_no_secrets, LINT_RUN, "      - run: echo ${{ toJSON(secrets) }}\n"),
+    (
+        "secret-braces",
+        rule_no_secrets,
+        LINT_RUN,
+        "      - run: echo \"${{ format('}}', toJSON(secrets)) }}\"\n",
+    ),
+    ("secret-hash", rule_no_secrets, LINT_RUN, "      - run: 'echo \"#${{ secrets.A }}\"'\n"),
+    (
+        "secret-folded",
+        rule_no_secrets,
+        LINT_RUN,
+        "      - run: |\n          echo ${{ toJSON(\n          secrets) }}\n",
+    ),
+    ("secret-if", rule_no_secrets, LINT_RUN, LINT_RUN + "        if: toJSON(secrets) != ''\n"),
+    ("secret-input", rule_no_secrets, PATTERN, "          pattern: ${{ secrets.A }}\n"),
+    (
+        "secret-inherit",
+        rule_no_secrets,
+        "jobs:\n",
+        f"jobs:\n  extra:\n    uses: a/b/.github/workflows/c.yml@{SHA}\n    secrets: inherit\n",
+    ),
+    (
+        "secret-inherit-quoted",
+        rule_no_secrets,
+        "jobs:\n",
+        f'jobs:\n  extra:\n    uses: a/b/c.yml@{SHA}\n    "secrets" : "inherit"\n',
+    ),
+    (
+        "secret-passed",
+        rule_no_secrets,
+        "jobs:\n",
+        f"jobs:\n  extra:\n    uses: a/b/c.yml@{SHA}\n    secrets: {{A: b}}\n",
+    ),
+    (
+        "secret-inherit-text",
+        rule_no_secrets,
+        LINT_RUN,
+        "      - run: 'echo \"secrets: inherit\"'\n",
     ),
     ("quoted-tag", rule_pins, f"uses: actions/checkout@{SHA} # v7.0.1", 'uses: "a/b@v7"'),
     ("flow-style-tag", rule_pins, LINT_RUN, "      - {uses: a/b@main}\n"),
@@ -348,6 +465,71 @@ def test_a_bad_edit_is_rejected(rule, old, new):
         rule(yaml.safe_load(edited))
 
 
+# Edits that only read: the loosened rules must accept them.
+GOOD_EDITS = [
+    (
+        "more-reads",
+        rule_read_only,
+        "permissions:\n  contents: read",
+        "permissions:\n  contents: read\n  attestations: read\n  packages: none",
+    ),
+    (
+        "job-reads",
+        rule_read_only,
+        "  lint:\n",
+        "  lint:\n    permissions: {contents: read, packages: none}\n",
+    ),
+    ("bare-word", rule_no_secrets, LINT_RUN, "      - run: echo no secrets here\n"),
+]
+
+
+@pytest.mark.parametrize(
+    ("rule", "old", "new"), [edit[1:] for edit in GOOD_EDITS], ids=[edit[0] for edit in GOOD_EDITS]
+)
+def test_a_reading_edit_is_accepted(rule, old, new):
+    text = CI.read_text()
+    assert old in text
+    rule(yaml.safe_load(text.replace(old, new, 1)))
+
+
+@pytest.mark.parametrize(
+    ("rule", "old", "new"),
+    [
+        (rule_read_only, "permissions:\n  contents: read", "permissions:\n  contents: write"),
+        (rule_read_only, "  cluster:\n", "  cluster:\n    permissions: {packages: write}\n"),
+        # Only ci.yml's publish job may write.
+        (rule_read_only, "  cluster:\n", "  publish:\n    permissions: {packages: write}\n"),
+        (rule_no_secrets, "${{ github.token }}", "${{ secrets.GITHUB_TOKEN }}"),
+        (rule_no_event_text, '--revision "$REVISION"', "--revision ${{ github.head_ref }}"),
+        (rule_pins, "actions/checkout@", "actions/checkout@v7 #"),
+    ],
+)
+def test_a_bad_gitops_edit_is_rejected(rule, old, new):
+    text = GITOPS.read_text()
+    assert old in text
+    workflow = yaml.safe_load(text.replace(old, new, 1))
+    arguments = (GITOPS.name,) if rule is rule_read_only else ()
+    with pytest.raises(AssertionError):
+        rule(workflow, *arguments)
+
+
+def test_gitops_tools_and_checks_are_the_expected_ones():
+    workflow = _load(GITOPS)
+    assert workflow["permissions"] == {"contents": "read"}
+    assert set(workflow["jobs"]) == {"manifests", "cluster"}
+    assert workflow["jobs"]["cluster"]["timeout-minutes"] == 30
+    for tool in ("KUBECTL", "KIND"):
+        assert re.fullmatch(r"[0-9a-f]{64}", workflow["env"][f"{tool}_SHA256"])
+        assert re.search(r"/v\d+\.\d+\.\d+/", workflow["env"][f"{tool}_URL"])
+    commands = _commands(workflow["jobs"]["manifests"])
+    assert "scripts/check_deploy.py <" in commands
+    assert "promote_images.py verify" in commands
+    cluster = _commands(workflow["jobs"]["cluster"])
+    assert "smoke_gitops.py --revision" in cluster
+    # The failure dump must not print Secret objects.
+    assert not re.search(r"\bsecrets?\b", cluster, re.IGNORECASE)
+
+
 def test_a_new_workflow_with_write_access_is_rejected(tmp_path):
     (tmp_path / "rogue.yaml").write_text(
         "on: push\npermissions: {contents: read}\n"
@@ -370,8 +552,9 @@ def test_only_pull_request_runs_are_cancelled():
     assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
 
 
-def test_checkouts_keep_no_credentials():
-    for step in _steps(_load(CI)):
+@pytest.mark.parametrize("path", WORKFLOWS, ids=lambda path: path.name)
+def test_checkouts_keep_no_credentials(path):
+    for step in _steps(_load(path)):
         if _action(step) == "actions/checkout":
             assert step["with"]["persist-credentials"] is False
 
