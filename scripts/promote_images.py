@@ -146,15 +146,36 @@ def _git(*arguments: str) -> str:
     return result.stdout
 
 
-def _base_pins() -> Pins | None:
-    """The pins where this branch left main, or None if main had none yet."""
+def never_back_commits(text: str) -> list[tuple[str, str]]:
+    """Name and commit of every readable NEVER_BACK pin in main's file.
+
+    main's file may hold other images, or be malformed: neither may block the pull request
+    that changes it.
+    """
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return []
+    entries = document.get("images") if isinstance(document, dict) else None
+    commits = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict) or entry.get("name") not in NEVER_BACK:
+            continue
+        tag = TAG.fullmatch(str(entry.get("newTag")))
+        if tag:
+            commits.append((entry["name"], tag[1]))
+    return commits
+
+
+def _base_commits() -> list[tuple[str, str]]:
+    """The NEVER_BACK pins where this branch left main; none if main had no pins yet."""
     base = _git("merge-base", "HEAD", MAIN).strip()
     # On main itself: compare with the commit before.
     if base == _git("rev-parse", "HEAD").strip():
         base = "HEAD^1"
     if not _git("ls-tree", "--name-only", base, "--", PINS_PATH).strip():
-        return None
-    return parse_pins(_git("show", f"{base}:{PINS_PATH}"))
+        return []
+    return never_back_commits(_git("show", f"{base}:{PINS_PATH}"))
 
 
 def record_digest(records: object, image: str) -> str:
@@ -218,9 +239,8 @@ def verify(pins: Pins) -> None:
         raise PromoteError("app and simulator are pinned to different commits")
     if not is_ancestor(pins["app"].commit, pins["migrate"].commit):
         raise PromoteError("app is newer than migrate")
-    base = _base_pins()
-    for name in NEVER_BACK if base else ():
-        if not is_ancestor(base[name].commit, pins[name].commit):
+    for name, commit in _base_commits():
+        if not is_ancestor(commit, pins[name].commit):
             raise PromoteError(f"{name} moved back")
     for name, pin in pins.items():
         # By digest: a tag could move.
