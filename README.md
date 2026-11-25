@@ -235,7 +235,7 @@ Docker Compose is the supported way to run the app. This demo shows the publishe
 
 | Path | Contents |
 | --- | --- |
-| `deploy/app/` | Kustomize files: `db` and `redis`, then the `migrate` Job, then two `api` pods with the AI features off |
+| `deploy/app/` | Kustomize files: `db`, `redis`, `kafka` and the provider simulator, then the `migrate` and `topic-init` Jobs, then two `api` pods, the dispatcher and two workers; `network.yaml` holds the network rules |
 | `deploy/app/images/` | Image pins (commit tag and digest), written only by `scripts/promote_images.py` |
 | `deploy/argocd/` | The Argo CD project (six allowed kinds, this repository, one namespace) and Application |
 | `deploy/kind/cluster.yaml` | The cluster, with its node image pinned by digest |
@@ -243,7 +243,25 @@ Docker Compose is the supported way to run the app. This demo shows the publishe
 `.github/workflows/gitops.yml` runs when these files or their scripts change, with a read-only token:
 
 - `manifests` renders `deploy/app`, runs `scripts/check_deploy.py`, and re-checks every image pin's signed build record.
-- `cluster` runs `scripts/gitops_cluster.py up` at the PR head, then `scripts/smoke_gitops.py`: Synced and Healthy at that commit, `scripts/smoke.py` through a loopback port-forward, Argo CD undoing a manual scale to 0, and a failing migration that must leave the API pods alone. It proves amd64 only.
+- `cluster` runs `scripts/gitops_cluster.py up` at the PR head, then `scripts/smoke_gitops.py`. It proves amd64 only. The checks:
+  - Synced and Healthy at that commit;
+  - `smoke.py`, then `smoke_ai.py`, `smoke_rag.py` and `smoke_assistant.py`, through a loopback port-forward. The job installs poppler, and fails without `pdftoppm`, so OCR really runs;
+  - the network paths, probed from inside every long-running pod: exactly the planned ones are open, and none to the internet;
+  - Argo CD undoing a manual scale to 0;
+  - a failing migration that must leave the API pods alone.
+
+The cluster runs the AI features, the assistant, its demo setup and memory. The only provider is the simulator, with a fake key that is the one literal credential in git. Left out: SQS, connectors, the OpenTelemetry collector, Langfuse, the TLS edge, graph extraction and RAG diagnostics.
+
+Traffic is denied both ways except cluster DNS and:
+
+| To | From |
+| --- | --- |
+| `db` 5432 | `api`, `migrate`, `dispatcher`, `worker`, `rag-worker` |
+| `redis` 6379 | `api` |
+| `kafka` 9092 | `topic-init`, `dispatcher`, `worker`, `rag-worker` |
+| `provider` 8080 | `api`, `worker`, `rag-worker` |
+
+At most 30 database connections are in use, and at most 59 in a rollout; `check_deploy.py` bounds the total.
 
 A pull request from a fork runs its own code in these jobs, with a read-only token and no secrets.
 
@@ -267,7 +285,7 @@ Add `--postgres` to `promote` to move PostgreSQL too. `rollback` never moves `mi
 
 Argo CD's manifest is checked against an exact SHA-256, but the images it names are tags, not digests.
 
-This is a demo: PostgreSQL is a prerelease, there is one database pod, no TLS and no network rules yet.
+This is a demo: PostgreSQL is a prerelease, there is one database pod and one Kafka pod, and no TLS. Network policies need a cluster network that enforces them (kind's does), and they never block a pod's traffic with its own node.
 
 ## Durable item rewriting
 
