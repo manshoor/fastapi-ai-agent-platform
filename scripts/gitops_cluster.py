@@ -8,7 +8,8 @@
     3. Argo CD core, from one exact manifest
     4. the Argo CD project and Application: Argo CD then syncs deploy/app
 
-Only ever touches the cluster `fastapi-gitops`, always by its own context name. Secret
+Only ever touches the cluster `fastapi-gitops` on this machine's Docker, always by its own
+context in a private kubeconfig: your own kubeconfig is neither read nor changed. Secret
 values go over stdin, are never printed, and existing Secrets are never replaced.
 """
 
@@ -17,6 +18,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import secrets
 import subprocess
@@ -31,6 +33,11 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 CLUSTER = "fastapi-gitops"
 CONTEXT = f"kind-{CLUSTER}"
+KUBECONFIG = ROOT / ".gitops-local" / "kubeconfig"
+PRIVATE_MODE = 0o700
+# kind's other providers have their own endpoints.
+PROVIDER = "docker"
+LOCAL_DOCKER = "unix:///"
 NAMESPACE = "fastapi-demo"
 ARGOCD_NAMESPACE = "argocd"
 KIND_CONFIG = ROOT / "deploy" / "kind" / "cluster.yaml"
@@ -90,8 +97,24 @@ def run(command: list[str], stdin: str = "", timeout: int = TIMEOUT_SECONDS) -> 
     return result.stdout
 
 
+def kubectl_command(*arguments: str) -> list[str]:
+    return ["kubectl", "--kubeconfig", str(KUBECONFIG), "--context", CONTEXT, *arguments]
+
+
 def kubectl(*arguments: str, stdin: str = "", timeout: int = TIMEOUT_SECONDS) -> str:
-    return run(["kubectl", "--context", CONTEXT, *arguments], stdin, timeout)
+    return run(kubectl_command(*arguments), stdin, timeout)
+
+
+def require_local_docker() -> None:
+    """Refuse unless kind would use the Docker socket of this machine."""
+    if os.environ.get("KIND_EXPERIMENTAL_PROVIDER", PROVIDER) not in ("", PROVIDER):
+        raise ClusterError("the kind provider is not docker")
+    # DOCKER_HOST beats the context. A TCP address, even loopback, may be a tunnel.
+    host = os.environ.get("DOCKER_HOST") or run(
+        ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"]
+    )
+    if not host.strip().startswith(LOCAL_DOCKER):
+        raise ClusterError("the Docker endpoint is not a local socket")
 
 
 def check_server(config: Mapping) -> None:
@@ -116,9 +139,12 @@ def require_loopback() -> None:
 
 
 def _create_cluster() -> None:
+    KUBECONFIG.parent.mkdir(mode=PRIVATE_MODE, exist_ok=True)
+    target = ["--name", CLUSTER, "--kubeconfig", str(KUBECONFIG)]
     if CLUSTER in run(["kind", "get", "clusters"]).split():
+        run(["kind", "export", "kubeconfig", *target])
         return
-    command = ["kind", "create", "cluster", "--name", CLUSTER, "--config", str(KIND_CONFIG)]
+    command = ["kind", "create", "cluster", *target, "--config", str(KIND_CONFIG)]
     run([*command, "--wait", "180s"], timeout=CREATE_TIMEOUT_SECONDS)
 
 
@@ -213,6 +239,7 @@ def application(revision: str | None) -> dict:
 def up(revision: str | None) -> None:
     # Read first, so a bad revision creates nothing.
     target = application(revision)
+    require_local_docker()
     _create_cluster()
     require_loopback()
 
@@ -227,7 +254,9 @@ def up(revision: str | None) -> None:
 
 
 def down() -> None:
-    run(["kind", "delete", "cluster", "--name", CLUSTER], timeout=CREATE_TIMEOUT_SECONDS)
+    require_local_docker()
+    command = ["kind", "delete", "cluster", "--name", CLUSTER, "--kubeconfig", str(KUBECONFIG)]
+    run(command, timeout=CREATE_TIMEOUT_SECONDS)
 
 
 def main() -> None:

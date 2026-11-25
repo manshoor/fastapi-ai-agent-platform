@@ -172,3 +172,31 @@ def test_the_recovery_requests_a_sync_only_if_needed(monkeypatch, synced, failed
     assert len(requested) == (starts == "on request")
     for sync in requested:
         assert sync == {"revision": COMMIT, "prune": True, "syncOptions": ["PruneLast=true"]}
+
+
+def test_the_waits_fit_their_step_and_the_job():
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "gitops.yml").read_text())
+    job = workflow["jobs"]["cluster"]
+    minutes = {step.get("name"): step.get("timeout-minutes") for step in job["steps"]}
+    limits = [
+        minutes[name]
+        for name in (
+            "Start the cluster",
+            "Smoke-test the cluster",
+            "Show pods, events and logs",
+            "Delete the cluster",
+        )
+    ]
+    # A step limit fails the step; the job limit would cancel the job and skip the dump.
+    assert all(limits)
+    assert sum(limits) <= job["timeout-minutes"] - 3
+    waits = (
+        smoke.SYNC_SECONDS
+        + smoke.FORWARD_SECONDS
+        + smoke.SMOKE_SECONDS
+        + smoke.HEAL_SECONDS
+        + smoke.FAIL_SECONDS
+        + smoke.START_SECONDS
+        + smoke.RECOVER_SECONDS
+    )
+    assert waits < minutes["Smoke-test the cluster"] * 60

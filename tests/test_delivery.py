@@ -52,6 +52,15 @@ SECRET_REFERENCE = re.compile(
     r"\bsecrets\s*[.\[]|\bsecrets[\"']?\s*:\s*[\"']?inherit\b", re.IGNORECASE
 )
 SECRET_KEY = re.compile(r"secrets", re.IGNORECASE)
+# Expressions an action input may hold: values this repository's workflows make, and the
+# commit to check out.
+INPUT_EXPRESSIONS = {
+    "steps.publish.outputs.app",
+    "steps.publish.outputs.postgres",
+    "steps.publish.outputs.simulator",
+    "matrix.arch",
+    "github.event.pull_request.head.sha || github.sha",
+}
 # The only expression a shell command may hold; anything else could carry event text.
 RUN_EXPRESSIONS = {"matrix.arch"}
 
@@ -145,14 +154,26 @@ def rule_pins(workflow: dict) -> None:
     found += [job["uses"] for job in workflow["jobs"].values() if "uses" in job]
     for reference in found:
         assert PINNED.fullmatch(reference), reference
+    # Their images would need digests; no job needs them.
+    for name, job in workflow["jobs"].items():
+        assert not {"container", "services"} & set(job), name
+
+
+def _check_text(node: object, allowed: set[str]) -> None:
+    for text in _strings(node):
+        assert text.count("${{") == len(re.findall(r"\$\{\{.*?\}\}", text, re.DOTALL))
+        found = {match.strip() for match in re.findall(r"\$\{\{(.*?)\}\}", text, re.DOTALL)}
+        assert found <= allowed, found
 
 
 def rule_no_event_text(workflow: dict) -> None:
+    _check_text(workflow.get("defaults"), RUN_EXPRESSIONS)
+    for job in workflow["jobs"].values():
+        _check_text(job.get("defaults"), RUN_EXPRESSIONS)
+        _check_text(job.get("with"), INPUT_EXPRESSIONS)
     for step in _steps(workflow):
-        run = step.get("run", "")
-        assert run.count("${{") == len(re.findall(r"\$\{\{.*?\}\}", run, re.DOTALL))
-        found = {match.strip() for match in re.findall(r"\$\{\{(.*?)\}\}", run, re.DOTALL)}
-        assert found <= RUN_EXPRESSIONS, found
+        _check_text([step.get("run"), step.get("shell")], RUN_EXPRESSIONS)
+        _check_text(step.get("with"), INPUT_EXPRESSIONS)
 
 
 @pytest.mark.parametrize("path", WORKFLOWS, ids=lambda path: path.name)
@@ -330,6 +351,27 @@ BAD_EDITS = [
         "  lint:\n    permissions: {contents: read, id-token: write}\n",
     ),
     ("job-write-all", rule_read_only, "  lint:\n", "  lint:\n    permissions: write-all\n"),
+    ("with-event", rule_no_event_text, PATTERN, "          pattern: ${{ github.head_ref }}\n"),
+    (
+        "shell-event",
+        rule_no_event_text,
+        LINT_RUN,
+        LINT_RUN + "        shell: bash ${{ github.event.pull_request.title }}\n",
+    ),
+    (
+        "job-with-event",
+        rule_no_event_text,
+        "jobs:\n",
+        f"jobs:\n  extra:\n    uses: a/b/c.yml@{SHA}\n    with: {{a: '${{{{ github.actor }}}}'}}\n",
+    ),
+    (
+        "default-shell-event",
+        rule_no_event_text,
+        "jobs:\n",
+        "defaults: {run: {shell: '${{ github.head_ref }}'}}\njobs:\n",
+    ),
+    ("container", rule_pins, "  lint:\n", "  lint:\n    container: alpine:3\n"),
+    ("services", rule_pins, "  lint:\n", "  lint:\n    services: {a: {image: alpine}}\n"),
     ("secret-env", rule_no_secrets, LINT_RUN, LINT_RUN + "        env: {A: '${{ secrets.A }}'}\n"),
     ("secret-run", rule_no_secrets, LINT_RUN, "      - run: echo ${{ secrets.A }}\n"),
     ("secret-index", rule_no_secrets, LINT_RUN, "      - run: echo ${{ secrets['A'] }}\n"),
@@ -502,6 +544,8 @@ def test_a_reading_edit_is_accepted(rule, old, new):
         (rule_no_secrets, "${{ github.token }}", "${{ secrets.GITHUB_TOKEN }}"),
         (rule_no_event_text, '--revision "$REVISION"', "--revision ${{ github.head_ref }}"),
         (rule_pins, "actions/checkout@", "actions/checkout@v7 #"),
+        (rule_pins, "  cluster:\n", "  cluster:\n    container: alpine:3\n"),
+        (rule_no_event_text, "fetch-depth: 0", "fetch-depth: ${{ github.head_ref }}"),
     ],
 )
 def test_a_bad_gitops_edit_is_rejected(rule, old, new):
@@ -513,21 +557,212 @@ def test_a_bad_gitops_edit_is_rejected(rule, old, new):
         rule(workflow, *arguments)
 
 
-def test_gitops_tools_and_checks_are_the_expected_ones():
-    workflow = _load(GITOPS)
+# Rules for gitops.yml
+
+CHECKED_OUT = "${{ github.event.pull_request.head.sha || github.sha }}"
+GITOPS_PATHS = [
+    "deploy/**",
+    "scripts/check_deploy.py",
+    "scripts/gitops_cluster.py",
+    "scripts/promote_images.py",
+    "scripts/smoke.py",
+    "scripts/smoke_gitops.py",
+    ".github/workflows/gitops.yml",
+]
+INSTALL_KUBECTL = """\
+mkdir -p "$RUNNER_TEMP/bin"
+curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/bin/kubectl" "$KUBECTL_URL"
+echo "$KUBECTL_SHA256  $RUNNER_TEMP/bin/kubectl" | sha256sum --check --strict
+chmod +x "$RUNNER_TEMP/bin/kubectl"
+echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+"""  # noqa: E501
+INSTALL_KIND = """\
+curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/bin/kind" "$KIND_URL"
+echo "$KIND_SHA256  $RUNNER_TEMP/bin/kind" | sha256sum --check --strict
+chmod +x "$RUNNER_TEMP/bin/kind"
+"""
+SETUP_RUNS = [None, None, "uv python install 3.13", "uv sync --locked", INSTALL_KUBECTL]
+MANIFESTS_RUNS = [
+    *SETUP_RUNS,
+    'kubectl kustomize deploy/app > "$RUNNER_TEMP/app.yaml"',
+    'uv run --locked python scripts/check_deploy.py < "$RUNNER_TEMP/app.yaml"',
+    "uv run --locked python scripts/promote_images.py verify",
+]
+DUMP_STEP = "Show pods, events and logs"
+CLUSTER_RUNS = [
+    *SETUP_RUNS,
+    INSTALL_KIND,
+    'uv run --locked python scripts/gitops_cluster.py up --revision "$REVISION"',
+    'uv run --locked python scripts/smoke_gitops.py --revision "$REVISION"',
+    DUMP_STEP,
+    "uv run --locked python scripts/gitops_cluster.py down",
+]
+GITOPS_ENV = {"KUBECTL_URL", "KUBECTL_SHA256", "KIND_URL", "KIND_SHA256"}
+# Pods hold references to Secrets, never their values; nothing else here can show one.
+DUMP_LINE = re.compile(
+    r"kube=\(kubectl --kubeconfig \.gitops-local/kubeconfig --context kind-fastapi-gitops\)"
+    r"|for name in [\w -]+; do|done"
+    r"|\"\$\{kube\[@\]\}\" (--namespace [\w-]+ )?"
+    r"(get pods --all-namespaces --output wide"
+    r"|get application fastapi-demo --output yaml"
+    r"|get deployments,statefulsets,jobs,services,persistentvolumeclaims --output wide"
+    r"|describe pods"
+    r"|get events --all-namespaces --sort-by \.lastTimestamp"
+    r"|logs --selector \"app\.kubernetes\.io/name=\$name\" --all-containers --prefix --tail \d+"
+    r") \|\| true"
+)
+
+
+def rule_gitops_triggers(workflow: dict) -> None:
+    assert workflow[True] == {
+        "push": {"branches": ["main"], "paths": GITOPS_PATHS},
+        "pull_request": {"paths": GITOPS_PATHS},
+        "workflow_dispatch": None,
+    }
+
+
+def rule_gitops_steps(workflow: dict) -> None:
+    assert set(workflow) == {"name", True, "permissions", "concurrency", "env", "jobs"}
     assert workflow["permissions"] == {"contents": "read"}
-    assert set(workflow["jobs"]) == {"manifests", "cluster"}
-    assert workflow["jobs"]["cluster"]["timeout-minutes"] == 30
-    for tool in ("KUBECTL", "KIND"):
+    # No variable that a shell would run, such as BASH_ENV.
+    assert set(workflow["env"]) == GITOPS_ENV
+    jobs = workflow["jobs"]
+    assert set(jobs) == {"manifests", "cluster"}
+    assert set(jobs["manifests"]) == {"runs-on", "timeout-minutes", "steps"}
+    assert set(jobs["cluster"]) == {"runs-on", "timeout-minutes", "env", "steps"}
+    assert jobs["cluster"]["env"] == {"REVISION": CHECKED_OUT}
+    assert jobs["cluster"]["timeout-minutes"] == 30
+    assert {job["runs-on"] for job in jobs.values()} == {"ubuntu-24.04"}
+
+    for job, expected in (("manifests", MANIFESTS_RUNS), ("cluster", CLUSTER_RUNS)):
+        runs = []
+        for step in jobs[job]["steps"]:
+            dump = step.get("name") == DUMP_STEP
+            runs.append(DUMP_STEP if dump else step.get("run"))
+            assert set(step) <= {"name", "uses", "with", "run", "env", "if", "timeout-minutes"}
+            # Only the dump and the teardown are conditional.
+            condition = "failure()" if dump else "always()" if "down" in str(runs[-1]) else None
+            assert step.get("if") == condition, step
+            verify = str(runs[-1]).endswith("promote_images.py verify")
+            token = {"GH_TOKEN": "${{ github.token }}"} if verify else None
+            assert step.get("env") == token, step
+        assert runs == expected
+
+    for job in jobs.values():
+        actions = [_action(step) for step in job["steps"] if "uses" in step]
+        assert actions == ["actions/checkout", "astral-sh/setup-uv"]
+        checkout = job["steps"][0]["with"]
+        assert checkout["ref"] == CHECKED_OUT
+        assert set(checkout) <= {"persist-credentials", "fetch-depth", "ref"}
+        assert job["steps"][1]["with"] == {"version": "0.13.6"}
+    # Without history, the pin order could not be checked.
+    assert jobs["manifests"]["steps"][0]["with"].get("fetch-depth") == 0
+
+
+def rule_gitops_dump(workflow: dict) -> None:
+    (dump,) = [
+        step for step in workflow["jobs"]["cluster"]["steps"] if step.get("name") == DUMP_STEP
+    ]
+    for line in dump["run"].splitlines():
+        assert DUMP_LINE.fullmatch(line.strip()), line
+
+
+def rule_gitops_tools(workflow: dict) -> None:
+    for tool, host in (
+        ("KUBECTL", "https://dl.k8s.io/release/"),
+        ("KIND", "https://github.com/kubernetes-sigs/kind/releases/download/"),
+    ):
         assert re.fullmatch(r"[0-9a-f]{64}", workflow["env"][f"{tool}_SHA256"])
-        assert re.search(r"/v\d+\.\d+\.\d+/", workflow["env"][f"{tool}_URL"])
-    commands = _commands(workflow["jobs"]["manifests"])
-    assert "scripts/check_deploy.py <" in commands
-    assert "promote_images.py verify" in commands
-    cluster = _commands(workflow["jobs"]["cluster"])
-    assert "smoke_gitops.py --revision" in cluster
-    # The failure dump must not print Secret objects.
-    assert not re.search(r"\bsecrets?\b", cluster, re.IGNORECASE)
+        url = workflow["env"][f"{tool}_URL"]
+        assert re.fullmatch(re.escape(host) + r"v\d+\.\d+\.\d+/[\w/-]+", url)
+
+
+GITOPS_RULES: list[Callable[[dict], None]] = [
+    rule_gitops_triggers,
+    rule_gitops_steps,
+    rule_gitops_dump,
+    rule_gitops_tools,
+]
+
+
+@pytest.mark.parametrize("rule", GITOPS_RULES, ids=lambda rule: rule.__name__)
+def test_gitops_follows(rule):
+    rule(_load(GITOPS))
+
+
+VERIFY = "        run: uv run --locked python scripts/promote_images.py verify\n"
+CHECK = "        run: uv run --locked python scripts/check_deploy.py"
+DUMP_POD = '          "${kube[@]}" --namespace fastapi-demo '
+GITOPS_EDITS = [
+    ("target", rule_gitops_triggers, "  pull_request:\n", "  pull_request_target:\n"),
+    ("run-trigger", rule_gitops_triggers, DISPATCH, DISPATCH + "  workflow_run:\n"),
+    ("fewer-paths", rule_gitops_triggers, "      - deploy/**\n", ""),
+    (
+        "kubectl-checksum",
+        rule_gitops_steps,
+        '          echo "$KUBECTL_SHA256  $RUNNER_TEMP/bin/kubectl" | sha256sum --check --strict\n',
+        "",
+    ),
+    (
+        "kind-checksum",
+        rule_gitops_steps,
+        '          echo "$KIND_SHA256  $RUNNER_TEMP/bin/kind" | sha256sum --check --strict\n',
+        "",
+    ),
+    ("verify-or-true", rule_gitops_steps, VERIFY, VERIFY[:-1] + " || true\n"),
+    ("verify-ignored", rule_gitops_steps, VERIFY, VERIFY + "        continue-on-error: true\n"),
+    ("verify-if", rule_gitops_steps, VERIFY, VERIFY + "        if: false\n"),
+    ("verify-shell", rule_gitops_steps, VERIFY, VERIFY + "        shell: bash {0} || true\n"),
+    ("no-verify", rule_gitops_steps, VERIFY, "        run: 'true'\n"),
+    ("check-or-true", rule_gitops_steps, CHECK, "        run: true || python check_deploy.py"),
+    ("job-if", rule_gitops_steps, "  manifests:\n", "  manifests:\n    if: false\n"),
+    ("job-ignored", rule_gitops_steps, "  cluster:\n", "  cluster:\n    continue-on-error: true\n"),
+    ("shell-env", rule_gitops_steps, "\nenv:\n", "\nenv:\n  BASH_ENV: x.sh\n"),
+    ("defaults", rule_gitops_steps, "\njobs:\n", "\ndefaults: {run: {shell: sh}}\njobs:\n"),
+    ("other-ref", rule_gitops_steps, f"          ref: {CHECKED_OUT}\n", "          ref: main\n"),
+    ("shallow", rule_gitops_steps, "          fetch-depth: 0\n", ""),
+    (
+        "no-smoke",
+        rule_gitops_steps,
+        "scripts/smoke_gitops.py --revision",
+        "scripts/x.py --revision",
+    ),
+    (
+        "extra-step",
+        rule_gitops_steps,
+        "      - name: Render\n",
+        "      - run: ./x\n      - name: Render\n",
+    ),
+    (
+        "dump-exec",
+        rule_gitops_dump,
+        f"{DUMP_POD}describe",
+        f"{DUMP_POD}exec deployment/api -- env || true\n{DUMP_POD}describe",
+    ),
+    ("dump-secret", rule_gitops_dump, "get deployments,", "get secrets,"),
+    (
+        "dump-yaml",
+        rule_gitops_dump,
+        "persistentvolumeclaims --output wide",
+        "persistentvolumeclaims --output yaml",
+    ),
+    ("dump-env", rule_gitops_dump, "          kube=(", "          env\n          kube=("),
+    ("dump-chain", rule_gitops_dump, "describe pods || true", "describe pods || true; env"),
+    ("tool-latest", rule_gitops_tools, "/release/v1.36.4/", "/release/stable/"),
+    ("tool-host", rule_gitops_tools, "https://dl.k8s.io/", "https://example.com/"),
+]
+
+
+@pytest.mark.parametrize(
+    ("rule", "old", "new"),
+    [edit[1:] for edit in GITOPS_EDITS],
+    ids=[edit[0] for edit in GITOPS_EDITS],
+)
+def test_a_bad_gitops_gate_edit_is_rejected(rule, old, new):
+    text = GITOPS.read_text()
+    assert old in text
+    with pytest.raises(AssertionError):
+        rule(yaml.safe_load(text.replace(old, new, 1)))
 
 
 def test_a_new_workflow_with_write_access_is_rejected(tmp_path):

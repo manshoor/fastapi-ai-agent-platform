@@ -31,7 +31,8 @@ class FakeTools:
     def __init__(self):
         self.calls: list[tuple[list[str], str]] = []
         self.answers: list[tuple[str, object]] = [
-            ("config view", json.dumps(kube_config("https://127.0.0.1:6443")))
+            ("config view", json.dumps(kube_config("https://127.0.0.1:6443"))),
+            ("docker context inspect", "unix:///var/run/docker.sock\n"),
         ]
 
     def __call__(self, command, stdin="", timeout=0):
@@ -53,7 +54,10 @@ def kube_config(server: str, **extra) -> dict:
 
 
 @pytest.fixture
-def tools(monkeypatch) -> FakeTools:
+def tools(monkeypatch, tmp_path) -> FakeTools:
+    for name in ("DOCKER_HOST", "KIND_EXPERIMENTAL_PROVIDER"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(script, "KUBECONFIG", tmp_path / "private" / "kubeconfig")
     fake = FakeTools()
     monkeypatch.setattr(script, "run", fake)
     monkeypatch.setattr(script, "_download_manifest", lambda: "argocd: manifest")
@@ -101,7 +105,9 @@ def test_every_kubectl_call_names_the_context(tools):
     calls = [command for command, _ in tools.calls if command[0] == "kubectl"]
     assert calls
     for command in calls:
-        assert command[1:3] == ["--context", "kind-fastapi-gitops"]
+        assert command[1:3] == ["--kubeconfig", str(script.KUBECONFIG)]
+        assert command[3:5] == ["--context", "kind-fastapi-gitops"]
+        assert command.count("--kubeconfig") == 1
         assert command.count("--context") == 1
 
 
@@ -117,6 +123,54 @@ def test_an_existing_cluster_is_kept(tools):
     tools.answers.append(("kind get clusters", "other\nfastapi-gitops\n"))
     script.up(None)
     assert not [line for line in tools.lines() if line.startswith("kind create")]
+
+
+def test_kind_never_writes_the_users_kubeconfig(tools):
+    script.up(None)
+    script.down()
+    tools.answers.append(("kind get clusters", "fastapi-gitops"))
+    script.up(None)
+    calls = [c for c, _ in tools.calls if c[0] == "kind" and c[1] != "get"]
+    assert {c[1] for c in calls} == {"create", "delete", "export"}
+    for command in calls:
+        assert command[command.index("--kubeconfig") + 1] == str(script.KUBECONFIG)
+    assert script.KUBECONFIG.parent.stat().st_mode & 0o777 == 0o700
+
+
+REMOTE = ["tcp://127.0.0.1:2375", "ssh://user@example.com", "tcp://example.com:2376", "", "x"]
+
+
+@pytest.mark.parametrize("host", REMOTE)
+@pytest.mark.parametrize("act", [lambda: script.up(None), script.down], ids=["up", "down"])
+def test_a_remote_docker_context_is_refused(tools, act, host):
+    tools.answers.append(("docker context inspect", host + "\n"))
+    with pytest.raises(script.ClusterError, match="Docker"):
+        act()
+    assert not [line for line in tools.lines() if not line.startswith("docker context")]
+
+
+@pytest.mark.parametrize("host", [host for host in REMOTE if host])
+@pytest.mark.parametrize("act", [lambda: script.up(None), script.down], ids=["up", "down"])
+def test_a_remote_docker_host_is_refused(tools, monkeypatch, act, host):
+    monkeypatch.setenv("DOCKER_HOST", host)
+    with pytest.raises(script.ClusterError, match="Docker"):
+        act()
+    assert tools.calls == []
+
+
+def test_another_kind_provider_is_refused(tools, monkeypatch):
+    # It would use its own endpoint, which the Docker check does not cover.
+    monkeypatch.setenv("KIND_EXPERIMENTAL_PROVIDER", "podman")
+    for act in (lambda: script.up(None), script.down):
+        with pytest.raises(script.ClusterError, match="provider"):
+            act()
+    assert tools.calls == []
+
+
+def test_a_local_docker_host_is_accepted(tools, monkeypatch):
+    monkeypatch.setenv("DOCKER_HOST", "unix:///run/user/1000/docker.sock")
+    script.down()
+    assert [line for line in tools.lines() if line.startswith("kind delete")]
 
 
 # Secrets

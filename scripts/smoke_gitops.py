@@ -67,13 +67,15 @@ FAILING_PATCHES = [
 FAILED_PHASES = {"Failed", "Error"}
 FORWARDING = re.compile(r"Forwarding from 127\.0\.0\.1:(\d+) ")
 POLL_SECONDS = 3
-SYNC_SECONDS = 600
-HEAL_SECONDS = 240
-FAIL_SECONDS = 300
+# Their sum must stay under the step limit in gitops.yml, or no log would be shown.
+SYNC_SECONDS = 300
+HEAL_SECONDS = 120
+FAIL_SECONDS = 180
+RECOVER_SECONDS = 180
 # How long Argo CD gets to start a sync by itself before one is requested.
-START_SECONDS = 45
-FORWARD_SECONDS = 30
-SMOKE_SECONDS = 120
+START_SECONDS = 30
+FORWARD_SECONDS = 20
+SMOKE_SECONDS = 60
 
 
 class SmokeError(RuntimeError):
@@ -185,8 +187,8 @@ def _all_ready(pods: Mapping[str, bool]) -> bool:
 
 @contextmanager
 def _port_forward() -> Iterator[str]:
-    command = ["kubectl", "--context", cluster.CONTEXT, "--namespace", cluster.NAMESPACE]
-    command += ["port-forward", "--address", "127.0.0.1", "service/api", ":8000"]
+    command = cluster.kubectl_command("--namespace", cluster.NAMESPACE, "port-forward")
+    command += ["--address", "127.0.0.1", "service/api", ":8000"]
     with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
         try:
             readable, _, _ = select.select([process.stdout], [], [], FORWARD_SECONDS)
@@ -197,16 +199,19 @@ def _port_forward() -> Iterator[str]:
             process.terminate()
 
 
-def _check_synced(revision: str) -> None:
-    _wait("Synced and Healthy", lambda: is_synced(_get_app(), revision), SYNC_SECONDS)
+def _check_synced(revision: str, seconds: int = SYNC_SECONDS) -> None:
+    _wait("Synced and Healthy", lambda: is_synced(_get_app(), revision), seconds)
 
 
 def _check_http() -> None:
     script = Path(__file__).resolve().parent / "smoke.py"
     with _port_forward() as url:
-        result = subprocess.run(
-            [sys.executable, str(script), "--base-url", url], check=False, timeout=SMOKE_SECONDS
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script), "--base-url", url], check=False, timeout=SMOKE_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            raise SmokeError("smoke.py timed out") from None
     _expect(result.returncode == 0, "smoke.py failed")
 
 
@@ -267,7 +272,7 @@ def _check_failing_migration(revision: str) -> None:
         _wait("Argo CD starts a sync", lambda: _started_clean(failed_at), START_SECONDS)
     except SmokeError:
         _request_sync(revision)
-    _check_synced(revision)
+    _check_synced(revision, RECOVER_SECONDS)
     _expect(_api_pods() == before, "the recovery replaced the API pods")
 
 

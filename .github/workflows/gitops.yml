@@ -88,15 +88,19 @@ jobs:
           curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/bin/kind" "$KIND_URL"
           echo "$KIND_SHA256  $RUNNER_TEMP/bin/kind" | sha256sum --check --strict
           chmod +x "$RUNNER_TEMP/bin/kind"
+      # Step limits: the job limit would cancel the job and skip the logs below.
       - name: Start the cluster
+        timeout-minutes: 7
         run: uv run --locked python scripts/gitops_cluster.py up --revision "$REVISION"
       - name: Smoke-test the cluster
+        timeout-minutes: 16
         run: uv run --locked python scripts/smoke_gitops.py --revision "$REVISION"
       # Never Secrets.
       - name: Show pods, events and logs
         if: failure()
+        timeout-minutes: 2
         run: |
-          kube=(kubectl --context kind-fastapi-gitops)
+          kube=(kubectl --kubeconfig .gitops-local/kubeconfig --context kind-fastapi-gitops)
           "${kube[@]}" get pods --all-namespaces --output wide || true
           "${kube[@]}" --namespace argocd get application fastapi-demo --output yaml || true
           "${kube[@]}" --namespace fastapi-demo get deployments,statefulsets,jobs,services,persistentvolumeclaims --output wide || true
@@ -110,4 +114,5 @@ jobs:
           done
       - name: Delete the cluster
         if: always()
+        timeout-minutes: 2
         run: uv run --locked python scripts/gitops_cluster.py down
