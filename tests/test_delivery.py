@@ -699,11 +699,11 @@ def rule_gitops_tools(workflow: dict) -> None:
 
 KIND_STEP = "      - name: Install kind\n"
 SMOKE_LIMIT = (
-    "        timeout-minutes: 16\n        run: uv run --locked python scripts/smoke_gitops.py"
+    "        timeout-minutes: 15\n        run: uv run --locked python scripts/smoke_gitops.py"
 )
 DUMP_LIMIT = "        if: failure()\n        timeout-minutes: 2\n"
 # Every cluster step that runs a command, and its limit. The sum leaves the job limit
-# room for the two actions, so a hung step still fails with its logs shown.
+# room for the two actions and the runner, so a hung step still fails with its logs shown.
 CLUSTER_LIMITS = {
     "uv python install 3.13": 1,
     "uv sync --locked": 1,
@@ -711,12 +711,12 @@ CLUSTER_LIMITS = {
     "Install kind": 1,
     "Install poppler": 2,
     "Start the cluster": 4,
-    "Smoke-test the cluster": 16,
+    "Smoke-test the cluster": 15,
     "Show pods, events and logs": 2,
     "Delete the cluster": 1,
 }
 CLUSTER_MINUTES = 30
-ACTION_ROOM_MINUTES = 1
+ACTION_ROOM_MINUTES = 2
 
 
 def rule_gitops_limits(workflow: dict) -> None:
@@ -805,14 +805,15 @@ GITOPS_EDITS = [
     ),
     ("dump-env", rule_gitops_dump, "          kube=(", "          env\n          kube=("),
     ("dump-chain", rule_gitops_dump, "describe pods || true", "describe pods || true; env"),
-    ("smoke-25", rule_gitops_limits, "timeout-minutes: 16\n", "timeout-minutes: 25\n"),
-    ("smoke-40", rule_gitops_limits, "timeout-minutes: 16\n", "timeout-minutes: 40\n"),
+    ("smoke-16", rule_gitops_limits, "timeout-minutes: 15\n", "timeout-minutes: 16\n"),
+    ("smoke-25", rule_gitops_limits, "timeout-minutes: 15\n", "timeout-minutes: 25\n"),
+    ("smoke-40", rule_gitops_limits, "timeout-minutes: 15\n", "timeout-minutes: 40\n"),
     ("start-20", rule_gitops_limits, "timeout-minutes: 4\n", "timeout-minutes: 20\n"),
     (
         "no-smoke-limit",
         rule_gitops_limits,
         SMOKE_LIMIT,
-        SMOKE_LIMIT.replace("        timeout-minutes: 16\n", ""),
+        SMOKE_LIMIT.replace("        timeout-minutes: 15\n", ""),
     ),
     (
         "no-dump-limit",

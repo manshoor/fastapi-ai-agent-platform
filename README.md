@@ -1135,3 +1135,19 @@ Run with mentions (2026-11-23, same two cases, one repeat): `graph` passed both 
 Paid assistant eval of prompt `assistant-v5` (2026-11-23, one repeat, no judge, AI stack defaults): 23 of 24 cases passed, including all 21 earlier ones and both messages that mix an action with a document question (the model acted first, then searched). `mixed-conditional-device` ("If quiet hours start before 23:00, set ...") failed `status`, `citations` and `forbidden`: the model searched, then tried `set_thermostat` although the prompt says not to. The server denied it (`not_permitted`), the device did not change, and the resident got the fixed refusal sentence but not the quiet-hours fact. Prompt `assistant-v6` and a fixed reason in the refused call's output now tell the model to answer from the passages anyway.
 
 Paid run of `assistant-v6` (same day, one repeat, no judge): 23 of 24 again. `mixed-conditional-device` now passes `status` and `citations` and fails only `forbidden`: the model still tried `set_thermostat`, the server denied it, and the resident got the quiet-hours answer with the refusal sentence. The case now accepts a refused attempt, since the attempt is what makes the server tell the resident that nothing ran. `forbidden` was relaxed after this run, so 23 of 24 is the score under the stricter `forbidden` check. `state` was tightened after this run too: a ticket opened, or either thermostat left changed, before the search now fails it. End-state checks miss a write that leaves the checked state unchanged (the living room set to its existing 21, or to 18 and back to 21) and do not cover memory notes; repeated refused attempts pass, and the case no longer measures the prompt's "do not call the action's tool".
+
+GitOps promotion and rollback drill (2026-11-26, GitHub-hosted amd64 runners, `.github/workflows/gitops.yml`):
+
+| Pin | Before | Promotion (`36c5ebb`) | Drill (`d6275a4`) |
+| --- | --- | --- | --- |
+| `app` | `e36f4d0` | `ea13d07` | `e36f4d0` |
+| `migrate` | `e36f4d0` | `ea13d07` | `ea13d07` |
+| `postgres` | `e36f4d0` | `e36f4d0` | `e36f4d0` |
+| `simulator` | `e36f4d0` | `ea13d07` | `e36f4d0` |
+
+Image digests: app and migrate `sha256:87ef9338cf9ac047d67243be3ea3aae44c0521de5c25ae58ec10b46b14cdcb63` at `ea13d07`, app `sha256:f0a982ffe230a11b3fcc2ce80cd99e66009cb3ed3e32e88206cb7f32005f3219` at `e36f4d0`; simulator `sha256:989b79fcda945bd09945505baaf493b30d321e508fa8edd0174dd45c9d1a94dd` at `ea13d07`, `sha256:47050cb80d6d4f3c4a130026c5458c22dd4e713d223f87641895122583b759a8` at `e36f4d0`; postgres `sha256:a719495f45caf0f469ee569bc85badd03e5b73cc24c884ae8826e19d534539bb`. All three `ea13d07` images passed `gh attestation verify` against `refs/heads/main` before the promotion. Postgres stayed because `docker/postgres` did not change between the two commits.
+
+- Promotion: `promote_images.py promote ea13d07…` on PR 12. [Run 45887874533](https://github.com/manshoor/fastapi-ai-agent-platform/actions/runs/45887874533) passed both jobs: `manifests` 31 s, `cluster` 5 min 27 s (cluster start 64 s, smoke 3 min 57 s).
+- Rollback drill: `promote_images.py rollback e36f4d0…` on draft PR 13, closed unmerged. [Run 45888771819](https://github.com/manshoor/fastapi-ai-agent-platform/actions/runs/45888771819) passed both jobs: `manifests` 29 s, `cluster` 6 min 18 s (cluster start 65 s, smoke 4 min 26 s). The `e36f4d0` app and simulator ran against the `ea13d07` migrate pin, and every smoke, network, self-heal and failing-migration check passed.
+
+Limits: `git diff e36f4d0 ea13d07 -- migrations/` is empty, so no migration lies between the two commits. The drill proves the rollback mechanism, not a rollback across a schema change. Both runs are amd64 only.
