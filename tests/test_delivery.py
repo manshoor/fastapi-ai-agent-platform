@@ -600,6 +600,8 @@ MANIFESTS_RUNS = [
     "uv run --locked python scripts/promote_images.py verify",
 ]
 DUMP_STEP = "Show pods, events and logs"
+DUMP_PODS = "db redis kafka provider migrate topic-init api dispatcher worker rag-worker"
+DUMP_ARGOCD = "argocd-application-controller argocd-repo-server"
 CLUSTER_RUNS = [
     *SETUP_RUNS,
     INSTALL_KIND,
@@ -676,6 +678,9 @@ def rule_gitops_dump(workflow: dict) -> None:
     (dump,) = [
         step for step in workflow["jobs"]["cluster"]["steps"] if step.get("name") == DUMP_STEP
     ]
+    # Every workload's logs, then Argo CD's.
+    loops = [line.strip() for line in dump["run"].splitlines() if "for name in" in line]
+    assert loops == [f"for name in {DUMP_PODS}; do", f"for name in {DUMP_ARGOCD}; do"]
     for line in dump["run"].splitlines():
         assert DUMP_LINE.fullmatch(line.strip()), line
 
@@ -763,6 +768,7 @@ GITOPS_EDITS = [
     ),
     ("dump-env", rule_gitops_dump, "          kube=(", "          env\n          kube=("),
     ("dump-chain", rule_gitops_dump, "describe pods || true", "describe pods || true; env"),
+    ("dump-fewer", rule_gitops_dump, "for name in db redis kafka", "for name in db kafka"),
     ("tool-latest", rule_gitops_tools, "/release/v1.36.4/", "/release/stable/"),
     ("tool-host", rule_gitops_tools, "https://dl.k8s.io/", "https://example.com/"),
 ]

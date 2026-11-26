@@ -153,6 +153,8 @@ POOL_SETTING = "DB_POOL_SIZE"
 POOL_SIZE = re.compile(r"[1-9]|10")
 # Alembic uses one connection without a pool.
 JOB_CONNECTIONS = 1
+# One pod at a time: parallelism or completions would multiply a Job's connections.
+JOB_SPEC_KEYS = {"backoffLimit", "activeDeadlineSeconds", "template"}
 WORKERS = ("dispatcher", "worker", "rag-worker")
 WORKER_REPLICAS = 1
 WORKER_STOP_SECONDS = 50
@@ -646,6 +648,8 @@ def rule_connections(docs: Docs) -> Problems:
         if name not in DATABASE_CLIENTS:
             continue
         if doc["kind"] == "Job":
+            if set(doc["spec"]) != JOB_SPEC_KEYS:
+                yield f"{name}: the Job may run more than one pod"
             rollout += JOB_CONNECTIONS
             continue
         pool, replicas = _pool(pod["containers"][0]), doc["spec"].get("replicas")
@@ -715,6 +719,8 @@ def rule_topics(docs: Docs) -> Problems:
         yield "topic-init: the script is not the expected one"
     if job["spec"].get("backoffLimit") != 0:
         yield "topic-init: the Job retries by itself"
+    if set(job["spec"]) != JOB_SPEC_KEYS:
+        yield "topic-init: the Job may run more than one pod"
 
 
 def _selector(name: str) -> dict:
