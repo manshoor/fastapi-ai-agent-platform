@@ -74,8 +74,8 @@ FORWARDING = re.compile(r"Forwarding from 127\.0\.0\.1:(\d+) ")
 POLL_SECONDS = 3
 # Their sum stays two minutes under the step limit in gitops.yml, so a slow failing run
 # still prints its FAIL line before the limit cuts it off. Measured in CI: about 4 minutes.
-SYNC_SECONDS = 180
-HEAL_SECONDS = 30
+SYNC_SECONDS = 150
+HEAL_SECONDS = 60
 FAIL_SECONDS = 150
 RECOVER_SECONDS = 90
 # How long Argo CD gets to start a sync by itself before one is requested.
