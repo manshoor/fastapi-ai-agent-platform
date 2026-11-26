@@ -116,6 +116,71 @@ def test_ready_pods_skips_pods_being_deleted():
     assert smoke.ready_pods(pods) == {"a": True, "b": False, "d": False}
 
 
+DIGEST = "sha256:" + "1" * 64
+OTHER_DIGEST = "sha256:" + "2" * 64
+SECRET = "not-for-the-log"
+
+
+def _image_pod(name: str, digest: str, **metadata) -> dict:
+    image = f"ghcr.io/example/{name}"
+    return {
+        "metadata": {"labels": {"app.kubernetes.io/name": name}, **metadata},
+        "spec": {"containers": [{"env": [{"name": "TOKEN", "value": SECRET}]}]},
+        "status": {"containerStatuses": [{"image": image, "imageID": f"{image}@{digest}"}]},
+    }
+
+
+def test_the_running_images_are_logged_when_they_match():
+    pods = {"items": [_image_pod("api", DIGEST), _image_pod("api", DIGEST)]}
+    pods["items"].append(_image_pod("redis", OTHER_DIGEST))
+    assert smoke.check_images(pods, {"api": DIGEST}) == [f"api {DIGEST}"]
+
+
+@pytest.mark.parametrize(
+    "pods",
+    [
+        [_image_pod("api", OTHER_DIGEST)],
+        [_image_pod("api", DIGEST), _image_pod("api", OTHER_DIGEST)],
+        [_image_pod("redis", DIGEST)],
+        [_image_pod("api", DIGEST, deletionTimestamp="2026-01-01T00:00:00Z")],
+    ],
+    ids=["other digest", "mixed digests", "no pod", "only a deleting pod"],
+)
+def test_an_image_that_is_not_its_pin_fails(pods):
+    with pytest.raises(smoke.SmokeError) as error:
+        smoke.check_images({"items": pods}, {"api": DIGEST})
+    assert SECRET not in str(error.value)
+
+
+@pytest.mark.parametrize("image_id", ["", "sha256:" + "1" * 64, "ghcr.io/example/api:latest"])
+def test_a_container_without_a_digest_fails(image_id):
+    pod = _image_pod("api", DIGEST)
+    pod["status"]["containerStatuses"][0]["imageID"] = image_id
+    with pytest.raises(smoke.SmokeError, match="no image digest"):
+        smoke.check_images({"items": [pod]}, {"api": DIGEST})
+
+
+def test_a_pod_with_no_container_status_fails():
+    pod = _image_pod("api", DIGEST)
+    del pod["status"]["containerStatuses"]
+    with pytest.raises(smoke.SmokeError):
+        smoke.check_images({"items": [pod]}, {"api": DIGEST})
+
+
+def test_the_logged_images_hold_names_and_digests_only():
+    lines = smoke.check_images({"items": [_image_pod("api", DIGEST)]}, {"api": DIGEST})
+    assert SECRET not in "\n".join(lines)
+    assert "ghcr.io" not in "\n".join(lines)
+
+
+def test_every_pinned_workload_is_checked():
+    pinned = smoke.pinned_digests()
+    assert set(pinned) == set(smoke.checker.PIN_NAMES)
+    pins = smoke.checker.promote.parse_pins((smoke.checker.APP / smoke.checker.PINS).read_text())
+    for name, pin_name in smoke.checker.PIN_NAMES.items():
+        assert pinned[name] == pins[pin_name].digest
+
+
 def test_the_failing_patch_fits_the_manifests():
     job, api = (
         yaml.safe_load_all((ROOT / "deploy" / "app" / f"{name}.yaml").read_text())

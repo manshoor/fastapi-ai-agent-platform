@@ -245,6 +245,7 @@ Docker Compose is the supported way to run the app. This demo shows the publishe
 - `manifests` renders `deploy/app`, runs `scripts/check_deploy.py`, and re-checks every image pin's signed build record.
 - `cluster` runs `scripts/gitops_cluster.py up` at the PR head, then `scripts/smoke_gitops.py`. It proves amd64 only. The checks:
   - Synced and Healthy at that commit;
+  - every pinned workload's pods run the digest pinned in `deploy/app/images/`. It logs each workload name and digest, nothing else;
   - `smoke.py`, then `smoke_ai.py`, `smoke_rag.py` and `smoke_assistant.py`, through a loopback port-forward. The job installs poppler, and fails without `pdftoppm`, so OCR really runs;
   - the network paths, probed over TCP from inside every long-running pod. The Python pods (`api`, `provider`, the dispatcher and workers) try every planned path: exactly the planned ones are open. `db`, `redis` and `kafka` try only their own port and the internet. No pod opens a TCP connection to the internet; cluster DNS still resolves outside names;
   - Argo CD undoing a manual scale to 0;

@@ -2,7 +2,7 @@
 
 python scripts/smoke_gitops.py --revision <40-hex commit>
 
-1. Argo CD is Synced and Healthy at that commit
+1. Argo CD is Synced and Healthy at that commit, and every pinned workload runs its pin
 2. scripts/smoke.py passes through a loopback port-forward
 3. smoke_ai.py, smoke_rag.py (with OCR) and smoke_assistant.py pass the same way
 4. only the planned network paths are open: no other pod to pod, none to the internet
@@ -74,8 +74,8 @@ FORWARDING = re.compile(r"Forwarding from 127\.0\.0\.1:(\d+) ")
 POLL_SECONDS = 3
 # Their sum stays two minutes under the step limit in gitops.yml, so a slow failing run
 # still prints its FAIL line before the limit cuts it off. Measured in CI: about 4 minutes.
-SYNC_SECONDS = 180
-HEAL_SECONDS = 30
+SYNC_SECONDS = 150
+HEAL_SECONDS = 60
 FAIL_SECONDS = 150
 RECOVER_SECONDS = 90
 # How long Argo CD gets to start a sync by itself before one is requested.
@@ -130,6 +130,8 @@ for target in "$@"; do
   esac
 done
 """
+# What a pod reports for an image pulled by digest: <repository>@<digest>.
+IMAGE_ID = re.compile(rf".+@({checker.promote.DIGEST.pattern})")
 # smoke_rag.py renders its scanned page with it, and skips OCR without it.
 OCR_TOOL = "pdftoppm"
 
@@ -238,6 +240,38 @@ def _all_ready(pods: Mapping[str, bool]) -> bool:
     return len(pods) == REPLICAS and all(pods.values())
 
 
+# Reading the running images
+
+
+def pinned_digests() -> dict[str, str]:
+    """Workload -> the digest deploy/app/images/ pins for it."""
+    pins = checker.promote.parse_pins((checker.APP / checker.PINS).read_text())
+    return {name: pins[pin].digest for name, pin in checker.PIN_NAMES.items()}
+
+
+def _pod_digests(name: str, pod: Mapping) -> set[str]:
+    # A pod with no container status yet counts as one container with no digest.
+    statuses = pod.get("status", {}).get("containerStatuses") or [{}]
+    digests = set()
+    for status in statuses:
+        match = IMAGE_ID.fullmatch(status.get("imageID") or "")
+        _expect(match, f"{name}: no image digest")
+        digests.add(match[1])
+    return digests
+
+
+def check_images(pods: Mapping, pinned: Mapping[str, str]) -> list[str]:
+    """One "<workload> <digest>" line per pinned workload; fails on any other digest."""
+    found: dict[str, set[str]] = {name: set() for name in pinned}
+    for pod in pods["items"]:
+        name = pod["metadata"].get("labels", {}).get(checker.NAME_LABEL)
+        if name in pinned and "deletionTimestamp" not in pod["metadata"]:
+            found[name] |= _pod_digests(name, pod)
+    for name, digest in pinned.items():
+        _expect(found[name] == {digest}, f"{name} runs {sorted(found[name])}, pinned {digest}")
+    return [f"{name} {digest}" for name, digest in pinned.items()]
+
+
 # The checks
 
 
@@ -257,6 +291,12 @@ def _port_forward() -> Iterator[str]:
 
 def _check_synced(revision: str, seconds: int = SYNC_SECONDS) -> None:
     _wait("Synced and Healthy", lambda: is_synced(_get_app(), revision), seconds)
+
+
+def _check_images() -> None:
+    # Names and digests only: the pod JSON also holds env, which is never printed.
+    for line in check_images(_get("pods"), pinned_digests()):
+        print(f"IMAGE: {line}", flush=True)
 
 
 def _run_smokes(smokes: Mapping[str, int]) -> None:
@@ -393,6 +433,7 @@ def main() -> None:
         parser.error("--revision must be 40 lowercase hex characters")
     checks: list[tuple[str, Callable[[], None]]] = [
         ("Synced and Healthy at the commit", lambda: _check_synced(args.revision)),
+        ("every pinned workload runs its pin", _check_images),
         ("smoke.py through a port-forward", lambda: _run_smokes(CORE_SMOKES)),
         ("the AI smokes, with OCR, through a port-forward", _check_ai),
         ("only the planned network paths are open", _check_network),
