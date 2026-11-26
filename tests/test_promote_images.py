@@ -209,6 +209,38 @@ def test_verify_accepts_a_rollback_and_a_promotion(tools, base):
     script.verify(pins(NEW, NEW, NEW))
 
 
+def test_verify_accepts_other_images_on_main(tools, base):
+    # Adding or dropping a pinned image must not block its own pull request.
+    extra = "  - name: new\n    newName: x\n    newTag: sha-1\n    digest: y\n"
+    base["text"] = script.render_pins(pins()) + extra
+    script.verify(pins())
+    lines = script.render_pins(pins()).splitlines(keepends=True)
+    base["text"] = "".join(lines[:-4])
+    script.verify(pins())
+
+
+def test_verify_still_checks_order_beside_other_images(tools, base):
+    base["text"] = script.render_pins(pins()) + "  - name: new\n  - 3\n"
+    with pytest.raises(script.PromoteError, match="migrate moved back"):
+        script.verify(pins(OLD, OLD, MID))
+
+
+@pytest.mark.parametrize(
+    "text", ["x: [", "", "- a", "images: 3", "images: [{name: migrate, newTag: 3}]"]
+)
+def test_verify_accepts_repairing_a_bad_file_on_main(tools, base, text):
+    base["text"] = text
+    script.verify(pins())
+
+
+def test_verify_skips_only_the_unreadable_pin_on_main(tools, base):
+    text = script.render_pins(pins())
+    base["text"] = text.replace(f"newTag: sha-{MID}", "newTag: x", 2)  # app and migrate
+    script.verify(pins(OLD, OLD, MID))
+    with pytest.raises(script.PromoteError, match="postgres moved back"):
+        script.verify(pins(OLD, OLD, OLD))
+
+
 def test_verify_accepts_the_first_pins(tools, base):
     base["text"] = None
     script.verify(pins())

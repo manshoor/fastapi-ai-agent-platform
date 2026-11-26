@@ -52,6 +52,10 @@ spec:
                 name: database-settings
             - configMapRef:
                 name: api-settings
+            - configMapRef:
+                name: ai-settings
+            - configMapRef:
+                name: provider-settings
           env:
             - name: DB_PASSWORD
               valueFrom:
@@ -63,6 +67,21 @@ spec:
                 secretKeyRef:
                   name: api-secrets
                   key: jwt-secret
+            - name: ASSISTANT_TOTP_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: api-secrets
+                  key: totp-key
+            - name: ASSISTANT_MEMORY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: api-secrets
+                  key: memory-key
+            - name: DB_POOL_SIZE
+              value: "10"
+            # Not a secret: the simulator takes any key.
+            - name: OPENAI_API_KEY
+              value: local-simulator-only-not-a-real-key
           ports:
             - name: http
               containerPort: 8000

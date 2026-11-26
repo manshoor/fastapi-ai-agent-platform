@@ -1,0 +1,88 @@
+# Headless, and published before ready: the broker resolves its own name while it starts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: kafka
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kafka
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kafka
+    spec:
+      automountServiceAccountToken: false
+      # A Service named `kafka` would inject KAFKA_PORT, which the image reads as a setting.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        # The image's appuser.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: kafka
+          image: apache/kafka:4.1.2@sha256:5cc2a2fd93fa2687b44015eee04fb2c3edd9e526bd64bf8bec5ff1e268772e0e
+          envFrom:
+            - configMapRef:
+                name: kafka-settings
+          ports:
+            - name: kafka
+              containerPort: 9092
+          # TCP: a metadata check would wait on the broker's own advertised name.
+          readinessProbe:
+            tcpSocket:
+              port: kafka
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # The entrypoint writes its settings under /opt/kafka.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  # Server defaults spelled out, so Argo CD sees no drift.
+  volumeClaimTemplates:
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: 1Gi

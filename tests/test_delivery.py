@@ -561,12 +561,20 @@ def test_a_bad_gitops_edit_is_rejected(rule, old, new):
 
 CHECKED_OUT = "${{ github.event.pull_request.head.sha || github.sha }}"
 GITOPS_PATHS = [
+    "pyproject.toml",
+    "uv.lock",
     "deploy/**",
     "scripts/check_deploy.py",
     "scripts/gitops_cluster.py",
     "scripts/promote_images.py",
     "scripts/smoke.py",
+    "scripts/smoke_ai.py",
+    "scripts/smoke_assistant.py",
     "scripts/smoke_gitops.py",
+    "scripts/smoke_rag.py",
+    "app/assistant/totp.py",
+    "tests/support/docx_files.py",
+    "tests/support/pdfs.py",
     ".github/workflows/gitops.yml",
 ]
 INSTALL_KUBECTL = """\
@@ -581,6 +589,11 @@ curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/bi
 echo "$KIND_SHA256  $RUNNER_TEMP/bin/kind" | sha256sum --check --strict
 chmod +x "$RUNNER_TEMP/bin/kind"
 """
+INSTALL_POPPLER = """\
+sudo apt-get update
+sudo apt-get install --yes --no-install-recommends poppler-utils
+command -v pdftoppm
+"""
 SETUP_RUNS = [None, None, "uv python install 3.13", "uv sync --locked", INSTALL_KUBECTL]
 MANIFESTS_RUNS = [
     *SETUP_RUNS,
@@ -589,9 +602,12 @@ MANIFESTS_RUNS = [
     "uv run --locked python scripts/promote_images.py verify",
 ]
 DUMP_STEP = "Show pods, events and logs"
+DUMP_PODS = "db redis kafka provider migrate topic-init api dispatcher worker rag-worker"
+DUMP_ARGOCD = "argocd-application-controller argocd-repo-server"
 CLUSTER_RUNS = [
     *SETUP_RUNS,
     INSTALL_KIND,
+    INSTALL_POPPLER,
     'uv run --locked python scripts/gitops_cluster.py up --revision "$REVISION"',
     'uv run --locked python scripts/smoke_gitops.py --revision "$REVISION"',
     DUMP_STEP,
@@ -605,7 +621,8 @@ DUMP_LINE = re.compile(
     r"|\"\$\{kube\[@\]\}\" (--namespace [\w-]+ )?"
     r"(get pods --all-namespaces --output wide"
     r"|get application fastapi-demo --output yaml"
-    r"|get deployments,statefulsets,jobs,services,persistentvolumeclaims --output wide"
+    r"|get deployments,statefulsets,jobs,services,persistentvolumeclaims,networkpolicies"
+    r" --output wide"
     r"|describe pods"
     r"|get events --all-namespaces --sort-by \.lastTimestamp"
     r"|logs --selector \"app\.kubernetes\.io/name=\$name\" --all-containers --prefix --tail \d+"
@@ -663,6 +680,9 @@ def rule_gitops_dump(workflow: dict) -> None:
     (dump,) = [
         step for step in workflow["jobs"]["cluster"]["steps"] if step.get("name") == DUMP_STEP
     ]
+    # Every workload's logs, then Argo CD's.
+    loops = [line.strip() for line in dump["run"].splitlines() if "for name in" in line]
+    assert loops == [f"for name in {DUMP_PODS}; do", f"for name in {DUMP_ARGOCD}; do"]
     for line in dump["run"].splitlines():
         assert DUMP_LINE.fullmatch(line.strip()), line
 
@@ -677,7 +697,42 @@ def rule_gitops_tools(workflow: dict) -> None:
         assert re.fullmatch(re.escape(host) + r"v\d+\.\d+\.\d+/[\w/-]+", url)
 
 
+KIND_STEP = "      - name: Install kind\n"
+SMOKE_LIMIT = (
+    "        timeout-minutes: 16\n        run: uv run --locked python scripts/smoke_gitops.py"
+)
+DUMP_LIMIT = "        if: failure()\n        timeout-minutes: 2\n"
+# Every cluster step that runs a command, and its limit. The sum leaves the job limit
+# room for the two actions, so a hung step still fails with its logs shown.
+CLUSTER_LIMITS = {
+    "uv python install 3.13": 1,
+    "uv sync --locked": 1,
+    "Install kubectl": 1,
+    "Install kind": 1,
+    "Install poppler": 2,
+    "Start the cluster": 4,
+    "Smoke-test the cluster": 16,
+    "Show pods, events and logs": 2,
+    "Delete the cluster": 1,
+}
+CLUSTER_MINUTES = 30
+ACTION_ROOM_MINUTES = 1
+
+
+def rule_gitops_limits(workflow: dict) -> None:
+    job = workflow["jobs"]["cluster"]
+    assert job["timeout-minutes"] == CLUSTER_MINUTES
+    limits = {
+        step.get("name") or step["run"]: step.get("timeout-minutes")
+        for step in job["steps"]
+        if "run" in step
+    }
+    assert limits == CLUSTER_LIMITS
+    assert sum(limits.values()) <= CLUSTER_MINUTES - ACTION_ROOM_MINUTES
+
+
 GITOPS_RULES: list[Callable[[dict], None]] = [
+    rule_gitops_limits,
     rule_gitops_triggers,
     rule_gitops_steps,
     rule_gitops_dump,
@@ -715,6 +770,8 @@ GITOPS_EDITS = [
     ("verify-shell", rule_gitops_steps, VERIFY, VERIFY + "        shell: bash {0} || true\n"),
     ("no-verify", rule_gitops_steps, VERIFY, "        run: 'true'\n"),
     ("check-or-true", rule_gitops_steps, CHECK, "        run: true || python check_deploy.py"),
+    ("no-poppler", rule_gitops_steps, "          command -v pdftoppm\n", ""),
+    ("no-smoke-path", rule_gitops_triggers, "      - scripts/smoke_rag.py\n", ""),
     ("job-if", rule_gitops_steps, "  manifests:\n", "  manifests:\n    if: false\n"),
     ("job-ignored", rule_gitops_steps, "  cluster:\n", "  cluster:\n    continue-on-error: true\n"),
     ("shell-env", rule_gitops_steps, "\nenv:\n", "\nenv:\n  BASH_ENV: x.sh\n"),
@@ -743,11 +800,31 @@ GITOPS_EDITS = [
     (
         "dump-yaml",
         rule_gitops_dump,
-        "persistentvolumeclaims --output wide",
-        "persistentvolumeclaims --output yaml",
+        "networkpolicies --output wide",
+        "networkpolicies --output yaml",
     ),
     ("dump-env", rule_gitops_dump, "          kube=(", "          env\n          kube=("),
     ("dump-chain", rule_gitops_dump, "describe pods || true", "describe pods || true; env"),
+    ("smoke-25", rule_gitops_limits, "timeout-minutes: 16\n", "timeout-minutes: 25\n"),
+    ("smoke-40", rule_gitops_limits, "timeout-minutes: 16\n", "timeout-minutes: 40\n"),
+    ("start-20", rule_gitops_limits, "timeout-minutes: 4\n", "timeout-minutes: 20\n"),
+    (
+        "no-smoke-limit",
+        rule_gitops_limits,
+        SMOKE_LIMIT,
+        SMOKE_LIMIT.replace("        timeout-minutes: 16\n", ""),
+    ),
+    (
+        "no-dump-limit",
+        rule_gitops_limits,
+        DUMP_LIMIT,
+        DUMP_LIMIT.replace("        timeout-minutes: 2\n", ""),
+    ),
+    ("unlimited-step", rule_gitops_limits, KIND_STEP, "      - run: sleep 1000\n" + KIND_STEP),
+    ("long-job", rule_gitops_limits, "    timeout-minutes: 30\n", "    timeout-minutes: 60\n"),
+    ("no-lock-path", rule_gitops_triggers, "      - uv.lock\n", ""),
+    ("no-project-path", rule_gitops_triggers, "      - pyproject.toml\n", ""),
+    ("dump-fewer", rule_gitops_dump, "for name in db redis kafka", "for name in db kafka"),
     ("tool-latest", rule_gitops_tools, "/release/v1.36.4/", "/release/stable/"),
     ("tool-host", rule_gitops_tools, "https://dl.k8s.io/", "https://example.com/"),
 ]

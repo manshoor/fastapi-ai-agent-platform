@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import urllib.error
 import urllib.request
@@ -138,8 +139,25 @@ def require_loopback() -> None:
     check_server(json.loads(kubectl("config", "view", "--minify", "--output", "json")))
 
 
+def _private_folder() -> None:
+    """Create the kubeconfig's folder, or refuse one that others could change."""
+    folder = KUBECONFIG.parent
+    try:
+        folder.mkdir(mode=PRIVATE_MODE)
+    except FileExistsError:
+        pass
+    # lstat: a link is not followed.
+    status = folder.lstat()
+    if (
+        not stat.S_ISDIR(status.st_mode)
+        or stat.S_IMODE(status.st_mode) != PRIVATE_MODE
+        or status.st_uid != os.getuid()
+    ):
+        raise ClusterError(f"{folder.name} is not a private folder of this user (mode 0700)")
+
+
 def _create_cluster() -> None:
-    KUBECONFIG.parent.mkdir(mode=PRIVATE_MODE, exist_ok=True)
+    _private_folder()
     target = ["--name", CLUSTER, "--kubeconfig", str(KUBECONFIG)]
     if CLUSTER in run(["kind", "get", "clusters"]).split():
         run(["kind", "export", "kubeconfig", *target])
@@ -255,6 +273,7 @@ def up(revision: str | None) -> None:
 
 def down() -> None:
     require_local_docker()
+    _private_folder()
     command = ["kind", "delete", "cluster", "--name", CLUSTER, "--kubeconfig", str(KUBECONFIG)]
     run(command, timeout=CREATE_TIMEOUT_SECONDS)
 

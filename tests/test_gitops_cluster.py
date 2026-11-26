@@ -3,6 +3,7 @@
 import base64
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -134,6 +135,43 @@ def test_kind_never_writes_the_users_kubeconfig(tools):
     assert {c[1] for c in calls} == {"create", "delete", "export"}
     for command in calls:
         assert command[command.index("--kubeconfig") + 1] == str(script.KUBECONFIG)
+    assert script.KUBECONFIG.parent.stat().st_mode & 0o777 == 0o700
+
+
+def _make_link(path: Path) -> None:
+    path.parent.joinpath("elsewhere").mkdir(mode=0o700)
+    path.symlink_to(path.parent / "elsewhere")
+
+
+UNSAFE_FOLDERS = {
+    "open": lambda path: path.mkdir(mode=0o755),
+    "link": _make_link,
+    "file": lambda path: path.write_text(""),
+}
+
+
+@pytest.mark.parametrize("make", UNSAFE_FOLDERS.values(), ids=UNSAFE_FOLDERS)
+@pytest.mark.parametrize(
+    "act", [lambda: script.up(None), lambda: script.down()], ids=["up", "down"]
+)
+def test_an_unsafe_private_folder_is_refused(tools, act, make):
+    make(script.KUBECONFIG.parent)
+    with pytest.raises(script.ClusterError, match="private"):
+        act()
+    assert not [line for line in tools.lines() if line.startswith("kind ")]
+
+
+def test_another_users_folder_is_refused(tools, monkeypatch):
+    script.KUBECONFIG.parent.mkdir(mode=0o700)
+    owner = script.KUBECONFIG.parent.stat().st_uid
+    monkeypatch.setattr(script.os, "getuid", lambda: owner + 1)
+    with pytest.raises(script.ClusterError, match="private"):
+        script.down()
+
+
+def test_down_works_before_up_and_after(tools):
+    script.down()
+    script.down()
     assert script.KUBECONFIG.parent.stat().st_mode & 0o777 == 0o700
 
 
@@ -306,4 +344,4 @@ def test_the_kind_node_is_pinned_and_local():
     config = yaml.safe_load(script.KIND_CONFIG.read_text())
     assert config["networking"]["apiServerAddress"] == "127.0.0.1"
     (node,) = config["nodes"]
-    assert checker.PINNED.fullmatch(node["image"])
+    assert re.fullmatch(r"kindest/node(:v[\d.]+)?@sha256:[0-9a-f]{64}", node["image"])

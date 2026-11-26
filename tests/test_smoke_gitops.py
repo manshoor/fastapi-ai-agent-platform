@@ -3,6 +3,10 @@
 import copy
 import importlib.util
 import json
+import socket
+import subprocess
+import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -137,6 +141,102 @@ def test_port_forward_output_gives_the_port():
     assert not smoke.FORWARDING.match("Forwarding from 0.0.0.0:40123 -> 8000\n")
 
 
+def test_the_ai_smokes_need_the_ocr_tool(monkeypatch):
+    # smoke_rag.py would skip OCR silently.
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: None)
+    monkeypatch.setattr(smoke, "_run_smokes", lambda _: pytest.fail("ran without OCR"))
+    with pytest.raises(smoke.SmokeError, match="pdftoppm"):
+        smoke._check_ai()
+
+
+def test_smokes_share_one_port_forward_and_stop_at_a_failure(monkeypatch):
+    commands = []
+
+    @contextmanager
+    def forward():
+        yield "http://127.0.0.1:40123"
+
+    def run(command, check, timeout):
+        commands.append((Path(command[1]).name, command[2:], timeout))
+        return subprocess.CompletedProcess(command, len(commands) == 2)
+
+    monkeypatch.setattr(smoke, "_port_forward", forward)
+    monkeypatch.setattr(smoke.subprocess, "run", run)
+    with pytest.raises(smoke.SmokeError, match="smoke_rag.py failed"):
+        smoke._run_smokes(smoke.AI_SMOKES)
+    url = ["--base-url", "http://127.0.0.1:40123"]
+    assert commands == [("smoke_ai.py", url, 45), ("smoke_rag.py", url, 60)]
+
+
+def test_every_smoke_exists():
+    for script in {**smoke.CORE_SMOKES, **smoke.AI_SMOKES}:
+        assert (ROOT / "scripts" / script).is_file()
+
+
+def test_the_probed_paths_are_the_planned_ones():
+    assert smoke.expected_paths("api") == {
+        "db:5432": "open",
+        "redis:6379": "open",
+        "kafka:9092": "timeout",
+        "provider:8080": "open",
+        "github.com:443": "timeout",
+    }
+    assert smoke.expected_paths("provider") == {
+        "db:5432": "timeout",
+        "redis:6379": "timeout",
+        "kafka:9092": "timeout",
+        "api:8000": "timeout",
+        "github.com:443": "timeout",
+    }
+
+
+def test_every_running_workload_is_probed():
+    probed = {*smoke.PYTHON_PODS, *(target.partition("/")[2] for target in smoke.BASH_PODS)}
+    assert probed == set(smoke.checker.WAVES) - {"migrate", "topic-init"}
+
+
+def test_the_python_probe_tells_open_refused_and_unknown_apart():
+    with socket.create_server(("127.0.0.1", 0)) as server:
+        opened = f"127.0.0.1:{server.getsockname()[1]}"
+        with socket.create_server(("127.0.0.1", 0)) as other:
+            closed = f"127.0.0.1:{other.getsockname()[1]}"
+        targets = [opened, closed, "no-such-host.invalid:1"]
+        command = [sys.executable, "-c", smoke.PYTHON_PROBE, *targets]
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
+    assert list(json.loads(result.stdout).values()) == [
+        "open",
+        "ConnectionRefusedError",
+        "no address",
+    ]
+
+
+@pytest.mark.parametrize("found", ["open", "no address", "ConnectionRefusedError"])
+def test_only_a_timeout_counts_as_blocked(monkeypatch, found):
+    answer = {**smoke.expected_paths("api"), "kafka:9092": found}
+    monkeypatch.setattr(smoke, "_exec", lambda *_, **__: json.dumps(answer))
+    with pytest.raises(smoke.SmokeError, match="api reached"):
+        smoke._probe_python("api")
+
+
+def test_the_network_check_fails_if_any_pod_does(monkeypatch):
+    def run(target, *command, namespace=smoke.cluster.NAMESPACE):
+        if command[0] == "python":
+            name = target.partition("/")[2]
+            return json.dumps(smoke.expected_paths(name))
+        lines = []
+        for probed in command[4:]:
+            reachable = namespace == "argocd" or target == leaking or probed != smoke.INTERNET
+            lines.append(f"{probed} {'open' if reachable else 'timeout'}\n")
+        return "".join(lines)
+
+    monkeypatch.setattr(smoke, "_exec", run)
+    leaking = ""
+    smoke._check_network()
+    leaking = "statefulset/kafka"
+    with pytest.raises(smoke.SmokeError, match="statefulset/kafka reached"):
+        smoke._check_network()
+
+
 def test_waiting_gives_up(monkeypatch):
     monkeypatch.setattr(smoke, "POLL_SECONDS", 0)
     with pytest.raises(smoke.SmokeError, match="timed out"):
@@ -190,13 +290,17 @@ def test_the_waits_fit_their_step_and_the_job():
     # A step limit fails the step; the job limit would cancel the job and skip the dump.
     assert all(limits)
     assert sum(limits) <= job["timeout-minutes"] - 3
+    # kubectl calls and polling add to the waits.
+    headroom = 120
     waits = (
         smoke.SYNC_SECONDS
-        + smoke.FORWARD_SECONDS
-        + smoke.SMOKE_SECONDS
+        + 2 * smoke.FORWARD_SECONDS
+        + sum(smoke.CORE_SMOKES.values())
+        + sum(smoke.AI_SMOKES.values())
+        + smoke.NETWORK_SECONDS * 2  # the control, then every pod at once
         + smoke.HEAL_SECONDS
         + smoke.FAIL_SECONDS
         + smoke.START_SECONDS
         + smoke.RECOVER_SECONDS
     )
-    assert waits < minutes["Smoke-test the cluster"] * 60
+    assert waits <= minutes["Smoke-test the cluster"] * 60 - headroom
