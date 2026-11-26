@@ -114,7 +114,7 @@ jobs:
         timeout-minutes: 4
         run: uv run --locked python scripts/gitops_cluster.py up --revision "$REVISION"
       - name: Smoke-test the cluster
-        timeout-minutes: 16
+        timeout-minutes: 15
         run: uv run --locked python scripts/smoke_gitops.py --revision "$REVISION"
       # Never Secrets.
       - name: Show pods, events and logs
