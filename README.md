@@ -246,7 +246,7 @@ Docker Compose is the supported way to run the app. This demo shows the publishe
 - `cluster` runs `scripts/gitops_cluster.py up` at the PR head, then `scripts/smoke_gitops.py`. It proves amd64 only. The checks:
   - Synced and Healthy at that commit;
   - `smoke.py`, then `smoke_ai.py`, `smoke_rag.py` and `smoke_assistant.py`, through a loopback port-forward. The job installs poppler, and fails without `pdftoppm`, so OCR really runs;
-  - the network paths, probed from inside every long-running pod: exactly the planned ones are open, and none to the internet;
+  - the network paths, probed over TCP from inside every long-running pod. The Python pods (`api`, `provider`, the dispatcher and workers) try every planned path: exactly the planned ones are open. `db`, `redis` and `kafka` try only their own port and the internet. No pod opens a TCP connection to the internet; cluster DNS still resolves outside names;
   - Argo CD undoing a manual scale to 0;
   - a failing migration that must leave the API pods alone.
 
@@ -261,7 +261,7 @@ Traffic is denied both ways except cluster DNS and:
 | `kafka` 9092 | `topic-init`, `dispatcher`, `worker`, `rag-worker` |
 | `provider` 8080 | `api`, `worker`, `rag-worker` |
 
-At most 30 database connections are in use, and at most 59 in a rollout; `check_deploy.py` bounds the total.
+The manifests use 30 database connections, and up to 51 during a rollout. `check_deploy.py` caps the totals at 30 and 59.
 
 A pull request from a fork runs its own code in these jobs, with a read-only token and no secrets.
 
