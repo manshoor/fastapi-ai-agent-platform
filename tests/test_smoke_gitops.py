@@ -165,7 +165,7 @@ def test_smokes_share_one_port_forward_and_stop_at_a_failure(monkeypatch):
     with pytest.raises(smoke.SmokeError, match="smoke_rag.py failed"):
         smoke._run_smokes(smoke.AI_SMOKES)
     url = ["--base-url", "http://127.0.0.1:40123"]
-    assert commands == [("smoke_ai.py", url, 60), ("smoke_rag.py", url, 90)]
+    assert commands == [("smoke_ai.py", url, 45), ("smoke_rag.py", url, 60)]
 
 
 def test_every_smoke_exists():
@@ -281,7 +281,6 @@ def test_the_waits_fit_their_step_and_the_job():
     limits = [
         minutes[name]
         for name in (
-            "Install poppler",
             "Start the cluster",
             "Smoke-test the cluster",
             "Show pods, events and logs",
@@ -291,6 +290,8 @@ def test_the_waits_fit_their_step_and_the_job():
     # A step limit fails the step; the job limit would cancel the job and skip the dump.
     assert all(limits)
     assert sum(limits) <= job["timeout-minutes"] - 3
+    # kubectl calls and polling add to the waits.
+    headroom = 120
     waits = (
         smoke.SYNC_SECONDS
         + 2 * smoke.FORWARD_SECONDS
@@ -302,4 +303,4 @@ def test_the_waits_fit_their_step_and_the_job():
         + smoke.START_SECONDS
         + smoke.RECOVER_SECONDS
     )
-    assert waits < minutes["Smoke-test the cluster"] * 60
+    assert waits <= minutes["Smoke-test the cluster"] * 60 - headroom

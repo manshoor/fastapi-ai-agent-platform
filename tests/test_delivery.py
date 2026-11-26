@@ -561,6 +561,8 @@ def test_a_bad_gitops_edit_is_rejected(rule, old, new):
 
 CHECKED_OUT = "${{ github.event.pull_request.head.sha || github.sha }}"
 GITOPS_PATHS = [
+    "pyproject.toml",
+    "uv.lock",
     "deploy/**",
     "scripts/check_deploy.py",
     "scripts/gitops_cluster.py",
@@ -695,7 +697,42 @@ def rule_gitops_tools(workflow: dict) -> None:
         assert re.fullmatch(re.escape(host) + r"v\d+\.\d+\.\d+/[\w/-]+", url)
 
 
+KIND_STEP = "      - name: Install kind\n"
+SMOKE_LIMIT = (
+    "        timeout-minutes: 16\n        run: uv run --locked python scripts/smoke_gitops.py"
+)
+DUMP_LIMIT = "        if: failure()\n        timeout-minutes: 2\n"
+# Every cluster step that runs a command, and its limit. The sum leaves the job limit
+# room for the two actions, so a hung step still fails with its logs shown.
+CLUSTER_LIMITS = {
+    "uv python install 3.13": 1,
+    "uv sync --locked": 1,
+    "Install kubectl": 1,
+    "Install kind": 1,
+    "Install poppler": 2,
+    "Start the cluster": 4,
+    "Smoke-test the cluster": 16,
+    "Show pods, events and logs": 2,
+    "Delete the cluster": 1,
+}
+CLUSTER_MINUTES = 30
+ACTION_ROOM_MINUTES = 1
+
+
+def rule_gitops_limits(workflow: dict) -> None:
+    job = workflow["jobs"]["cluster"]
+    assert job["timeout-minutes"] == CLUSTER_MINUTES
+    limits = {
+        step.get("name") or step["run"]: step.get("timeout-minutes")
+        for step in job["steps"]
+        if "run" in step
+    }
+    assert limits == CLUSTER_LIMITS
+    assert sum(limits.values()) <= CLUSTER_MINUTES - ACTION_ROOM_MINUTES
+
+
 GITOPS_RULES: list[Callable[[dict], None]] = [
+    rule_gitops_limits,
     rule_gitops_triggers,
     rule_gitops_steps,
     rule_gitops_dump,
@@ -768,6 +805,25 @@ GITOPS_EDITS = [
     ),
     ("dump-env", rule_gitops_dump, "          kube=(", "          env\n          kube=("),
     ("dump-chain", rule_gitops_dump, "describe pods || true", "describe pods || true; env"),
+    ("smoke-25", rule_gitops_limits, "timeout-minutes: 16\n", "timeout-minutes: 25\n"),
+    ("smoke-40", rule_gitops_limits, "timeout-minutes: 16\n", "timeout-minutes: 40\n"),
+    ("start-20", rule_gitops_limits, "timeout-minutes: 4\n", "timeout-minutes: 20\n"),
+    (
+        "no-smoke-limit",
+        rule_gitops_limits,
+        SMOKE_LIMIT,
+        SMOKE_LIMIT.replace("        timeout-minutes: 16\n", ""),
+    ),
+    (
+        "no-dump-limit",
+        rule_gitops_limits,
+        DUMP_LIMIT,
+        DUMP_LIMIT.replace("        timeout-minutes: 2\n", ""),
+    ),
+    ("unlimited-step", rule_gitops_limits, KIND_STEP, "      - run: sleep 1000\n" + KIND_STEP),
+    ("long-job", rule_gitops_limits, "    timeout-minutes: 30\n", "    timeout-minutes: 60\n"),
+    ("no-lock-path", rule_gitops_triggers, "      - uv.lock\n", ""),
+    ("no-project-path", rule_gitops_triggers, "      - pyproject.toml\n", ""),
     ("dump-fewer", rule_gitops_dump, "for name in db redis kafka", "for name in db kafka"),
     ("tool-latest", rule_gitops_tools, "/release/v1.36.4/", "/release/stable/"),
     ("tool-host", rule_gitops_tools, "https://dl.k8s.io/", "https://example.com/"),

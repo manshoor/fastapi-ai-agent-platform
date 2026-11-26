@@ -72,16 +72,17 @@ FAILING_PATCHES = [
 FAILED_PHASES = {"Failed", "Error"}
 FORWARDING = re.compile(r"Forwarding from 127\.0\.0\.1:(\d+) ")
 POLL_SECONDS = 3
-# Their sum must stay under the step limit in gitops.yml, or no log would be shown.
-SYNC_SECONDS = 240
-HEAL_SECONDS = 90
-FAIL_SECONDS = 160
-RECOVER_SECONDS = 120
+# Their sum stays two minutes under the step limit in gitops.yml, so a slow failing run
+# still prints its FAIL line before the limit cuts it off. Measured in CI: about 4 minutes.
+SYNC_SECONDS = 180
+HEAL_SECONDS = 60
+FAIL_SECONDS = 150
+RECOVER_SECONDS = 90
 # How long Argo CD gets to start a sync by itself before one is requested.
 START_SECONDS = 20
 FORWARD_SECONDS = 20
 CORE_SMOKES = {"smoke.py": 45}
-AI_SMOKES = {"smoke_ai.py": 60, "smoke_rag.py": 90, "smoke_assistant.py": 90}
+AI_SMOKES = {"smoke_ai.py": 45, "smoke_rag.py": 60, "smoke_assistant.py": 60}
 NETWORK_SECONDS = 30
 # Argo CD's repo server fetches from it, so the runner's pods can reach it.
 INTERNET = "github.com:443"
