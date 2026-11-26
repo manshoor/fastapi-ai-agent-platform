@@ -9,8 +9,8 @@ spec:
   # Never two at once: the connection budget counts one.
   strategy:
     type: Recreate
-  # A worker that cannot start exits at once; one that lasts this long counts as running.
-  minReadySeconds: 10
+  # It gives Kafka up to 15 s to start, then exits: only a later one counts as running.
+  minReadySeconds: 20
   selector:
     matchLabels:
       app.kubernetes.io/name: dispatcher

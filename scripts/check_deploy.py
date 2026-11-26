@@ -131,11 +131,13 @@ CONTAINER_KEYS = {
 POD_IDS = ("runAsUser", "runAsGroup", "fsGroup")
 POD_SECURITY_KEYS = {"runAsNonRoot", "seccompProfile", *POD_IDS}
 HOST_KEYS = ("hostNetwork", "hostPID", "hostIPC", "hostUsers", "hostAliases")
-VOLUME_TYPES = {"emptyDir", "configMap", "persistentVolumeClaim"}
+# No claim: a pod could mount another's data. StatefulSets get theirs from templates.
+VOLUME_TYPES = {"emptyDir", "configMap"}
 CLAIM_KEYS = {"apiVersion", "kind", "metadata", "spec"}
 CLAIM_SPEC_KEYS = {"accessModes", "volumeMode", "resources"}
 DATA_PATH = "/var/lib/postgresql"
 DB_ARGS = ["postgres", "-c", "max_connections=100"]
+DB_POD_VOLUMES = ["run", "tmp"]
 DB_MOUNTS = [
     {"name": "data", "mountPath": DATA_PATH},
     {"name": "run", "mountPath": "/var/run/postgresql"},
@@ -158,8 +160,11 @@ JOB_SPEC_KEYS = {"backoffLimit", "activeDeadlineSeconds", "template"}
 WORKERS = ("dispatcher", "worker", "rag-worker")
 WORKER_REPLICAS = 1
 WORKER_STOP_SECONDS = 50
-# Two parser children of at most 1 GiB each, plus the worker.
-EXACT_MEMORY = {"rag-worker": "2560Mi"}
+# Past the 15 s a worker gives Kafka to start, so a worker that cannot start is not ready.
+WORKER_READY_SECONDS = 20
+# Address-space caps, not use: two parser children of 1 GiB, each with one 256 MiB OCR
+# tool at a time, plus the worker.
+EXACT_MEMORY = {"rag-worker": "3Gi"}
 KAFKA_DATA_PATH = "/var/lib/kafka/data"
 KAFKA_REPLICAS = 1
 KAFKA_VOTERS = "1@localhost:9093"
@@ -236,37 +241,50 @@ TEXTS: dict[str, dict[str, object]] = {
     "rag-worker": {"command": ["python", "-m", "app.rag.worker"]},
 }
 TEXT_KEYS = ("command", "args", "lifecycle")
-CONFIG_KEYS = {
-    "database-settings": {"DB_HOST", "DB_PORT", "DB_NAME", "DB_USER"},
-    "api-settings": {
-        "REDIS_URL",
-        "AUTH_TOKEN_TTL_SECONDS",
-        "ASSISTANT_ENABLED",
-        "ASSISTANT_DEMO_ENABLED",
-        "ASSISTANT_MEMORY_ENABLED",
+# Every setting and its value: a host, URL or flag elsewhere would leave the demo.
+CONFIG: dict[str, dict[str, str]] = {
+    "database-settings": {
+        "DB_HOST": "db",
+        "DB_PORT": "5432",
+        "DB_NAME": "app",
+        "DB_USER": "app",
     },
-    "ai-settings": {"AI_ENABLED", "AI_POLL_SECONDS", "RAG_ENABLED", "KAFKA_BOOTSTRAP_SERVERS"},
-    "provider-settings": {"OPENAI_BASE_URL"},
+    "api-settings": {
+        "REDIS_URL": "redis://redis:6379/0",
+        "AUTH_TOKEN_TTL_SECONDS": "900",
+        "ASSISTANT_ENABLED": "true",
+        "ASSISTANT_DEMO_ENABLED": "true",
+        "ASSISTANT_MEMORY_ENABLED": "true",
+    },
+    "ai-settings": {
+        "AI_ENABLED": "true",
+        "AI_POLL_SECONDS": "0.25",
+        "RAG_ENABLED": "true",
+        "KAFKA_BOOTSTRAP_SERVERS": "kafka:9092",
+    },
+    "provider-settings": {
+        "OPENAI_BASE_URL": "http://provider:8080/v1",
+    },
     "kafka-settings": {
-        "CLUSTER_ID",
-        "KAFKA_NODE_ID",
-        "KAFKA_PROCESS_ROLES",
-        "KAFKA_LISTENERS",
-        "KAFKA_ADVERTISED_LISTENERS",
-        "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
-        "KAFKA_CONTROLLER_LISTENER_NAMES",
-        "KAFKA_CONTROLLER_QUORUM_VOTERS",
-        "KAFKA_INTER_BROKER_LISTENER_NAME",
-        "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR",
-        "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR",
-        "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR",
-        "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS",
-        "KAFKA_AUTO_CREATE_TOPICS_ENABLE",
-        "KAFKA_LOG_RETENTION_HOURS",
-        "KAFKA_LOG_RETENTION_BYTES",
-        "KAFKA_LOG_SEGMENT_BYTES",
-        "KAFKA_LOG_DIRS",
-        "KAFKA_HEAP_OPTS",
+        "CLUSTER_ID": "MkU3OEVBNTcwNTJENDM2Qk",
+        "KAFKA_NODE_ID": "1",
+        "KAFKA_PROCESS_ROLES": "broker,controller",
+        "KAFKA_LISTENERS": "PLAINTEXT://:9092,CONTROLLER://:9093",
+        "KAFKA_ADVERTISED_LISTENERS": "PLAINTEXT://kafka:9092",
+        "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP": "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT",
+        "KAFKA_CONTROLLER_LISTENER_NAMES": "CONTROLLER",
+        "KAFKA_CONTROLLER_QUORUM_VOTERS": "1@localhost:9093",
+        "KAFKA_INTER_BROKER_LISTENER_NAME": "PLAINTEXT",
+        "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR": "1",
+        "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
+        "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR": "1",
+        "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS": "0",
+        "KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
+        "KAFKA_LOG_RETENTION_HOURS": "24",
+        "KAFKA_LOG_RETENTION_BYTES": "268435456",
+        "KAFKA_LOG_SEGMENT_BYTES": "67108864",
+        "KAFKA_LOG_DIRS": "/var/lib/kafka/data",
+        "KAFKA_HEAP_OPTS": "-Xms256m -Xmx512m",
     },
 }
 # The suffix kustomize adds to a generated ConfigMap's name.
@@ -520,13 +538,13 @@ def rule_known_texts(docs: Docs) -> Problems:
         if texts != TEXTS.get(name, {}):
             yield f"{name}: command, args or lifecycle is not the expected one"
     names = [_base_name(_name(doc)) for doc in docs if doc.get("kind") == "ConfigMap"]
-    if sorted(names) != sorted(CONFIG_KEYS):
-        yield f"ConfigMaps are {sorted(names)}, expected {sorted(CONFIG_KEYS)}"
+    if sorted(names) != sorted(CONFIG):
+        yield f"ConfigMaps are {sorted(names)}, expected {sorted(CONFIG)}"
         return
-    for name, keys in CONFIG_KEYS.items():
+    for name, settings in CONFIG.items():
         (doc,) = _config_maps(docs, name)
-        if set(doc["data"]) != keys or "binaryData" in doc:
-            yield f"ConfigMap {name}: keys are not the expected ones"
+        if doc["data"] != settings or "binaryData" in doc:
+            yield f"ConfigMap {name}: settings are not the expected ones"
 
 
 def rule_provider(docs: Docs) -> Problems:
@@ -565,6 +583,10 @@ def rule_database(docs: Docs) -> Problems:
         yield "db: env is not the expected one"
     if container.get("volumeMounts") != DB_MOUNTS:
         yield "db: mounts are not the expected ones"
+    # A pod volume named like the claim would replace it.
+    volumes = [volume["name"] for volume in db["spec"]["template"]["spec"].get("volumes") or []]
+    if volumes != DB_POD_VOLUMES:
+        yield f"db: pod volumes are not {DB_POD_VOLUMES}"
     claims = db["spec"].get("volumeClaimTemplates") or []
     if [_name(claim) for claim in claims] != [DB_MOUNTS[0]["name"]]:
         yield f"db: no single claim at {DATA_PATH}"
@@ -685,6 +707,8 @@ def rule_workers(docs: Docs) -> Problems:
             yield f"{name}: not exactly one at a time"
         if spec["template"]["spec"].get("terminationGracePeriodSeconds") != WORKER_STOP_SECONDS:
             yield f"{name}: stop time is not {WORKER_STOP_SECONDS} s"
+        if spec.get("minReadySeconds") != WORKER_READY_SECONDS:
+            yield f"{name}: minReadySeconds is not {WORKER_READY_SECONDS}"
 
 
 def rule_kafka(docs: Docs) -> Problems:

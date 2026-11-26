@@ -94,6 +94,7 @@ READ_ONLY = "securityContext/readOnlyRootFilesystem"
 LABELS = "Deployment/provider/spec/template/metadata/labels"
 PROVIDER = "ConfigMap/provider-settings/data"
 VOTERS = "ConfigMap/kafka-settings/data/KAFKA_CONTROLLER_QUORUM_VOTERS"
+CLAIM_VOLUME = {"name": "x", "persistentVolumeClaim": {"claimName": "data-db-0"}}
 FAKE = {"name": "OPENAI_API_KEY", "value": checker.FAKE_KEY}
 DENY = "NetworkPolicy/default-deny"
 TO_DB = "NetworkPolicy/to-db/spec"
@@ -287,10 +288,47 @@ BAD_EDITS = [
         f"{KAFKA_BOX}/securityContext/privileged",
         True,
     ),
-    ("small-parser", "rule_memory", f"{RAG_BOX}/resources/limits/memory", "1Gi"),
+    ("small-parser", "rule_memory", f"{RAG_BOX}/resources/limits/memory", "2560Mi"),
     ("worker-reads-api", "rule_secret_access", f"{WORKER_BOX}/env/0", API_SECRET[0]),
     ("topic-hook", "rule_annotations", "Job/topic-init/metadata/annotations", {}),
     ("worker-wave", "rule_annotations", "Deployment/worker/metadata/annotations", {}),
+    ("api-claim", "rule_pod_access", f"{POD}/volumes/1", CLAIM_VOLUME),
+    ("worker-claim", "rule_pod_access", f"Deployment/worker/{FIRST[:-13]}/volumes/0", CLAIM_VOLUME),
+    ("job-claim", "rule_pod_access", "Job/migrate/spec/template/spec/volumes/0", CLAIM_VOLUME),
+    ("db-data-volume", "rule_database", f"{DB}/volumes/2", {"name": "data", "emptyDir": {}}),
+    (
+        "outside-db",
+        "rule_known_texts",
+        "ConfigMap/database-settings/data/DB_HOST",
+        "db.example.com",
+    ),
+    (
+        "outside-kafka",
+        "rule_known_texts",
+        "ConfigMap/ai-settings/data/KAFKA_BOOTSTRAP_SERVERS",
+        "kafka.example.com:9092",
+    ),
+    (
+        "redis-password",
+        "rule_known_texts",
+        "ConfigMap/api-settings/data/REDIS_URL",
+        "redis://redis:6379/0?password=x",
+    ),
+    ("rag-off", "rule_known_texts", "ConfigMap/ai-settings/data/RAG_ENABLED", "false"),
+    (
+        "memory-off",
+        "rule_known_texts",
+        "ConfigMap/api-settings/data/ASSISTANT_MEMORY_ENABLED",
+        "false",
+    ),
+    (
+        "kafka-auto-topics",
+        "rule_known_texts",
+        "ConfigMap/kafka-settings/data/KAFKA_AUTO_CREATE_TOPICS_ENABLE",
+        "true",
+    ),
+    ("worker-quick", "rule_workers", "Deployment/worker/spec/minReadySeconds", 5),
+    ("worker-no-wait", "rule_workers", "Deployment/rag-worker/spec/minReadySeconds", ...),
     ("parallel-migrate", "rule_connections", "Job/migrate/spec/parallelism", 40),
     ("many-migrates", "rule_connections", "Job/migrate/spec/completions", 40),
     ("parallel-topics", "rule_topics", "Job/topic-init/spec/parallelism", 2),
@@ -398,7 +436,7 @@ def test_every_rule_has_a_bad_edit():
 def test_generated_names_may_carry_the_kustomize_hash(good):
     docs = copy.deepcopy(good)
     text = yaml.safe_dump_all(docs)
-    for name in checker.CONFIG_KEYS:
+    for name in checker.CONFIG:
         text = text.replace(f"name: {name}\n", f"name: {name}-5g8fc84dg8\n")
     assert checker.check(list(yaml.safe_load_all(text))) == []
 

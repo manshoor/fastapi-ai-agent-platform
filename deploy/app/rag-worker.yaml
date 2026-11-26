@@ -9,8 +9,8 @@ spec:
   # Never two at once: the connection budget counts one.
   strategy:
     type: Recreate
-  # A worker that cannot start exits at once; one that lasts this long counts as running.
-  minReadySeconds: 10
+  # It gives Kafka up to 15 s to start, then exits: only a later one counts as running.
+  minReadySeconds: 20
   selector:
     matchLabels:
       app.kubernetes.io/name: rag-worker
@@ -57,8 +57,9 @@ spec:
               cpu: 100m
               memory: 256Mi
             limits:
-              # Two parser children (AI_CONCURRENCY) of at most 1 GiB each, plus the worker.
-              memory: 2560Mi
+              # Address-space caps, not use: two parser children (AI_CONCURRENCY) of 1 GiB,
+              # each with one 256 MiB OCR tool at a time, plus the worker.
+              memory: 3Gi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
