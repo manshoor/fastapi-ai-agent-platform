@@ -175,7 +175,8 @@ async def test_real_redis_expiration_uses_time_before_database_read(
     owner = await account()
     created = await item(owner)
     cache = app.state.item_cache
-    cache.ttl_ms = 200
+    # Long enough to outlast a slow runner before the deadline is read back.
+    cache.ttl_ms = 1000
     redis = app.state.redis
     key = cache_key(owner, created["id"])
     original_time = redis.time
