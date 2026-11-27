@@ -5,7 +5,7 @@
 
     1. create the kind cluster, then check that its API server is this machine
     2. namespace `fastapi-demo` (Pod Security `restricted`) and its Secrets
-    3. Argo CD core, from one exact manifest
+    3. Argo CD core, from one exact manifest, its images pulled into the node by digest
     4. the Argo CD project and Application: Argo CD then syncs deploy/app
 
 Only ever touches the cluster `fastapi-gitops` on this machine's Docker, always by its own
@@ -23,10 +23,12 @@ import re
 import secrets
 import stat
 import subprocess
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 import yaml
@@ -54,6 +56,35 @@ ARGOCD_WORKLOADS = (
     "deployment/argocd-applicationset-controller",
     "statefulset/argocd-application-controller",
 )
+
+
+class PinnedImage(NamedTuple):
+    digest: str
+    # Registries that serve this digest, the manifest's own first.
+    sources: tuple[str, ...]
+
+
+# The images the manifest names, by tag, and their index digests. `up` pulls each into the
+# node with a short retry and a second source, then runs it by digest with pull policy
+# Never: a failed pull ends `up` with a reason, not in the kubelet's growing back-off.
+ARGOCD_IMAGES = {
+    # v3.6.1
+    "quay.io/argoproj/argocd:v3.6.1": PinnedImage(
+        "sha256:296e3d74f449b2ce45265613fcb68c18ed7366488360c8ea32f5f2a93d2e5c54",
+        ("quay.io/argoproj/argocd",),
+    ),
+    # 8.10.1-alpine; Docker Hub serves the same index.
+    "public.ecr.aws/docker/library/redis:8.10.1-alpine": PinnedImage(
+        "sha256:ef216d85ec44f4fdf7c0e6df2d1757a4734ed32fbb278cabd3181b5a27353b79",
+        ("public.ecr.aws/docker/library/redis", "docker.io/library/redis"),
+    ),
+}
+NODE = f"{CLUSTER}-control-plane"
+IMAGE_LINE = re.compile(r"(?P<indent> +)(?P<dash>- )?image: (?P<image>\S+)")
+POLICY_LINE = re.compile(r" +imagePullPolicy: \w+")
+PULL_ATTEMPTS = 2
+PULL_SECONDS = 15
+PULL_WAIT_SECONDS = 5
 COMMIT = re.compile(r"[0-9a-f]{40}")
 TIMEOUT_SECONDS = 120
 CREATE_TIMEOUT_SECONDS = 600
@@ -233,8 +264,47 @@ def _download_manifest() -> str:
         raise ClusterError("the Argo CD manifest could not be downloaded") from None
 
 
+def _pull(image: PinnedImage) -> str:
+    """Pull one image into the node by digest; the reference that worked."""
+    for source in image.sources:
+        reference = f"{source}@{image.digest}"
+        for attempt in range(PULL_ATTEMPTS):
+            if attempt:
+                time.sleep(PULL_WAIT_SECONDS)
+            command = ["docker", "exec", NODE, "crictl", "pull"]
+            command += ["--pull-timeout", f"{PULL_SECONDS}s", reference]
+            try:
+                run(command, timeout=PULL_SECONDS + PULL_WAIT_SECONDS)
+                return reference
+            except ClusterError as error:
+                print(f"pull failed: {error}", flush=True)
+    raise ClusterError(f"{image.sources[0]}@{image.digest} could not be pulled")
+
+
+def pin_images(manifest: str, pulled: Mapping[str, str]) -> str:
+    """Point every container at its pulled digest, with pull policy Never."""
+    lines = []
+    found = set()
+    for line in manifest.splitlines():
+        if POLICY_LINE.fullmatch(line):
+            continue
+        match = IMAGE_LINE.fullmatch(line)
+        if not match:
+            lines.append(line)
+            continue
+        found.add(match["image"])
+        indent = match["indent"] + ("  " if match["dash"] else "")
+        lines.append(f"{match['indent']}{match['dash'] or ''}image: {pulled.get(match['image'])}")
+        lines.append(f"{indent}imagePullPolicy: Never")
+    if found != set(pulled):
+        raise ClusterError("the Argo CD manifest names other Argo CD images than the pins")
+    return "\n".join(lines) + "\n"
+
+
 def _install_argocd() -> None:
-    _apply(_download_manifest(), "--namespace", ARGOCD_NAMESPACE)
+    manifest = _download_manifest()
+    pulled = {tag: _pull(image) for tag, image in ARGOCD_IMAGES.items()}
+    _apply(pin_images(manifest, pulled), "--namespace", ARGOCD_NAMESPACE)
     for workload in ARGOCD_WORKLOADS:
         kubectl(
             *("--namespace", ARGOCD_NAMESPACE, "rollout", "status", workload),

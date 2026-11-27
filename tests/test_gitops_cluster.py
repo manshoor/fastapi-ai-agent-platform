@@ -23,6 +23,39 @@ def _load(name: str):
 script = _load("gitops_cluster")
 checker = _load("check_deploy")
 COMMIT = "a" * 40
+ARGOCD = "quay.io/argoproj/argocd:v3.6.1"
+REDIS = "public.ecr.aws/docker/library/redis:8.10.1-alpine"
+# The shape of Argo CD's workloads: an image line, sometimes a policy line after it.
+MANIFEST = f"""\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-redis
+spec:
+  template:
+    spec:
+      initContainers:
+      - command: [argocd, admin]
+        image: {ARGOCD}
+        imagePullPolicy: IfNotPresent
+        name: secret-init
+      containers:
+      - args: [--save, ""]
+        image: {REDIS}
+        imagePullPolicy: Always
+        name: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: argocd-application-controller
+spec:
+  template:
+    spec:
+      containers:
+      - image: {ARGOCD}
+        name: argocd-application-controller
+"""
 REPOSITORY = "https://github.com/manshoor/fastapi-ai-agent-platform.git"
 
 
@@ -61,7 +94,8 @@ def tools(monkeypatch, tmp_path) -> FakeTools:
     monkeypatch.setattr(script, "KUBECONFIG", tmp_path / "private" / "kubeconfig")
     fake = FakeTools()
     monkeypatch.setattr(script, "run", fake)
-    monkeypatch.setattr(script, "_download_manifest", lambda: "argocd: manifest")
+    monkeypatch.setattr(script, "_download_manifest", lambda: MANIFEST)
+    monkeypatch.setattr(script.time, "sleep", lambda seconds: None)
     return fake
 
 
@@ -283,8 +317,126 @@ def test_the_namespace_and_secrets_exist_before_the_application(tools):
 
 def test_argocd_is_applied_server_side(tools):
     script.up(None)
-    ((command, _),) = [call for call in tools.calls if call[1] == "argocd: manifest"]
+    ((command, _),) = [call for call in tools.calls if "argocd-redis" in call[1]]
     assert "--server-side" in command
+
+
+# Argo CD's images
+
+
+def _pulls(tools: FakeTools) -> list[str]:
+    return [line for line in tools.lines() if " crictl " in line]
+
+
+def _applied_containers(tools: FakeTools) -> list[dict]:
+    (manifest,) = [stdin for _, stdin in tools.calls if "argocd-redis" in stdin]
+    containers = []
+    for document in yaml.safe_load_all(manifest):
+        spec = document["spec"]["template"]["spec"]
+        containers += spec.get("initContainers", []) + spec["containers"]
+    return containers
+
+
+def _digest(reference: str) -> str:
+    return script.ARGOCD_IMAGES[reference].digest
+
+
+def test_argocd_images_are_pulled_into_the_node_before_argocd(tools):
+    script.up(None)
+    lines = tools.lines()
+    pulls = _pulls(tools)
+    assert pulls == [
+        "docker exec fastapi-gitops-control-plane crictl pull"
+        f" --pull-timeout {script.PULL_SECONDS}s {name}@{_digest(tag)}"
+        for tag, name in (
+            (ARGOCD, "quay.io/argoproj/argocd"),
+            (REDIS, "public.ecr.aws/docker/library/redis"),
+        )
+    ]
+    argocd = next(i for i, (_, stdin) in enumerate(tools.calls) if "argocd-redis" in stdin)
+    created = next(i for i, line in enumerate(lines) if line.startswith("kind create"))
+    assert created < lines.index(pulls[0]) and lines.index(pulls[-1]) < argocd
+
+
+def test_argocd_runs_only_the_pulled_digests(tools):
+    script.up(None)
+    containers = _applied_containers(tools)
+    assert [c["name"] for c in containers] == [
+        "secret-init",
+        "redis",
+        "argocd-application-controller",
+    ]
+    for container in containers:
+        # Never: a pod can only start from the image pulled above, not from a registry.
+        assert container["imagePullPolicy"] == "Never"
+        assert re.fullmatch(r"[\w./-]+@sha256:[0-9a-f]{64}", container["image"])
+    assert containers[1]["image"] == f"public.ecr.aws/docker/library/redis@{_digest(REDIS)}"
+
+
+def test_a_failed_pull_is_retried_then_the_next_source_is_used(tools):
+    tools.answers.append(("public.ecr.aws/docker/library/redis@", script.ClusterError("429")))
+    script.up(None)
+    redis = [line for line in _pulls(tools) if "redis" in line]
+    attempts = script.PULL_ATTEMPTS
+    assert [line.split()[-1] for line in redis] == [
+        f"public.ecr.aws/docker/library/redis@{_digest(REDIS)}"
+    ] * attempts + [f"docker.io/library/redis@{_digest(REDIS)}"]
+    assert _applied_containers(tools)[1]["image"] == f"docker.io/library/redis@{_digest(REDIS)}"
+
+
+def test_argocd_is_not_applied_if_an_image_cannot_be_pulled(tools):
+    tools.answers.append(("crictl pull", script.ClusterError("429")))
+    with pytest.raises(script.ClusterError, match="could not be pulled"):
+        script.up(None)
+    sources = len(script.ARGOCD_IMAGES[ARGOCD].sources)
+    assert len(_pulls(tools)) == script.PULL_ATTEMPTS * sources
+    assert not [stdin for _, stdin in tools.calls if "argocd-redis" in stdin]
+
+
+def test_each_pull_has_its_own_time_limit(tools):
+    script.up(None)
+    assert _pulls(tools)
+    for command, _ in tools.calls:
+        if "crictl" in command:
+            assert command[3:6] == ["crictl", "pull", "--pull-timeout"]
+            assert command[6] == f"{script.PULL_SECONDS}s"
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        MANIFEST.replace(REDIS, "docker.io/library/redis:latest"),
+        MANIFEST.replace(f"        image: {REDIS}\n", ""),
+        MANIFEST.replace(f"image: {ARGOCD}", f"image: {ARGOCD}@sha256:{'0' * 64}"),
+    ],
+    ids=["unpinned", "missing", "other-digest"],
+)
+def test_a_manifest_with_other_images_is_refused(manifest):
+    pulled = {tag: f"x@{image.digest}" for tag, image in script.ARGOCD_IMAGES.items()}
+    with pytest.raises(script.ClusterError, match="Argo CD images"):
+        script.pin_images(manifest, pulled)
+
+
+def test_argocd_images_are_pinned_by_digest():
+    assert set(script.ARGOCD_IMAGES) == {ARGOCD, REDIS}
+    for tag, image in script.ARGOCD_IMAGES.items():
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", image.digest)
+        # The manifest's own registry comes first; a mirror only after it.
+        assert image.sources[0] == tag.rsplit(":", 1)[0]
+        assert len(set(image.sources)) == len(image.sources) <= 2
+    assert ARGOCD.rsplit(":", 1)[1] in script.ARGOCD_URL
+
+
+def test_the_pulls_fit_the_start_step():
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "gitops.yml").read_text())
+    (step,) = [
+        s for s in workflow["jobs"]["cluster"]["steps"] if s.get("name") == "Start the cluster"
+    ]
+    attempts = sum(len(image.sources) for image in script.ARGOCD_IMAGES.values())
+    attempts *= script.PULL_ATTEMPTS
+    worst = attempts * (script.PULL_SECONDS + script.PULL_WAIT_SECONDS)
+    # Half the step: the cluster and Argo CD's rollout need the rest.
+    assert worst <= step["timeout-minutes"] * 60 / 2
 
 
 def test_the_argocd_url_names_an_exact_version():
