@@ -254,7 +254,8 @@ def _argument_device(arguments: str) -> object:
     """The raw "device" argument of a call that was never validated, or None."""
     try:
         parsed = json.loads(arguments)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # Deep nesting raises RecursionError, not a decode error.
         return None
     return parsed.get("device") if isinstance(parsed, dict) else None
 

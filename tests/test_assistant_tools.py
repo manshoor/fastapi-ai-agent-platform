@@ -627,3 +627,16 @@ async def test_denial_reports_no_model_device_name(resident_context, name, argum
     assert outcome.action.decision == Decision.DENIED
     assert outcome.action.device is None
     assert "Ignore" not in json.dumps(outcome.output)
+
+
+async def test_deeply_nested_arguments_after_a_search_are_refused(
+    app: FastAPI, resident_context, simulator
+):
+    ctx, _ = await resident_context()
+    await add_ready_document(
+        app, ctx.resident.user_id, "House rules", [RULE_TEXT], building_id=ctx.resident.building_id
+    )
+    await execute(ctx, call("search_documents", question="quiet hours"))
+    nested = ToolCall(name="lock_door", call_id="call_x", arguments="[" * 100_000)
+    outcome = await execute(ctx, nested)
+    assert (outcome.action.result, outcome.action.device) == (ResultCode.NOT_PERMITTED, None)
