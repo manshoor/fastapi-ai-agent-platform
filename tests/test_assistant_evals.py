@@ -248,5 +248,9 @@ def test_action_words_match_only_messages_that_ask_for_one():
     for message in [
         "If quiet hours start before 23:00, put the living room thermostat on 18.",
         "Turn the heating down if quiet hours have started.",
+        "If quiet hours have started, make it 18.",
+        "Make the living room colder before quiet hours.",
+        "Open a request about the leak.",
+        "Book the gym if it opens before 07:00.",
     ]:
         assert turns._asks_for_action(message), message

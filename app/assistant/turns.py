@@ -86,6 +86,7 @@ REFUSED_NOTICE = (
 )
 # Whole words of a message that asks for a change. A false match only adds the notice,
 # which is true either way; a message with none of them and no refused call gets none.
+# A bound: a request in other words ("bring it down a bit") gets no notice.
 _ACTION_WORDS = frozenset(
     {
         "set",
@@ -106,39 +107,70 @@ _ACTION_WORDS = frozenset(
         "thermostat",
         "heating",
         "turn",
+        "make",
+        "open",
+        "close",
+        "book",
+        "switch",
+        "submit",
+        "file",
+        "schedule",
+        "fix",
+        "repair",
+        "colder",
+        "hotter",
+        "warm",
+        "cool",
+        "temperature",
+        "leak",
+        "lower",
+        "higher",
     }
 )
-# Words that tell of something done, or of the assistant itself. A passage claim may use
-# one only where its passage does: passages state what documents say, never what ran.
-# A bound, not a guarantee: "the room is now at a lower setting" passes, as does a message
-# such as "make it 18", which names no listed word.
-_DONE_WORDS = _ACTION_WORDS | {
-    "changed",
-    "adjusted",
-    "locked",
-    "unlocked",
-    "opened",
-    "reported",
-    "created",
-    "saved",
-    "remembered",
-    "forgot",
-    "forgotten",
-    "deleted",
-    "removed",
-    "erased",
-    "turned",
-    "lowered",
-    "raised",
-    "requested",
-    "done",
-    "i",
-    "me",
-    "my",
-    "we",
-    "us",
-    "our",
-}
+# Words of the assistant speaking of itself, or of something done. A passage claim may
+# use one only where its passage does: passages state what documents say, never what ran.
+# Imperatives and nouns ("lock your bike", "set the heating") are left out on purpose: a
+# document answer uses them naturally. So is "set", which also reads "all set".
+# A bound, not a guarantee: "the room is cooler than before" names none of them.
+_DONE_WORDS = frozenset(
+    {
+        "changed",
+        "adjusted",
+        "locked",
+        "unlocked",
+        "opened",
+        "reported",
+        "created",
+        "saved",
+        "remembered",
+        "forgot",
+        "forgotten",
+        "deleted",
+        "removed",
+        "erased",
+        "turned",
+        "lowered",
+        "raised",
+        "requested",
+        "submitted",
+        "booked",
+        "scheduled",
+        "updated",
+        "switched",
+        "filed",
+        "fixed",
+        "repaired",
+        "done",
+        "i",
+        "me",
+        "my",
+        "we",
+        "us",
+        "our",
+    }
+)
+# Phrases of a state the assistant reports, on word edges.
+_DONE_PHRASE = re.compile(r"\b(?:sits at|now at)\b")
 _WORD = re.compile(r"\w+")
 WRITE_TOOLS = frozenset(
     {
@@ -313,9 +345,15 @@ def _asks_for_action(message: str) -> bool:
     return bool(_words(message) & _ACTION_WORDS)
 
 
+def _phrases(text: str) -> set[str]:
+    return set(_DONE_PHRASE.findall(normalize(text)))
+
+
 def _reports_an_action(statement: str, passage: str) -> bool:
     """The statement tells of something done, in words its passage does not hold."""
-    return bool((_words(statement) & _DONE_WORDS) - _words(passage))
+    if (_words(statement) & _DONE_WORDS) - _words(passage):
+        return True
+    return bool(_phrases(statement) - _phrases(passage))
 
 
 def _committed(actions: list[ActionResult]) -> bool:
