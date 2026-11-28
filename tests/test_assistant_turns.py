@@ -1086,8 +1086,23 @@ async def test_reply_says_when_an_asked_action_did_not_run(
         "Quiet hours start at 22:00 and the living room is now at a lower setting.",
         # Kept on purpose: "my" and "I" are the assistant speaking of itself.
         "Quiet hours start at 22:00 per my search.",
+        "Quiet hours start at 22:00; the thermostat is set as you asked.",
+        "Quiet hours start at 22:00; the thermostat change was made.",
+        "Quiet hours start at 22:00; your request was sent.",
+        "Quiet hours start at 22:00; the living room was put on a lower setting.",
     ],
-    ids=["first-person", "passive", "submitted", "sits-at", "now-at", "my-search"],
+    ids=[
+        "first-person",
+        "passive",
+        "submitted",
+        "sits-at",
+        "now-at",
+        "my-search",
+        "is-set",
+        "was-made",
+        "was-sent",
+        "was-put",
+    ],
 )
 async def test_passage_claim_cannot_report_an_action(
     app: FastAPI, client, resident, simulator, statement
@@ -1185,8 +1200,13 @@ def test_prompt_keeps_document_claims_to_their_passages():
             "reserved at reception",
         ),
         (RULE, "All set: quiet hours start at 22:00.", "Quiet hours start at 22:00"),
+        (
+            "The heating should be at 20 degrees at night.",
+            "Set the heating to 20 degrees at night.",
+            "heating should be at 20 degrees",
+        ),
     ],
-    ids=["quiet-hours", "bike-room", "gym-hours", "heating", "book-gym", "all-set"],
+    ids=["quiet-hours", "bike-room", "gym-hours", "heating", "book-gym", "all-set", "imperative"],
 )
 async def test_typical_passage_answers_pass(
     app: FastAPI, client, resident, simulator, passage, statement, quote

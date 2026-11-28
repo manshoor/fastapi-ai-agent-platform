@@ -254,3 +254,22 @@ def test_action_words_match_only_messages_that_ask_for_one():
         "Book the gym if it opens before 07:00.",
     ]:
         assert turns._asks_for_action(message), message
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "When is the gym open?",
+        "What time does reception close?",
+        "Can I book the party room?",
+        "Where do I file a complaint?",
+        "Is there a lower floor bike room?",
+        "Is the pool warm?",
+        "Is the cool room near the gym?",
+        "How do I make a booking?",
+    ],
+)
+def test_questions_name_no_action(message):
+    import app.assistant.turns as turns
+
+    assert not turns._asks_for_action(message)

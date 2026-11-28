@@ -86,7 +86,8 @@ REFUSED_NOTICE = (
 )
 # Whole words of a message that asks for a change. A false match only adds the notice,
 # which is true either way; a message with none of them and no refused call gets none.
-# A bound: a request in other words ("bring it down a bit") gets no notice.
+# Words also common in questions ("When is the gym open?", "Is the pool warm?") are left
+# out. A bound: a request in other words ("bring it down a bit") gets no notice.
 _ACTION_WORDS = frozenset(
     {
         "set",
@@ -107,24 +108,14 @@ _ACTION_WORDS = frozenset(
         "thermostat",
         "heating",
         "turn",
-        "make",
-        "open",
-        "close",
-        "book",
         "switch",
         "submit",
-        "file",
         "schedule",
         "fix",
         "repair",
         "colder",
         "hotter",
-        "warm",
-        "cool",
         "temperature",
-        "leak",
-        "lower",
-        "higher",
     }
 )
 # Words of the assistant speaking of itself, or of something done. A passage claim may
@@ -169,8 +160,17 @@ _DONE_WORDS = frozenset(
         "our",
     }
 )
-# Phrases of a state the assistant reports, on word edges.
-_DONE_PHRASE = re.compile(r"\b(?:sits at|now at)\b")
+# Verbs that also appear in questions ("How do I make a booking?") count only as a
+# command: at the start of the message or a clause, or after "please". "Can you book
+# the gym?" is a request this misses.
+_COMMAND_WORDS = re.compile(
+    r"(?:^|[.!?,;:]\s*|\b(?:and|also|then|please)\s+)(?:please\s+)?(?:make|book|open)\b"
+)
+# Phrases of a state or a deed the assistant reports, on word edges. "set" alone stays
+# out: "All set" and "Set the heating to 20" are plain document answers.
+_DONE_PHRASE = re.compile(
+    r"\b(?:sits at|now at|is set|was set|was made|was sent|was put|as you asked|as requested)\b"
+)
 _WORD = re.compile(r"\w+")
 WRITE_TOOLS = frozenset(
     {
@@ -342,7 +342,9 @@ def _words(text: str) -> set[str]:
 
 
 def _asks_for_action(message: str) -> bool:
-    return bool(_words(message) & _ACTION_WORDS)
+    if _words(message) & _ACTION_WORDS:
+        return True
+    return _COMMAND_WORDS.search(normalize(message)) is not None
 
 
 def _phrases(text: str) -> set[str]:
