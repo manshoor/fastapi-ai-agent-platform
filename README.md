@@ -284,7 +284,7 @@ Add `--postgres` to `promote` to move PostgreSQL too. `rollback` never moves `mi
 
 `gitops_cluster.py` needs `kind` and `kubectl`. It creates and deletes only the cluster `fastapi-gitops`, always names that context, and refuses a Docker endpoint that is not a local socket and an API server that is not on this machine. It keeps its own kubeconfig in `.gitops-local/` (private, never committed), so your current context does not change; use `kubectl --kubeconfig .gitops-local/kubeconfig`. It creates the Secrets over stdin and never replaces them; git holds none, and the Argo CD project does not allow any. `down` deletes the cluster and its data.
 
-Argo CD's manifest is checked against an exact SHA-256, but the images it names are tags, not digests.
+Argo CD's manifest is checked against an exact SHA-256. The images it names are tags, so `gitops_cluster.py` pins each to a digest, pulls it into the node with a short retry (Redis from Docker Hub if ECR fails), and runs it with pull policy `Never`. A new Argo CD version needs new digests in `ARGOCD_IMAGES`.
 
 This is a demo: PostgreSQL is a prerelease, there is one database pod and one Kafka pod, and no TLS. Network policies need a cluster network that enforces them (kind's does), and they never block a pod's traffic with its own node.
 
