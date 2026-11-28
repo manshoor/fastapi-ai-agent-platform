@@ -370,6 +370,15 @@ async def _pending_views(session_factory: SessionFactory, run: TurnRun) -> list[
     return views
 
 
+def _with_notice(run: TurnRun, status: str, answer: str) -> str:
+    """Add the fixed notice when the turn refused a change. The model has no label for it."""
+    if not run.context.refused_after_search:
+        return answer
+    if status == "no_context":
+        return REFUSED_NOTICE
+    return f"{answer} {REFUSED_NOTICE}"
+
+
 class _Deadline(Exception):
     """The turn's backstop fired. Other timeouts are dependency failures."""
 
@@ -434,9 +443,7 @@ async def _finish(
         status, answer, citations, code = "incomplete", INCOMPLETE_ANSWER, [], CLAIM_CODE
     else:
         status, answer, citations = "no_context", NO_CONTEXT_ANSWER, []
-    if run.context.refused_after_search:
-        # The model has no label for a denial, so the server states it.
-        answer = REFUSED_NOTICE if status == "no_context" else f"{answer} {REFUSED_NOTICE}"
+    answer = _with_notice(run, status, answer)
     pending = await _pending_views(session_factory, run)
     await _record(runtime.telemetry, session_factory, turn_id, status, run, code, failure)
     return _response(turn_id, run, status, answer, citations, pending)
@@ -549,6 +556,7 @@ async def _turn(
         if run is not None and _committed(run.actions):
             # The write stands; report it. Pending ids are in the actions.
             await _record(runtime.telemetry, session_factory, turn_id, "incomplete", run, code)
-            return _response(turn_id, run, "incomplete", INCOMPLETE_ANSWER, [], [])
+            answer = _with_notice(run, "incomplete", INCOMPLETE_ANSWER)
+            return _response(turn_id, run, "incomplete", answer, [], [])
         await _record(runtime.telemetry, session_factory, turn_id, "failed", run, code)
         raise
