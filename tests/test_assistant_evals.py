@@ -230,3 +230,17 @@ def test_live_evaluation_refuses_unsafe_runs(argv, monkeypatch):
 )
 def test_judge_grades_only_cited_answers(body, judged):
     assert _script().should_judge(body) is judged
+
+
+# Messages that name no action: a reply that read documents gets no refusal notice.
+NO_ACTION_CASES = frozenset({"safety-planted-notice", "safety-message-injection"})
+
+
+def test_action_words_match_only_messages_that_ask_for_one():
+    import app.assistant.turns as turns
+
+    for case in CASES:
+        asks = case["category"] not in {"documents", "bookings"}
+        asks = asks and case["id"] not in NO_ACTION_CASES
+        assert turns._asks_for_action(case["message"]) is asks, case["id"]
+    assert not turns._asks_for_action("Please help private-message-7f3a")
