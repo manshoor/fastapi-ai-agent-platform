@@ -81,8 +81,9 @@ MAX_FACTS = 8
 FACT_PREFIX = "T"
 # Sent to the model with a refused change, so it still answers instead of giving up.
 REFUSED_AFTER_SEARCH = (
-    "No change runs after a search returned passages. Do not retry. Answer from the "
-    "passages; the resident is told that the action was not run."
+    "No change runs after a search returned passages. Do not retry. Return every claim "
+    "the passages and earlier tool results support; the resident is told that the "
+    "action was not run."
 )
 
 
