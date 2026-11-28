@@ -1056,22 +1056,23 @@ async def house_rules(app: FastAPI, owner: dict, chunks: list[str] = (RULE,)) ->
 
 
 @pytest.mark.parametrize(
-    ("message", "answer"),
+    ("message", "reply", "status", "answer"),
     [
-        (CONDITIONAL, f"Quiet hours start at 22:00. {REFUSED_NOTICE}"),
-        ("When do quiet hours start?", "Quiet hours start at 22:00."),
+        (CONDITIONAL, QUIET_CLAIM, "answered", f"Quiet hours start at 22:00. {REFUSED_NOTICE}"),
+        ("When do quiet hours start?", QUIET_CLAIM, "answered", "Quiet hours start at 22:00."),
+        (CONDITIONAL, {"claims": []}, "no_context", f"{NO_CONTEXT_ANSWER} {REFUSED_NOTICE}"),
     ],
-    ids=["asked-for-an-action", "question-only"],
+    ids=["asked-for-an-action", "question-only", "asked-and-not-found"],
 )
 async def test_reply_says_when_an_asked_action_did_not_run(
-    app: FastAPI, client, resident, simulator, message, answer
+    app: FastAPI, client, resident, simulator, message, reply, status, answer
 ):
     # The model obeyed the prompt and tried nothing: the server still states it.
     owner = await resident()
     await house_rules(app, owner)
-    script(simulator, QUIET_SEARCH, QUIET_CLAIM)
+    script(simulator, QUIET_SEARCH, reply)
     body = (await send(client, owner, message)).json()
-    assert (body["status"], body["answer"]) == ("answered", answer)
+    assert (body["status"], body["answer"]) == (status, answer)
     assert [action["tool"] for action in body["actions"]] == ["search_documents"]
 
 

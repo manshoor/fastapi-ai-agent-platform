@@ -456,7 +456,8 @@ def _with_notice(run: TurnRun, status: str, answer: str) -> str:
     asked = bool(context.passages) and _asks_for_action(context.message)
     if not (context.refused_after_search or asked):
         return answer
-    if status == "no_context":
+    # A refused call is why the answer is empty: the notice replaces "could not find".
+    if status == "no_context" and context.refused_after_search:
         return REFUSED_NOTICE
     return f"{answer} {REFUSED_NOTICE}"
 
