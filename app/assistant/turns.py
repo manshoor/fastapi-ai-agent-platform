@@ -9,7 +9,8 @@
 
     Claim checks (all-or-nothing, as for RAG queries):
       passage claim (P1..P8) -> quote and numbers checked against that passage's text;
-                                the reply shows the statement
+                                the reply shows the statement, so it may not tell of
+                                anything done in words the passage does not hold
       tool claim (T1..T8)    -> quote checked against that tool result's server-written
                                 fact; the reply shows the fact, never the statement.
                                 A label never handed out, or a fact a later result for
@@ -21,6 +22,9 @@
       all verified  -> "answered"; no claims or a failed check -> "no_context",
                        or "incomplete" (claim_unverified) after a committed write
 
+    Notice: a change was refused after a search, or the turn read passages and the
+    message asks for a change -> the server adds REFUSED_NOTICE to the answer.
+
     Provider failure after a committed write: 200 "incomplete" with the actions.
     Failure with nothing committed: 503 / 504 / 502, as for RAG queries.
 
@@ -30,6 +34,7 @@ never the message, a tool argument, a passage or the answer.
 
 import asyncio
 import logging
+import re
 import time
 from datetime import timedelta
 from uuid import UUID, uuid4
@@ -58,7 +63,7 @@ from app.assistant.residence import Resident
 from app.assistant.runtime import AssistantRuntime
 from app.assistant.tools import FACT_PREFIX, ToolContext
 from app.models import AssistantTurn, Device, PendingAction
-from app.rag.verification import ClaimFailure, check_quote
+from app.rag.verification import ClaimFailure, check_quote, normalize
 from app.telemetry import Telemetry
 
 logger = logging.getLogger(__name__)
@@ -74,10 +79,99 @@ RUNNING_TURN_GRACE_SECONDS = 15
 NO_CONTEXT_ANSWER = "I could not find that in your building's documents."
 INCOMPLETE_ANSWER = "I could not finish. The completed steps are listed."
 # Neutral on purpose: planted text can cause the refusal, so it must not urge a retry.
+# True in every case it is shown, also when an action ran before the search.
 REFUSED_NOTICE = (
-    "An action was not run because this reply read building documents. "
-    "If you asked for it, send it as its own message."
+    "No action runs after a reply reads building documents. If you asked for one that "
+    "the actions list does not show as done, send it as its own message."
 )
+# Whole words of a message that asks for a change. A false match only adds the notice,
+# which is true either way; a message with none of them and no refused call gets none.
+# Words also common in questions ("When is the gym open?", "Is the pool warm?") are left
+# out. A bound: a request in other words ("bring it down a bit") gets no notice.
+_ACTION_WORDS = frozenset(
+    {
+        "set",
+        "change",
+        "adjust",
+        "lock",
+        "unlock",
+        "report",
+        "ticket",
+        "remember",
+        "forget",
+        "delete",
+        "remove",
+        "erase",
+        "degrees",
+        "warmer",
+        "cooler",
+        "thermostat",
+        "heating",
+        "turn",
+        "switch",
+        "submit",
+        "schedule",
+        "fix",
+        "repair",
+        "colder",
+        "hotter",
+        "temperature",
+    }
+)
+# Words of the assistant speaking of itself, or of something done. A passage claim may
+# use one only where its passage does: passages state what documents say, never what ran.
+# Imperatives and nouns ("lock your bike", "set the heating") are left out on purpose: a
+# document answer uses them naturally. So is "set", which also reads "all set".
+# A bound, not a guarantee: "the room is cooler than before" names none of them.
+_DONE_WORDS = frozenset(
+    {
+        "changed",
+        "adjusted",
+        "locked",
+        "unlocked",
+        "opened",
+        "reported",
+        "created",
+        "saved",
+        "remembered",
+        "forgot",
+        "forgotten",
+        "deleted",
+        "removed",
+        "erased",
+        "turned",
+        "lowered",
+        "raised",
+        "requested",
+        "submitted",
+        "booked",
+        "scheduled",
+        "updated",
+        "switched",
+        "filed",
+        "fixed",
+        "repaired",
+        "done",
+        "i",
+        "me",
+        "my",
+        "we",
+        "us",
+        "our",
+    }
+)
+# Verbs that also appear in questions ("How do I make a booking?") count only as a
+# command: at the start of the message or a clause, or after "please". "Can you book
+# the gym?" is a request this misses.
+_COMMAND_WORDS = re.compile(
+    r"(?:^|[.!?,;:]\s*|\b(?:and|also|then|please)\s+)(?:please\s+)?(?:make|book|open)\b"
+)
+# Phrases of a state or a deed the assistant reports, on word edges. "set" alone stays
+# out: "All set" and "Set the heating to 20" are plain document answers.
+_DONE_PHRASE = re.compile(
+    r"\b(?:sits at|now at|is set|was set|was made|was sent|was put|as you asked|as requested)\b"
+)
+_WORD = re.compile(r"\w+")
 WRITE_TOOLS = frozenset(
     {
         ToolName.CREATE_TICKET,
@@ -243,6 +337,27 @@ async def _record(
     await asyncio.shield(write())
 
 
+def _words(text: str) -> set[str]:
+    return set(_WORD.findall(normalize(text)))
+
+
+def _asks_for_action(message: str) -> bool:
+    if _words(message) & _ACTION_WORDS:
+        return True
+    return _COMMAND_WORDS.search(normalize(message)) is not None
+
+
+def _phrases(text: str) -> set[str]:
+    return set(_DONE_PHRASE.findall(normalize(text)))
+
+
+def _reports_an_action(statement: str, passage: str) -> bool:
+    """The statement tells of something done, in words its passage does not hold."""
+    if (_words(statement) & _DONE_WORDS) - _words(passage):
+        return True
+    return bool(_phrases(statement) - _phrases(passage))
+
+
 def _committed(actions: list[ActionResult]) -> bool:
     return any(
         action.tool in WRITE_TOOLS and (action.decision, action.result) in GROUNDING_RESULTS
@@ -307,7 +422,11 @@ def _check(
         # The reply shows the quote as the resident's words, never the statement.
         return check_quote(statement="", quote=claim.quote, text=memories[index])
     if not claim.source.startswith(FACT_PREFIX):
-        return check_quote(claim.statement, claim.quote, passages[index])
+        failure = check_quote(claim.statement, claim.quote, passages[index])
+        if failure is None and _reports_an_action(claim.statement, passages[index]):
+            # The reply shows this statement as written: it must not claim a write.
+            return ClaimFailure.TOOL_CLAIM_UNGROUNDED
+        return failure
     if index >= len(facts) or not facts[index]:
         return ClaimFailure.TOOL_CLAIM_UNGROUNDED
     # The reply shows the fact, never the statement, so the statement is not checked.
@@ -368,6 +487,22 @@ async def _pending_views(session_factory: SessionFactory, run: TurnRun) -> list[
         ]
         await session.rollback()
     return views
+
+
+def _with_notice(run: TurnRun, status: str, answer: str) -> str:
+    """Add the fixed notice when a change could not run. The model has no label for it.
+
+    Decided from server state only: a change was refused, or the turn read passages and
+    the resident's message asks for a change. Never from what the model wrote.
+    """
+    context = run.context
+    asked = bool(context.passages) and _asks_for_action(context.message)
+    if not (context.refused_after_search or asked):
+        return answer
+    # A refused call is why the answer is empty: the notice replaces "could not find".
+    if status == "no_context" and context.refused_after_search:
+        return REFUSED_NOTICE
+    return f"{answer} {REFUSED_NOTICE}"
 
 
 class _Deadline(Exception):
@@ -434,9 +569,7 @@ async def _finish(
         status, answer, citations, code = "incomplete", INCOMPLETE_ANSWER, [], CLAIM_CODE
     else:
         status, answer, citations = "no_context", NO_CONTEXT_ANSWER, []
-    if run.context.refused_after_search:
-        # The model has no label for a denial, so the server states it.
-        answer = REFUSED_NOTICE if status == "no_context" else f"{answer} {REFUSED_NOTICE}"
+    answer = _with_notice(run, status, answer)
     pending = await _pending_views(session_factory, run)
     await _record(runtime.telemetry, session_factory, turn_id, status, run, code, failure)
     return _response(turn_id, run, status, answer, citations, pending)
@@ -520,6 +653,7 @@ async def _turn(
                 turn_id=turn_id,
                 embedder=runtime.embedder,
                 telemetry=runtime.telemetry,
+                device_names=frozenset(device["name"] for device in context["devices"]),
                 message=message,
                 memory_box=box,
                 memories=memories,
@@ -548,6 +682,7 @@ async def _turn(
         if run is not None and _committed(run.actions):
             # The write stands; report it. Pending ids are in the actions.
             await _record(runtime.telemetry, session_factory, turn_id, "incomplete", run, code)
-            return _response(turn_id, run, "incomplete", INCOMPLETE_ANSWER, [], [])
+            answer = _with_notice(run, "incomplete", INCOMPLETE_ANSWER)
+            return _response(turn_id, run, "incomplete", answer, [], [])
         await _record(runtime.telemetry, session_factory, turn_id, "failed", run, code)
         raise

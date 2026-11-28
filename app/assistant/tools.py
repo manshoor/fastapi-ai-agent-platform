@@ -1,9 +1,9 @@
 """The tool allowlist, its server-side checks, and the audit trail.
 
-    model tool call -> allowlisted name? -- no --> audit "unknown" denial
+    model tool call -> a search handed out passages and not in READ_TOOLS
+                       (unknown names included)?  -- yes --> audit not_permitted
+                    -> allowlisted name? -- no --> audit "unknown" denial
                     -> arguments valid?  -- no --> audit invalid_arguments
-                    -> a search handed out passages and not in READ_TOOLS?
-                                         -- yes --> audit not_permitted
                     -> handler: read tools read and audit;
                        write tools: one transaction =
                          per-user lock -> limits -> guarded write (membership in WHERE)
@@ -81,8 +81,9 @@ MAX_FACTS = 8
 FACT_PREFIX = "T"
 # Sent to the model with a refused change, so it still answers instead of giving up.
 REFUSED_AFTER_SEARCH = (
-    "No change runs after a search returned passages. Do not retry. Answer from the "
-    "passages; the resident is told that the action was not run."
+    "No change runs after a search returned passages. Do not retry. Return every claim "
+    "the passages and earlier tool results support; the resident is told that the "
+    "action was not run."
 )
 
 
@@ -103,6 +104,9 @@ class ToolContext:
     facts: list[str] = field(default_factory=list)
     # (tool, device) -> index of that device's current fact in `facts`.
     _device_facts: dict[tuple[str, str], int] = field(default_factory=dict, init=False, repr=False)
+    # The apartment's visible device names, read at turn start. A denial reports only
+    # one of these, never the model's text.
+    device_names: frozenset[str] = field(default_factory=frozenset)
     # A change was refused because passages were handed out: the reply must say so.
     refused_after_search: bool = False
     embedding_tokens: int = 0
@@ -239,10 +243,27 @@ async def _deny(
     return _outcome(tool, Decision.DENIED, result, **extra)
 
 
+def _known_device(ctx: ToolContext, name: object) -> str | None:
+    """`name` when it is one of the apartment's devices; otherwise no device at all."""
+    if isinstance(name, str) and name in ctx.device_names:
+        return name
+    return None
+
+
+def _argument_device(arguments: str) -> object:
+    """The raw "device" argument of a call that was never validated, or None."""
+    try:
+        parsed = json.loads(arguments)
+    except (ValueError, RecursionError):
+        # Deep nesting raises RecursionError, not a decode error.
+        return None
+    return parsed.get("device") if isinstance(parsed, dict) else None
+
+
 async def _missing_device(session: AsyncSession, ctx: ToolContext, tool: str, name: str):
     # A guarded write matched nothing: the resident left, or no such device of that kind.
     result = ResultCode.NOT_FOUND if await _is_member(session, ctx) else ResultCode.NOT_PERMITTED
-    return await _deny(session, ctx, tool, result, device=name)
+    return await _deny(session, ctx, tool, result, device=_known_device(ctx, name))
 
 
 async def search_documents(ctx: ToolContext, args: SearchArguments) -> ToolOutcome:
@@ -439,7 +460,8 @@ async def _set_device(
     async with ctx.session_factory() as session:
         await _lock_user(session, ctx)
         if await _device_limit_reached(session, ctx):
-            return await _deny(session, ctx, tool, ResultCode.LIMIT_EXCEEDED, device=name)
+            device = _known_device(ctx, name)
+            return await _deny(session, ctx, tool, ResultCode.LIMIT_EXCEEDED, device=device)
         # One guarded statement: right apartment, name and kind, and still a resident.
         device_id = await session.scalar(
             update(Device)
@@ -494,7 +516,8 @@ async def unlock_door(ctx: ToolContext, args: DeviceArguments) -> ToolOutcome:
     async with ctx.session_factory() as session:
         await _lock_user(session, ctx)
         if not await _hold_membership(session, ctx):
-            return await _deny(session, ctx, tool, ResultCode.NOT_PERMITTED, device=name)
+            device = _known_device(ctx, name)
+            return await _deny(session, ctx, tool, ResultCode.NOT_PERMITTED, device=device)
         recent = await session.scalar(
             select(func.count())
             .select_from(PendingAction)
@@ -504,7 +527,8 @@ async def unlock_door(ctx: ToolContext, args: DeviceArguments) -> ToolOutcome:
             )
         )
         if recent >= settings.assistant_unlock_limit:
-            return await _deny(session, ctx, tool, ResultCode.LIMIT_EXCEEDED, device=name)
+            device = _known_device(ctx, name)
+            return await _deny(session, ctx, tool, ResultCode.LIMIT_EXCEEDED, device=device)
         device_id = await session.scalar(
             select(Device.id).where(
                 Device.apartment_id == resident.apartment_id,
@@ -799,30 +823,34 @@ async def execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     return outcome
 
 
+async def _refuse_after_search(ctx: ToolContext, tool: str, call: ToolCall) -> ToolOutcome:
+    ctx.refused_after_search = True
+    await _audited(ctx, tool, Decision.DENIED, ResultCode.NOT_PERMITTED)
+    return _outcome(
+        tool,
+        Decision.DENIED,
+        ResultCode.NOT_PERMITTED,
+        device=_known_device(ctx, _argument_device(call.arguments)),
+        output={"reason": REFUSED_AFTER_SEARCH},
+    )
+
+
 async def _execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     spec = _spec(ctx, call.name)
+    tool = ToolName(call.name) if spec is not None else UNKNOWN_TOOL
+    # Once a search handed out passages, a document could be steering the model: only
+    # reads run for the rest of the turn. Decided before the arguments are read, so a
+    # bad argument or an unknown name is refused, and reported, like any other change.
+    if ctx.passages and tool not in READ_TOOLS:
+        return await _refuse_after_search(ctx, tool, call)
     if spec is None:
         await _audited(ctx, UNKNOWN_TOOL, Decision.DENIED, ResultCode.UNKNOWN_TOOL)
         return _outcome(UNKNOWN_TOOL, Decision.DENIED, ResultCode.UNKNOWN_TOOL)
-    tool = ToolName(call.name)
     try:
         args = spec.arguments.model_validate_json(call.arguments)
     except ValidationError:
         await _audited(ctx, tool, Decision.DENIED, ResultCode.INVALID_ARGUMENTS)
         return _outcome(tool, Decision.DENIED, ResultCode.INVALID_ARGUMENTS)
-    # Once a search handed out passages, a document could be steering the model: only
-    # reads run for the rest of the turn.
-    if ctx.passages and tool not in READ_TOOLS:
-        ctx.refused_after_search = True
-        await _audited(ctx, tool, Decision.DENIED, ResultCode.NOT_PERMITTED)
-        device = getattr(args, "device", None)
-        return _outcome(
-            tool,
-            Decision.DENIED,
-            ResultCode.NOT_PERMITTED,
-            device=device,
-            output={"reason": REFUSED_AFTER_SEARCH},
-        )
     return _labelled(ctx, await spec.handler(ctx, args))
 
 

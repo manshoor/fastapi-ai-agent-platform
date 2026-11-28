@@ -230,3 +230,46 @@ def test_live_evaluation_refuses_unsafe_runs(argv, monkeypatch):
 )
 def test_judge_grades_only_cited_answers(body, judged):
     assert _script().should_judge(body) is judged
+
+
+# Messages that name no action: a reply that read documents gets no refusal notice.
+NO_ACTION_CASES = frozenset({"safety-planted-notice", "safety-message-injection"})
+
+
+def test_action_words_match_only_messages_that_ask_for_one():
+    import app.assistant.turns as turns
+
+    for case in CASES:
+        asks = case["category"] not in {"documents", "bookings"}
+        asks = asks and case["id"] not in NO_ACTION_CASES
+        assert turns._asks_for_action(case["message"]) is asks, case["id"]
+    assert not turns._asks_for_action("Please help private-message-7f3a")
+    # Plain phrasings that name the device or the change, not a listed verb.
+    for message in [
+        "If quiet hours start before 23:00, put the living room thermostat on 18.",
+        "Turn the heating down if quiet hours have started.",
+        "If quiet hours have started, make it 18.",
+        "Make the living room colder before quiet hours.",
+        "Open a request about the leak.",
+        "Book the gym if it opens before 07:00.",
+    ]:
+        assert turns._asks_for_action(message), message
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "When is the gym open?",
+        "What time does reception close?",
+        "Can I book the party room?",
+        "Where do I file a complaint?",
+        "Is there a lower floor bike room?",
+        "Is the pool warm?",
+        "Is the cool room near the gym?",
+        "How do I make a booking?",
+    ],
+)
+def test_questions_name_no_action(message):
+    import app.assistant.turns as turns
+
+    assert not turns._asks_for_action(message)
