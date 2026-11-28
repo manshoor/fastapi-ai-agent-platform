@@ -1,9 +1,9 @@
 """The tool allowlist, its server-side checks, and the audit trail.
 
-    model tool call -> allowlisted name? -- no --> audit "unknown" denial
+    model tool call -> a search handed out passages and not in READ_TOOLS
+                       (unknown names included)?  -- yes --> audit not_permitted
+                    -> allowlisted name? -- no --> audit "unknown" denial
                     -> arguments valid?  -- no --> audit invalid_arguments
-                    -> a search handed out passages and not in READ_TOOLS?
-                                         -- yes --> audit not_permitted
                     -> handler: read tools read and audit;
                        write tools: one transaction =
                          per-user lock -> limits -> guarded write (membership in WHERE)
@@ -799,30 +799,33 @@ async def execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     return outcome
 
 
+async def _refuse_after_search(ctx: ToolContext, tool: str) -> ToolOutcome:
+    ctx.refused_after_search = True
+    await _audited(ctx, tool, Decision.DENIED, ResultCode.NOT_PERMITTED)
+    return _outcome(
+        tool,
+        Decision.DENIED,
+        ResultCode.NOT_PERMITTED,
+        output={"reason": REFUSED_AFTER_SEARCH},
+    )
+
+
 async def _execute(ctx: ToolContext, call: ToolCall) -> ToolOutcome:
     spec = _spec(ctx, call.name)
+    tool = ToolName(call.name) if spec is not None else UNKNOWN_TOOL
+    # Once a search handed out passages, a document could be steering the model: only
+    # reads run for the rest of the turn. Decided before the arguments are read, so a
+    # bad argument or an unknown name is refused, and reported, like any other change.
+    if ctx.passages and tool not in READ_TOOLS:
+        return await _refuse_after_search(ctx, tool)
     if spec is None:
         await _audited(ctx, UNKNOWN_TOOL, Decision.DENIED, ResultCode.UNKNOWN_TOOL)
         return _outcome(UNKNOWN_TOOL, Decision.DENIED, ResultCode.UNKNOWN_TOOL)
-    tool = ToolName(call.name)
     try:
         args = spec.arguments.model_validate_json(call.arguments)
     except ValidationError:
         await _audited(ctx, tool, Decision.DENIED, ResultCode.INVALID_ARGUMENTS)
         return _outcome(tool, Decision.DENIED, ResultCode.INVALID_ARGUMENTS)
-    # Once a search handed out passages, a document could be steering the model: only
-    # reads run for the rest of the turn.
-    if ctx.passages and tool not in READ_TOOLS:
-        ctx.refused_after_search = True
-        await _audited(ctx, tool, Decision.DENIED, ResultCode.NOT_PERMITTED)
-        device = getattr(args, "device", None)
-        return _outcome(
-            tool,
-            Decision.DENIED,
-            ResultCode.NOT_PERMITTED,
-            device=device,
-            output={"reason": REFUSED_AFTER_SEARCH},
-        )
     return _labelled(ctx, await spec.handler(ctx, args))
 
 
