@@ -520,6 +520,7 @@ async def _turn(
                 turn_id=turn_id,
                 embedder=runtime.embedder,
                 telemetry=runtime.telemetry,
+                device_names=frozenset(device["name"] for device in context["devices"]),
                 message=message,
                 memory_box=box,
                 memories=memories,
