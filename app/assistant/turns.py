@@ -103,11 +103,15 @@ _ACTION_WORDS = frozenset(
         "degrees",
         "warmer",
         "cooler",
+        "thermostat",
+        "heating",
+        "turn",
     }
 )
 # Words that tell of something done, or of the assistant itself. A passage claim may use
 # one only where its passage does: passages state what documents say, never what ran.
-# A bound, not a guarantee: "the heating is now lower" names no such word.
+# A bound, not a guarantee: "the room is now at a lower setting" passes, as does a message
+# such as "make it 18", which names no listed word.
 _DONE_WORDS = _ACTION_WORDS | {
     "changed",
     "adjusted",
@@ -128,7 +132,6 @@ _DONE_WORDS = _ACTION_WORDS | {
     "raised",
     "requested",
     "done",
-    "thermostat",
     "i",
     "me",
     "my",

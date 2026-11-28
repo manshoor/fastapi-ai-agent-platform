@@ -244,3 +244,9 @@ def test_action_words_match_only_messages_that_ask_for_one():
         asks = asks and case["id"] not in NO_ACTION_CASES
         assert turns._asks_for_action(case["message"]) is asks, case["id"]
     assert not turns._asks_for_action("Please help private-message-7f3a")
+    # Plain phrasings that name the device or the change, not a listed verb.
+    for message in [
+        "If quiet hours start before 23:00, put the living room thermostat on 18.",
+        "Turn the heating down if quiet hours have started.",
+    ]:
+        assert turns._asks_for_action(message), message
